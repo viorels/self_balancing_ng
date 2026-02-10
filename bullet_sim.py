@@ -52,17 +52,17 @@ CONFIG = {
     'AXLE_WIDTH': 0.10,  # distance between wheels
     
     # Initial conditions
-    'INITIAL_PITCH': -0.01,  # rad (~5.7 degrees)
+    'INITIAL_PITCH': 0.0,  # rad (~5.7 degrees)
     'INITIAL_HEIGHT': 0.08,  # m above ground
     
     # PID Controller gains
     # These are the main tuning parameters for balance control
     'PID_KP': 8.0,   # proportional gain (pitch angle error)
     'PID_KD': 3.0,   # derivative gain (pitch rate)
-    'PID_KI': 0.1,   # integral gain (accumulated pitch error)
+    'PID_KI': 0.5,   # integral gain (accumulated pitch error)
     
     # Motor/actuator limits
-    'MAX_TORQUE': 1.5,  # Nm (motor saturation limit)
+    'MAX_TORQUE': 0.5,  # Nm (motor saturation limit)
     
     # Sensor simulation
     'IMU_ANGLE_NOISE_STD': 0.01,  # rad, standard deviation of angle noise
@@ -242,13 +242,13 @@ class BalanceBot:
         force = np.clip(force, -max_force, max_force)
         self.control_torque = force * (self.cfg['WHEEL_DIAMETER'] / 2)
         
-        # Apply force to both wheels to create forward/backward motion
+        # Apply torque to both wheels to spin them (creating motion)
+        # Positive force tilting forward should spin wheels forward
         for wheel_id in self.wheel_ids:
-            p.applyExternalForce(
+            p.applyExternalTorque(
                 objectUniqueId=wheel_id,
                 linkIndex=-1,
-                forceObj=[0, force, 0],  # force in wheel's local Y direction
-                posObj=[0, 0, 0],  # apply at wheel center
+                torqueObj=[0, 0, -force],  # torque around Y-axis (wheel rotation axis)
                 flags=p.LINK_FRAME
             )
     
