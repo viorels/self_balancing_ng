@@ -104,13 +104,15 @@ class BalanceBot:
         self.control_torque = 0.0
         
     def _create_robot(self):
-        """Create the robot body and wheels in PyBullet using hinged wheels."""
+        """Create the robot body and wheels in PyBullet using a single createMultiBody call."""
         
-        # Calculate body mass (remaining mass after wheels)
+        # Calculate dimensions
         body_mass = self.cfg['ROBOT_MASS'] - 2 * self.cfg['WHEEL_MASS']
         wheel_radius = self.cfg['WHEEL_DIAMETER'] / 2
+        wheel_width = 0.02  # 2cm wide wheels
+        body_z = wheel_radius + self.cfg['BODY_HEIGHT'] / 2
         
-        # Create body collision shape (box)
+        # Create collision shapes
         body_shape = p.createCollisionShape(
             p.GEOM_BOX,
             halfExtents=[
@@ -120,67 +122,54 @@ class BalanceBot:
             ]
         )
         
-        # Create the robot body
-        # Position body so its bottom aligns with wheel center height
-        body_z = wheel_radius + self.cfg['BODY_HEIGHT'] / 2
-        self.body_id = p.createMultiBody(
-            baseMass=body_mass,
-            baseCollisionShapeIndex=body_shape,
-            basePosition=[0, 0, body_z],
-            baseOrientation=[0, 0, 0, 1]
-        )
-        
-        # Create wheel collision shape (single cylinder)
-        # Use a narrow wheel width to avoid intersecting with body
-        wheel_width = 0.02  # 2cm wide wheels
         wheel_shape = p.createCollisionShape(
             p.GEOM_CYLINDER,
             radius=wheel_radius,
             height=wheel_width
         )
         
-        # Create left and right wheels as separate bodies
-        # Position wheels relative to robot body center
-        # Body center is at body_z, so wheels should be at body_z - BODY_HEIGHT/2 (bottom of body)
-        wheel_positions = [
-            [-self.cfg['AXLE_WIDTH'] / 2, 0, body_z - self.cfg['BODY_HEIGHT'] / 2],
-            [self.cfg['AXLE_WIDTH'] / 2, 0, body_z - self.cfg['BODY_HEIGHT'] / 2]
-        ]
+        # Create robot as multi-body with wheels as revolute-joint links
+        self.body_id = p.createMultiBody(
+            baseMass=body_mass,
+            baseCollisionShapeIndex=body_shape,
+            basePosition=[0, 0, body_z],
+            baseOrientation=p.getQuaternionFromEuler([self.cfg['INITIAL_PITCH'], 0, 0]),
+
+            linkMasses=[self.cfg['WHEEL_MASS'], self.cfg['WHEEL_MASS']],
+            linkCollisionShapeIndices=[wheel_shape, wheel_shape],
+            linkVisualShapeIndices=[-1, -1],  # or wheel_visual if you have one
+
+            linkPositions=[
+                [-self.cfg['AXLE_WIDTH'] / 2, 0, -self.cfg['BODY_HEIGHT'] / 2],
+                [ self.cfg['AXLE_WIDTH'] / 2, 0, -self.cfg['BODY_HEIGHT'] / 2]
+            ],
+
+            linkOrientations=[
+                p.getQuaternionFromEuler([0, math.pi/2, 0]),
+                p.getQuaternionFromEuler([0, math.pi/2, 0])
+            ],
+
+            linkInertialFramePositions=[[0,0,0],[0,0,0]],
+            linkInertialFrameOrientations=[
+                [0,0,0,1],
+                [0,0,0,1]
+            ],
+
+            linkParentIndices=[0, 0],
+            linkJointTypes=[p.JOINT_REVOLUTE, p.JOINT_REVOLUTE],
+            linkJointAxis=[[0, 1, 0], [0, 1, 0]]
+        )
         
-        self.wheel_ids = []
-        for pos in wheel_positions:
-            wheel_id = p.createMultiBody(
-                baseMass=self.cfg['WHEEL_MASS'],
-                baseCollisionShapeIndex=wheel_shape,
-                basePosition=pos,
-                baseOrientation=p.getQuaternionFromEuler([0, math.pi/2, 0])
-            )
-            self.wheel_ids.append(wheel_id)
-        
-        # Create hinged connections (allow rotation around Y-axis only)
-        for i, wheel_id in enumerate(self.wheel_ids):
-            p.createConstraint(
-                parentBodyUniqueId=self.body_id,
-                parentLinkIndex=-1,
-                childBodyUniqueId=wheel_id,
-                childLinkIndex=-1,
-                jointType=p.JOINT_POINT2POINT,
-                jointAxis=[0, 0, 0],
-                parentFramePosition=[wheel_positions[i][0], 0, -self.cfg['BODY_HEIGHT'] / 2],
-                childFramePosition=[0, 0, 0]
-            )
+        # Store wheel link indices (0 and 1 for the two wheels)
+        self.wheel_ids = [0, 1]
         
         # Set friction and damping
         p.changeDynamics(self.body_id, -1, lateralFriction=self.cfg['GROUND_FRICTION'],
                         linearDamping=0.0, angularDamping=0.0)
         
-        for wheel_id in self.wheel_ids:
-            p.changeDynamics(wheel_id, -1, lateralFriction=self.cfg['WHEEL_FRICTION'],
+        for wheel_link in self.wheel_ids:
+            p.changeDynamics(self.body_id, wheel_link, lateralFriction=self.cfg['WHEEL_FRICTION'],
                             linearDamping=0.0, angularDamping=0.0)
-        
-        # Apply initial tilt (pitch)
-        initial_orn = p.getQuaternionFromEuler([self.cfg['INITIAL_PITCH'], 0, 0])
-        p.resetBasePositionAndOrientation(self.body_id, [0, 0, body_z], initial_orn)
     
     def get_state(self):
         """
@@ -242,12 +231,12 @@ class BalanceBot:
         force = np.clip(force, -max_force, max_force)
         self.control_torque = force * (self.cfg['WHEEL_DIAMETER'] / 2)
         
-        # Apply torque to both wheels to spin them (creating motion)
+        # Apply torque to both wheel links to spin them (creating motion)
         # Positive force tilting forward should spin wheels forward
-        for wheel_id in self.wheel_ids:
+        for wheel_link in self.wheel_ids:
             p.applyExternalTorque(
-                objectUniqueId=wheel_id,
-                linkIndex=-1,
+                objectUniqueId=self.body_id,
+                linkIndex=wheel_link,
                 torqueObj=[0, 0, -force],  # torque around Y-axis (wheel rotation axis)
                 flags=p.LINK_FRAME
             )
