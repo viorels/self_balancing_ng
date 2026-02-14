@@ -110,6 +110,7 @@ class BalanceBot:
         body_mass = self.cfg['ROBOT_MASS'] - 2 * self.cfg['WHEEL_MASS']
         wheel_radius = self.cfg['WHEEL_DIAMETER'] / 2
         wheel_width = 0.02  # 2cm wide wheels
+        wheel_spacing = self.cfg['AXLE_WIDTH'] / 2 + 0.01
         body_z = wheel_radius + self.cfg['BODY_HEIGHT'] / 2
         
         # Create collision shapes
@@ -139,14 +140,16 @@ class BalanceBot:
             linkCollisionShapeIndices=[wheel_shape, wheel_shape],
             linkVisualShapeIndices=[-1, -1],  # or wheel_visual if you have one
 
+            # Wheels are left/right of the body along the Y axis
             linkPositions=[
-                [-self.cfg['AXLE_WIDTH'] / 2, 0, -self.cfg['BODY_HEIGHT'] / 2],
-                [ self.cfg['AXLE_WIDTH'] / 2, 0, -self.cfg['BODY_HEIGHT'] / 2]
+                [0, -wheel_spacing, -self.cfg['BODY_HEIGHT'] / 2],
+                [0,  wheel_spacing, -self.cfg['BODY_HEIGHT'] / 2]
             ],
 
+            # PyBullet cylinders are Z-aligned by default; rotate so cylinder axis aligns with wheel axle (Y)
             linkOrientations=[
-                p.getQuaternionFromEuler([0, math.pi/2, 0]),
-                p.getQuaternionFromEuler([0, math.pi/2, 0])
+                p.getQuaternionFromEuler([math.pi / 2, 0, 0]),
+                p.getQuaternionFromEuler([math.pi / 2, 0, 0])
             ],
 
             linkInertialFramePositions=[[0,0,0],[0,0,0]],
@@ -157,11 +160,25 @@ class BalanceBot:
 
             linkParentIndices=[0, 0],
             linkJointTypes=[p.JOINT_REVOLUTE, p.JOINT_REVOLUTE],
-            linkJointAxis=[[0, 1, 0], [0, 1, 0]]
+
+            # Joint axis is in the child (wheel) local frame.
+            # The wheel cylinder is rotated 90° around X, so local-Z maps to world-Y (the axle).
+            # Use [0,0,1] so wheels spin around their cylinder axis (world-Y axle).
+            linkJointAxis=[[0, 0, 1], [0, 0, 1]]
         )
         
         # Store wheel link indices (0 and 1 for the two wheels)
         self.wheel_ids = [0, 1]
+
+        # Disable the default joint motors so we can apply pure torque control
+        for wheel_joint in self.wheel_ids:
+            p.setJointMotorControl2(
+                bodyUniqueId=self.body_id,
+                jointIndex=wheel_joint,
+                controlMode=p.VELOCITY_CONTROL,
+                targetVelocity=0.0,
+                force=0.0,
+            )
         
         # Set friction and damping
         p.changeDynamics(self.body_id, -1, lateralFriction=self.cfg['GROUND_FRICTION'],
@@ -171,7 +188,7 @@ class BalanceBot:
             p.changeDynamics(self.body_id, wheel_link, lateralFriction=self.cfg['WHEEL_FRICTION'],
                             linearDamping=0.0, angularDamping=0.0)
     
-    def get_state(self):
+    def get_state(self, *, noise: bool = True):
         """
         Read robot state from PyBullet (simulated IMU).
         
@@ -185,11 +202,13 @@ class BalanceBot:
         
         # Convert quaternion to Euler angles
         euler = p.getEulerFromQuaternion(orn)
-        pitch = euler[0]  # pitch is X-axis rotation (forward/backward tilt)
-        pitch_rate = ang_vel[0]  # angular velocity around X-axis
+        # PyBullet Euler angles are (roll=X, pitch=Y, yaw=Z). For a 2-wheel bot that moves along X,
+        # the balancing tilt is about the Y axis.
+        pitch = euler[1]
+        pitch_rate = ang_vel[1]
         
         # Add sensor noise if enabled
-        if self.cfg['ADD_SENSOR_NOISE']:
+        if noise and self.cfg['ADD_SENSOR_NOISE']:
             pitch += np.random.normal(0, self.cfg['IMU_ANGLE_NOISE_STD'])
             pitch_rate += np.random.normal(0, self.cfg['IMU_GYRO_NOISE_STD'])
         
@@ -202,7 +221,7 @@ class BalanceBot:
         The controller uses pitch angle and pitch rate as feedback to maintain balance.
         We apply linear force to the wheels which creates motion and balancing torque.
         """
-        pitch, pitch_rate = self.get_state()
+        pitch, pitch_rate = self.get_state(noise=True)
         self.pitch_angle = pitch
         self.pitch_rate = pitch_rate
         
@@ -222,28 +241,23 @@ class BalanceBot:
         self.integral_pitch_error = np.clip(self.integral_pitch_error, -0.5, 0.5)
         i_term = self.cfg['PID_KI'] * self.integral_pitch_error
         
-        # Total control force (in Y direction)
-        force = p_term + d_term + i_term
-        
-        # Saturate force to motor limits (convert torque limit to force)
-        # F = tau / r
-        max_force = self.cfg['MAX_TORQUE'] / (self.cfg['WHEEL_DIAMETER'] / 2)
-        force = np.clip(force, -max_force, max_force)
-        self.control_torque = force * (self.cfg['WHEEL_DIAMETER'] / 2)
-        
-        # Apply torque to both wheel links to spin them (creating motion)
-        # Positive force tilting forward should spin wheels forward
-        for wheel_link in self.wheel_ids:
-            p.applyExternalTorque(
-                objectUniqueId=self.body_id,
-                linkIndex=wheel_link,
-                torqueObj=[0, 0, -force],  # torque around Y-axis (wheel rotation axis)
-                flags=p.LINK_FRAME
+        # Total control torque (about the wheel axle, Y)
+        torque = p_term + d_term + i_term
+        torque = float(np.clip(torque, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']))
+        self.control_torque = torque
+
+        # Apply the same torque to both wheels (differential drive forward/back)
+        for wheel_joint in self.wheel_ids:
+            p.setJointMotorControl2(
+                bodyUniqueId=self.body_id,
+                jointIndex=wheel_joint,
+                controlMode=p.TORQUE_CONTROL,
+                force=torque,
             )
     
     def check_fallen(self):
         """Check if robot has fallen over (abs pitch > 60 degrees)."""
-        pitch, _ = self.get_state()
+        pitch, _ = self.get_state(noise=False)
         return abs(pitch) > math.radians(60)
 
 
