@@ -52,17 +52,17 @@ CONFIG = {
     'AXLE_WIDTH': 0.10,  # distance between wheels
     
     # Initial conditions
-    'INITIAL_PITCH': 0.0,  # rad (~5.7 degrees)
+    'INITIAL_PITCH': 0.1,  # rad (~5.7 degrees)
     'INITIAL_HEIGHT': 0.08,  # m above ground
     
     # PID Controller gains
     # These are the main tuning parameters for balance control
-    'PID_KP': 15.0,   # proportional gain (pitch angle error)
+    'PID_KP': 8.0,   # proportional gain (pitch angle error)
     'PID_KD': 1.0,    # derivative gain (pitch rate)
     'PID_KI': 0.5,    # integral gain (accumulated pitch error)
     
     # Motor/actuator limits
-    'MAX_TORQUE': 2.0,  # Nm (motor saturation limit)
+    'MAX_TORQUE': 0.5,  # Nm (motor saturation limit)
     
     # Sensor simulation
     'IMU_ANGLE_NOISE_STD': 0.01,  # rad, standard deviation of angle noise
@@ -198,32 +198,71 @@ class BalanceBot:
             )
         
         # Set friction and damping
+        # Add small angular damping to body to resist yaw drift
         p.changeDynamics(self.body_id, -1, lateralFriction=self.cfg['GROUND_FRICTION'],
-                        linearDamping=0.0, angularDamping=0.0)
+                        linearDamping=0.0, angularDamping=0.05)
         
         for wheel_link in self.wheel_ids:
-            p.changeDynamics(self.body_id, wheel_link, lateralFriction=self.cfg['WHEEL_FRICTION'],
+            # spinningFriction resists the wheel spinning around the contact normal (Z),
+            # which is what causes yaw torque from wheel-ground contact asymmetry.
+            # rollingFriction adds realistic rolling resistance.
+            p.changeDynamics(self.body_id, wheel_link,
+                            lateralFriction=self.cfg['WHEEL_FRICTION'],
+                            spinningFriction=0.01,
+                            rollingFriction=0.001,
                             linearDamping=0.0, angularDamping=0.0)
     
     def get_state(self, *, noise: bool = True):
         """
         Read robot state from PyBullet (simulated IMU).
         
+        Computes pitch in the BODY frame so the reading is correct regardless
+        of the robot's yaw angle. The "pitch" is the forward tilt — the angle
+        between the body's up-vector and world vertical, projected onto the
+        body's forward-lateral plane.
+
         Returns:
-            pitch_angle: Body pitch in radians
+            pitch_angle: Body pitch in radians (positive = tilted forward/+X body)
             pitch_rate: Body pitch angular velocity in rad/s
         """
-        # Get body orientation and angular velocity
         pos, orn = p.getBasePositionAndOrientation(self.body_id)
         lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
         
-        # Convert quaternion to Euler angles
-        euler = p.getEulerFromQuaternion(orn)
-        # PyBullet Euler angles are (roll=X, pitch=Y, yaw=Z). For a 2-wheel bot that moves along X,
-        # the balancing tilt is about the Y axis.
-        pitch = euler[1]
-        pitch_rate = ang_vel[1]
-        
+        # --- Pitch angle (yaw-invariant) ---
+        # Get the rotation matrix from the quaternion.
+        # p.getMatrixFromQuaternion returns a flat 9-element list (row-major 3x3).
+        rot = p.getMatrixFromQuaternion(orn)
+        # Body's local Z-axis (up) expressed in world coordinates:
+        #   body_up_world = R * [0, 0, 1]
+        # That's the third column of the rotation matrix.
+        body_up_x = rot[2]   # R[0][2]
+        body_up_y = rot[5]   # R[1][2]
+        body_up_z = rot[8]   # R[2][2]
+
+        # Body's local X-axis (forward) expressed in world coordinates:
+        body_fwd_x = rot[0]  # R[0][0]
+        body_fwd_y = rot[3]  # R[1][0]
+        body_fwd_z = rot[6]  # R[2][0]
+
+        # The "forward tilt" pitch is how much the body's up-vector is tilted
+        # in the body's forward direction. Project body_up onto body_fwd in the
+        # world XY plane isn't right — instead use the direct geometric approach:
+        # pitch = atan2( -(body_up projected onto body_fwd), (body_up projected onto world_up) )
+        # Equivalently: pitch = atan2(-body_fwd_z_component_of_up, body_up_z)
+        # Simplest: pitch = atan2(-body_fwd_z, body_up_z)
+        # where body_fwd_z is the Z component of the body's forward (X) axis.
+        # If body is upright: body_fwd_z=0, body_up_z=1 -> pitch=0  ✓
+        # If body tilts forward: body_fwd_z<0, body_up_z<1 -> pitch>0 ✓
+        pitch = math.atan2(-body_fwd_z, body_up_z)
+
+        # --- Pitch rate (in body frame) ---
+        # Angular velocity from getBaseVelocity is in WORLD frame.
+        # Transform to body frame: omega_body = R^T * omega_world
+        # The pitch rate is the body-frame Y component of angular velocity.
+        # Body Y-axis in world = second column of R: (rot[1], rot[4], rot[7])
+        # body_omega_y = dot(body_y_world, omega_world)
+        pitch_rate = rot[1] * ang_vel[0] + rot[4] * ang_vel[1] + rot[7] * ang_vel[2]
+
         # Add sensor noise if enabled
         if noise and self.cfg['ADD_SENSOR_NOISE']:
             pitch += np.random.normal(0, self.cfg['IMU_ANGLE_NOISE_STD'])
@@ -299,9 +338,9 @@ class BalanceBot:
         }
 
     def check_fallen(self):
-        """Check if robot has fallen over (abs pitch > 60 degrees)."""
+        """Check if robot has fallen over (abs pitch > 45 degrees)."""
         pitch, _ = self.get_state(noise=False)
-        return abs(pitch) > math.radians(60)
+        return abs(pitch) > math.radians(45)
 
 
 # ============================================================================
