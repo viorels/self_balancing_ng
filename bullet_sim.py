@@ -38,7 +38,7 @@ CONFIG = {
     # Simulation parameters
     'GRAVITY': -9.81,
     'TIMESTEP': 1.0 / 500.0,  # 500 Hz simulation frequency
-    'SIM_DURATION': 10.0,  # seconds
+    'SIM_DURATION': 60.0,  # seconds
     'GROUND_FRICTION': 0.8,
     
     # Robot physical parameters
@@ -57,12 +57,12 @@ CONFIG = {
     
     # PID Controller gains
     # These are the main tuning parameters for balance control
-    'PID_KP': 8.0,   # proportional gain (pitch angle error)
-    'PID_KD': 3.0,   # derivative gain (pitch rate)
-    'PID_KI': 0.5,   # integral gain (accumulated pitch error)
+    'PID_KP': 15.0,   # proportional gain (pitch angle error)
+    'PID_KD': 1.0,    # derivative gain (pitch rate)
+    'PID_KI': 0.5,    # integral gain (accumulated pitch error)
     
     # Motor/actuator limits
-    'MAX_TORQUE': 0.5,  # Nm (motor saturation limit)
+    'MAX_TORQUE': 2.0,  # Nm (motor saturation limit)
     
     # Sensor simulation
     'IMU_ANGLE_NOISE_STD': 0.01,  # rad, standard deviation of angle noise
@@ -122,23 +122,40 @@ class BalanceBot:
                 self.cfg['BODY_HEIGHT'] / 2
             ]
         )
+        body_visual = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[
+                self.cfg['BODY_WIDTH'] / 2,
+                self.cfg['BODY_DEPTH'] / 2,
+                self.cfg['BODY_HEIGHT'] / 2
+            ],
+            rgbaColor=[0.2, 0.6, 1.0, 1.0]  # blue body
+        )
         
         wheel_shape = p.createCollisionShape(
             p.GEOM_CYLINDER,
             radius=wheel_radius,
             height=wheel_width
         )
+        wheel_visual = p.createVisualShape(
+            p.GEOM_CYLINDER,
+            radius=wheel_radius,
+            length=wheel_width,
+            rgbaColor=[0.1, 0.1, 0.1, 1.0]  # dark wheels
+        )
         
         # Create robot as multi-body with wheels as revolute-joint links
         self.body_id = p.createMultiBody(
             baseMass=body_mass,
             baseCollisionShapeIndex=body_shape,
+            baseVisualShapeIndex=body_visual,
             basePosition=[0, 0, body_z],
-            baseOrientation=p.getQuaternionFromEuler([self.cfg['INITIAL_PITCH'], 0, 0]),
+            # Initial pitch is rotation around Y axis (the wheel axle)
+            baseOrientation=p.getQuaternionFromEuler([0, self.cfg['INITIAL_PITCH'], 0]),
 
             linkMasses=[self.cfg['WHEEL_MASS'], self.cfg['WHEEL_MASS']],
             linkCollisionShapeIndices=[wheel_shape, wheel_shape],
-            linkVisualShapeIndices=[-1, -1],  # or wheel_visual if you have one
+            linkVisualShapeIndices=[wheel_visual, wheel_visual],
 
             # Wheels are left/right of the body along the Y axis
             linkPositions=[
@@ -254,7 +271,33 @@ class BalanceBot:
                 controlMode=p.TORQUE_CONTROL,
                 force=torque,
             )
-    
+
+    def get_debug_state(self):
+        """
+        Return comprehensive debug info for all axes.
+        Helps verify that axes are set up correctly.
+        """
+        pos, orn = p.getBasePositionAndOrientation(self.body_id)
+        lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
+        euler = p.getEulerFromQuaternion(orn)
+
+        # Get wheel joint states
+        wheel_states = []
+        for wid in self.wheel_ids:
+            js = p.getJointState(self.body_id, wid)
+            wheel_states.append({
+                'pos': js[0],     # joint position (angle in rad)
+                'vel': js[1],     # joint velocity (rad/s)
+                'torque': js[3],  # applied torque
+            })
+
+        return {
+            'pos': pos,
+            'euler_deg': (math.degrees(euler[0]), math.degrees(euler[1]), math.degrees(euler[2])),
+            'ang_vel_deg': (math.degrees(ang_vel[0]), math.degrees(ang_vel[1]), math.degrees(ang_vel[2])),
+            'wheels': wheel_states,
+        }
+
     def check_fallen(self):
         """Check if robot has fallen over (abs pitch > 60 degrees)."""
         pitch, _ = self.get_state(noise=False)
@@ -325,10 +368,16 @@ def run_simulation():
         
         # Log status periodically
         if sim_time - last_log_time >= log_interval:
-            pitch_deg = math.degrees(robot.pitch_angle)
-            print(f"[{sim_time:6.2f}s] Pitch: {pitch_deg:7.2f}° | "
-                  f"Rate: {math.degrees(robot.pitch_rate):7.2f}°/s | "
-                  f"Torque: {robot.control_torque:6.3f} Nm")
+            dbg = robot.get_debug_state()
+            rx, ry, rz = dbg['euler_deg']
+            wx, wy, wz = dbg['ang_vel_deg']
+            w0 = dbg['wheels'][0]
+            w1 = dbg['wheels'][1]
+            print(f"[{sim_time:5.2f}s] "
+                  f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
+                  f"AngVel(x={wx:6.1f} y={wy:6.1f} z={wz:6.1f})°/s | "
+                  f"Whl({w0['vel']:6.1f},{w1['vel']:6.1f})rad/s | "
+                  f"Trq: {robot.control_torque:6.3f}")
             last_log_time = sim_time
         
         # Small sleep to prevent GUI from freezing
