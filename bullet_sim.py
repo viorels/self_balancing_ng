@@ -2,25 +2,15 @@
 """
 Self-Balancing Robot Prototype using PyBullet and PID Control
 
-This script simulates a 2-wheel differential-drive self-balancing robot (inverted pendulum)
-using PyBullet physics simulation. The robot is stabilized using a PID controller that
-regulates the pitch angle and pitch rate.
+Realistic simulation including motor dynamics, sensor fusion, control latency,
+and mechanical imperfections to approximate real-world balancing difficulty.
 
 REQUIREMENTS:
     - PyBullet: pip install pybullet
     - NumPy: pip install numpy
 
 USAGE:
-    python3 balance_bot.py
-
-The simulation will:
-    1. Create a 2-wheel self-balancing robot
-    2. Give it a small initial tilt
-    3. Attempt to balance using PID control
-    4. Run for ~10 seconds (configurable)
-    5. Display pitch angle, control torque, and other metrics
-
-Parameters can be easily tuned by modifying the CONFIG dictionary at the top of the file.
+    python3 bullet_sim.py
 """
 
 import time
@@ -37,298 +27,404 @@ import pybullet_data
 CONFIG = {
     # Simulation parameters
     'GRAVITY': -9.81,
-    'TIMESTEP': 1.0 / 500.0,  # 500 Hz simulation frequency
-    'SIM_DURATION': 60.0,  # seconds
+    'TIMESTEP': 1.0 / 500.0,  # 500 Hz physics
+    'SIM_DURATION': 60.0,
     'GROUND_FRICTION': 0.8,
-    
+
     # Robot physical parameters
-    'ROBOT_MASS': 1.1,  # kg
-    'BODY_HEIGHT': 0.15,  # m
-    'BODY_WIDTH': 0.08,  # m
-    'BODY_DEPTH': 0.08,  # m
-    'WHEEL_DIAMETER': 0.095,  # m
-    'WHEEL_MASS': 0.15,  # kg each
+    'ROBOT_MASS': 1.1,
+    'BODY_HEIGHT': 0.15,
+    'BODY_WIDTH': 0.08,
+    'BODY_DEPTH': 0.08,
+    'WHEEL_DIAMETER': 0.095,
+    'WHEEL_MASS': 0.15,
     'WHEEL_FRICTION': 1.0,
-    'AXLE_WIDTH': 0.10,  # distance between wheels
-    
+    'AXLE_WIDTH': 0.10,
+
+    # Center of mass offset from geometric center (meters, body-local)
+    # Real robots are never perfectly symmetric
+    'COM_OFFSET': [0.002, 0.001, 0.005],
+
     # Initial conditions
-    'INITIAL_PITCH': 0.1,  # rad (~5.7 degrees)
-    'INITIAL_HEIGHT': 0.08,  # m above ground
-    
+    'INITIAL_PITCH': -0.05,  # rad (~2.9 degrees)
+    'INITIAL_HEIGHT': 0.08,
+
     # PID Controller gains
-    # These are the main tuning parameters for balance control
-    'PID_KP': 8.0,   # proportional gain (pitch angle error)
-    'PID_KD': 1.0,    # derivative gain (pitch rate)
-    'PID_KI': 0.5,    # integral gain (accumulated pitch error)
-    
-    # Motor/actuator limits
-    'MAX_TORQUE': 0.5,  # Nm (motor saturation limit)
-    
-    # Sensor simulation
-    'IMU_ANGLE_NOISE_STD': 0.01,  # rad, standard deviation of angle noise
-    'IMU_GYRO_NOISE_STD': 0.05,   # rad/s, standard deviation of gyro noise
-    'ADD_SENSOR_NOISE': True,  # Enable/disable noise
+    'PID_KP': 2.0,
+    'PID_KD': 0.1,
+    'PID_KI': 0.5,
+
+    # Motor/actuator limits (realistic small brushless)
+    'MAX_TORQUE': 0.5,  # Nm (stall torque)
+
+    # === REALISM PARAMETERS ===
+
+    # Motor model
+    'MOTOR_TAU': 0.003,          # Electrical time constant (s), 1st-order lag
+    'MOTOR_BACK_EMF_K': 0.005,   # Back-EMF constant: torque_loss = K * omega (Nm per rad/s)
+    'MOTOR_COGGING_AMPLITUDE': 0.005,  # Nm, cogging torque amplitude
+    'MOTOR_COGGING_POLES': 14,    # Number of magnetic poles (cogging frequency)
+    'MOTOR_DEADBAND': 0.01,       # Nm, minimum torque the motor can produce
+    'MOTOR_TORQUE_NOISE_STD': 0.005, # Nm, random torque variation
+
+    # Control loop
+    'CONTROL_RATE_HZ': 200,       # PID update rate (Hz) — typical for Arduino/ESP32
+    'CONTROL_JITTER_STD': 0.0005, # Timing jitter standard deviation (s)
+    'SENSOR_TO_ACTUATOR_DELAY_STEPS': 1,  # Extra timestep delay (sample → actuate pipeline)
+
+    # IMU sensor model
+    'ADD_SENSOR_NOISE': True,
+    'IMU_ANGLE_NOISE_STD': 0.003,   # rad — complementary filter output noise
+    'IMU_GYRO_NOISE_STD': 0.01,     # rad/s — gyro noise after filtering
+    'IMU_GYRO_DRIFT_RATE': 0.001,   # rad/s per second — slow gyro bias drift
+    'IMU_ACCEL_VIB_NOISE_STD': 0.15, # m/s² — vibration-induced accel noise
+    'IMU_SAMPLE_RATE_HZ': 500,       # IMU sample rate
+    'IMU_QUANTIZATION_BITS': 16,     # ADC resolution
+    'IMU_ACCEL_RANGE_G': 2,          # ±2g accelerometer range
+    'IMU_GYRO_RANGE_DPS': 500,       # ±500 deg/s gyro range
+
+    # Complementary filter (simulates real sensor fusion)
+    'COMP_FILTER_ALPHA': 0.02,       # Weight of accelerometer (0=pure gyro, 1=pure accel)
+
+    # Mechanical imperfections
+    'WHEEL_IMBALANCE_TORQUE': 0.002,  # Nm, periodic torque from wheel imbalance
 }
 
 
 # ============================================================================
-# ROBOT CLASS - Encapsulates robot creation and control
+# REALISTIC MOTOR MODEL
+# ============================================================================
+
+class BrushlessMotorModel:
+    """
+    Simulates a brushless DC motor with:
+    - First-order lag (electrical time constant)
+    - Back-EMF (torque drops with speed)
+    - Cogging torque
+    - Deadband
+    - Torque noise
+    """
+
+    def __init__(self, config):
+        self.cfg = config
+        self.actual_torque = 0.0  # Current output torque (after lag)
+        self.tau = config['MOTOR_TAU']
+
+    def update(self, commanded_torque, wheel_velocity, dt):
+        """
+        Compute actual motor torque given commanded torque and wheel speed.
+
+        Args:
+            commanded_torque: Desired torque from controller (Nm)
+            wheel_velocity: Current wheel angular velocity (rad/s)
+            dt: Time step (s)
+
+        Returns:
+            Actual torque applied to the wheel (Nm)
+        """
+        # 1. First-order lag (motor electrical dynamics)
+        #    tau * d(torque)/dt + torque = command
+        #    Discrete: torque += (command - torque) * dt / tau
+        if self.tau > 0:
+            alpha = min(1.0, dt / self.tau)
+            self.actual_torque += (commanded_torque - self.actual_torque) * alpha
+        else:
+            self.actual_torque = commanded_torque
+
+        torque = self.actual_torque
+
+        # 2. Back-EMF: torque capability decreases with speed
+        #    Available torque = stall_torque - K * |omega|
+        back_emf_loss = self.cfg['MOTOR_BACK_EMF_K'] * abs(wheel_velocity)
+        max_available = max(0.0, self.cfg['MAX_TORQUE'] - back_emf_loss)
+        torque = np.clip(torque, -max_available, max_available)
+
+        # 3. Cogging torque (periodic resistance from magnets)
+        cogging = self.cfg['MOTOR_COGGING_AMPLITUDE'] * math.sin(
+            self.cfg['MOTOR_COGGING_POLES'] * wheel_velocity * dt * 100  # approximate rotor angle
+        )
+        torque += cogging
+
+        # 4. Deadband: motor can't produce very small torques
+        if abs(torque) < self.cfg['MOTOR_DEADBAND']:
+            torque = 0.0
+
+        # 5. Torque noise (electrical noise, commutation ripple)
+        torque += np.random.normal(0, self.cfg['MOTOR_TORQUE_NOISE_STD'])
+
+        # Final clamp
+        torque = np.clip(torque, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+
+        return float(torque)
+
+
+# ============================================================================
+# REALISTIC IMU SENSOR MODEL
+# ============================================================================
+
+class IMUSensorModel:
+    """
+    Simulates a MEMS IMU (e.g. MPU6050) with:
+    - Accelerometer-based angle (noisy, vibration-sensitive, no drift)
+    - Gyroscope-based angle (low noise, but drifts)
+    - Complementary filter fusion
+    - Quantization
+    - Sample rate limiting
+    """
+
+    def __init__(self, config):
+        self.cfg = config
+        self.fused_pitch = 0.0  # Complementary filter output
+        self.gyro_bias = 0.0    # Slowly drifting gyro bias
+        self.last_sample_time = 0.0
+        self.sample_period = 1.0 / config['IMU_SAMPLE_RATE_HZ']
+
+        # Quantization parameters
+        accel_range_mps2 = config['IMU_ACCEL_RANGE_G'] * 9.81
+        self.accel_lsb = (2 * accel_range_mps2) / (2 ** config['IMU_QUANTIZATION_BITS'])
+        gyro_range_rps = math.radians(config['IMU_GYRO_RANGE_DPS'])
+        self.gyro_lsb = (2 * gyro_range_rps) / (2 ** config['IMU_QUANTIZATION_BITS'])
+
+    def _quantize(self, value, lsb):
+        """Simulate ADC quantization."""
+        return round(value / lsb) * lsb
+
+    def read(self, true_pitch, true_pitch_rate, sim_time, dt):
+        """
+        Simulate an IMU reading with realistic noise and fusion.
+
+        Args:
+            true_pitch: Actual pitch angle (rad) from physics
+            true_pitch_rate: Actual pitch rate (rad/s) from physics
+            sim_time: Current simulation time
+            dt: Physics timestep
+
+        Returns:
+            (measured_pitch, measured_pitch_rate)
+        """
+        if not self.cfg['ADD_SENSOR_NOISE']:
+            return true_pitch, true_pitch_rate
+
+        # === Gyroscope model ===
+        # Gyro drift: bias wanders slowly (random walk)
+        self.gyro_bias += np.random.normal(0, self.cfg['IMU_GYRO_DRIFT_RATE'] * dt)
+
+        # Gyro reading = true rate + bias + noise
+        gyro_reading = true_pitch_rate + self.gyro_bias
+        gyro_reading += np.random.normal(0, self.cfg['IMU_GYRO_NOISE_STD'])
+        gyro_reading = self._quantize(gyro_reading, self.gyro_lsb)
+
+        # === Accelerometer model ===
+        # Accel measures gravity direction, giving absolute pitch
+        # But it's corrupted by vibration and linear acceleration
+        accel_pitch = true_pitch
+        accel_pitch += np.random.normal(0, self.cfg['IMU_ANGLE_NOISE_STD'])
+        # Vibration noise (from motors, wheel impacts)
+        vibration = np.random.normal(0, self.cfg['IMU_ACCEL_VIB_NOISE_STD'])
+        # Convert vibration acceleration to angle error: approx atan(a_noise / g)
+        accel_pitch += math.atan2(vibration, 9.81)
+        # Quantize the underlying accelerometer values
+        accel_pitch = self._quantize(accel_pitch, self.accel_lsb)
+
+        # === Complementary filter ===
+        # Fuse: trust gyro for fast changes, accel for absolute reference
+        alpha = self.cfg['COMP_FILTER_ALPHA']
+        gyro_angle = self.fused_pitch + gyro_reading * dt
+        self.fused_pitch = (1.0 - alpha) * gyro_angle + alpha * accel_pitch
+
+        return self.fused_pitch, gyro_reading
+
+
+# ============================================================================
+# ROBOT CLASS
 # ============================================================================
 
 class BalanceBot:
-    """A 2-wheel self-balancing robot with PID control."""
-    
+    """A 2-wheel self-balancing robot with realistic motor and sensor models."""
+
     def __init__(self, physics_client_id, config):
-        """
-        Create the robot in PyBullet.
-        
-        Args:
-            physics_client_id: PyBullet physics client ID
-            config: Configuration dictionary
-        """
         self.pc = physics_client_id
         self.cfg = config
-        
-        # Create robot body and wheels
+
         self.body_id = None
         self.wheel_ids = []
         self._create_robot()
-        
+
         # PID controller state
         self.prev_pitch_error = 0.0
         self.integral_pitch_error = 0.0
-        
-        # Sensor data (with optional noise)
+
+        # Realistic motor models (one per wheel)
+        self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
+
+        # Realistic IMU sensor model
+        self.imu = IMUSensorModel(config)
+
+        # Control loop timing
+        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
+        self.time_since_last_control = 0.0
+        self.next_control_time = 0.0
+
+        # Sensor-to-actuator delay buffer
+        delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
+        self.torque_delay_buffer = [0.0] * (delay_steps + 1)
+
+        # Output state for logging
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.control_torque = 0.0
-        
+        self.actual_torques = [0.0, 0.0]
+
     def _create_robot(self):
-        """Create the robot body and wheels in PyBullet using a single createMultiBody call."""
-        
-        # Calculate dimensions
+        """Create the robot body and wheels using createMultiBody."""
         body_mass = self.cfg['ROBOT_MASS'] - 2 * self.cfg['WHEEL_MASS']
         wheel_radius = self.cfg['WHEEL_DIAMETER'] / 2
-        wheel_width = 0.02  # 2cm wide wheels
+        wheel_width = 0.02
         wheel_spacing = self.cfg['AXLE_WIDTH'] / 2 + 0.01
         body_z = wheel_radius + self.cfg['BODY_HEIGHT'] / 2
-        
-        # Create collision shapes
+
+        # Collision and visual shapes
         body_shape = p.createCollisionShape(
             p.GEOM_BOX,
-            halfExtents=[
-                self.cfg['BODY_WIDTH'] / 2,
-                self.cfg['BODY_DEPTH'] / 2,
-                self.cfg['BODY_HEIGHT'] / 2
-            ]
+            halfExtents=[self.cfg['BODY_WIDTH']/2, self.cfg['BODY_DEPTH']/2, self.cfg['BODY_HEIGHT']/2]
         )
         body_visual = p.createVisualShape(
             p.GEOM_BOX,
-            halfExtents=[
-                self.cfg['BODY_WIDTH'] / 2,
-                self.cfg['BODY_DEPTH'] / 2,
-                self.cfg['BODY_HEIGHT'] / 2
-            ],
-            rgbaColor=[0.2, 0.6, 1.0, 1.0]  # blue body
+            halfExtents=[self.cfg['BODY_WIDTH']/2, self.cfg['BODY_DEPTH']/2, self.cfg['BODY_HEIGHT']/2],
+            rgbaColor=[0.2, 0.6, 1.0, 1.0]
         )
-        
-        wheel_shape = p.createCollisionShape(
-            p.GEOM_CYLINDER,
-            radius=wheel_radius,
-            height=wheel_width
-        )
-        wheel_visual = p.createVisualShape(
-            p.GEOM_CYLINDER,
-            radius=wheel_radius,
-            length=wheel_width,
-            rgbaColor=[0.1, 0.1, 0.1, 1.0]  # dark wheels
-        )
-        
-        # Create robot as multi-body with wheels as revolute-joint links
+
+        wheel_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=wheel_radius, height=wheel_width)
+        wheel_visual = p.createVisualShape(p.GEOM_CYLINDER, radius=wheel_radius, length=wheel_width,
+                                           rgbaColor=[0.1, 0.1, 0.1, 1.0])
+
         self.body_id = p.createMultiBody(
             baseMass=body_mass,
             baseCollisionShapeIndex=body_shape,
             baseVisualShapeIndex=body_visual,
             basePosition=[0, 0, body_z],
-            # Initial pitch is rotation around Y axis (the wheel axle)
             baseOrientation=p.getQuaternionFromEuler([0, self.cfg['INITIAL_PITCH'], 0]),
+            # Center of mass offset for asymmetry
+            baseInertialFramePosition=self.cfg['COM_OFFSET'],
+            baseInertialFrameOrientation=[0, 0, 0, 1],
 
             linkMasses=[self.cfg['WHEEL_MASS'], self.cfg['WHEEL_MASS']],
             linkCollisionShapeIndices=[wheel_shape, wheel_shape],
             linkVisualShapeIndices=[wheel_visual, wheel_visual],
-
-            # Wheels are left/right of the body along the Y axis
             linkPositions=[
-                [0, -wheel_spacing, -self.cfg['BODY_HEIGHT'] / 2],
-                [0,  wheel_spacing, -self.cfg['BODY_HEIGHT'] / 2]
+                [0, -wheel_spacing, -self.cfg['BODY_HEIGHT']/2],
+                [0,  wheel_spacing, -self.cfg['BODY_HEIGHT']/2]
             ],
-
-            # PyBullet cylinders are Z-aligned by default; rotate so cylinder axis aligns with wheel axle (Y)
             linkOrientations=[
-                p.getQuaternionFromEuler([math.pi / 2, 0, 0]),
-                p.getQuaternionFromEuler([math.pi / 2, 0, 0])
+                p.getQuaternionFromEuler([math.pi/2, 0, 0]),
+                p.getQuaternionFromEuler([math.pi/2, 0, 0])
             ],
-
-            linkInertialFramePositions=[[0,0,0],[0,0,0]],
-            linkInertialFrameOrientations=[
-                [0,0,0,1],
-                [0,0,0,1]
-            ],
-
+            linkInertialFramePositions=[[0, 0, 0], [0, 0, 0]],
+            linkInertialFrameOrientations=[[0, 0, 0, 1], [0, 0, 0, 1]],
             linkParentIndices=[0, 0],
             linkJointTypes=[p.JOINT_REVOLUTE, p.JOINT_REVOLUTE],
-
-            # Joint axis is in the child (wheel) local frame.
-            # The wheel cylinder is rotated 90° around X, so local-Z maps to world-Y (the axle).
-            # Use [0,0,1] so wheels spin around their cylinder axis (world-Y axle).
             linkJointAxis=[[0, 0, 1], [0, 0, 1]]
         )
-        
-        # Store wheel link indices (0 and 1 for the two wheels)
+
         self.wheel_ids = [0, 1]
 
-        # Disable the default joint motors so we can apply pure torque control
-        for wheel_joint in self.wheel_ids:
-            p.setJointMotorControl2(
-                bodyUniqueId=self.body_id,
-                jointIndex=wheel_joint,
-                controlMode=p.VELOCITY_CONTROL,
-                targetVelocity=0.0,
-                force=0.0,
-            )
-        
-        # Set friction and damping
-        # Add small angular damping to body to resist yaw drift
-        p.changeDynamics(self.body_id, -1, lateralFriction=self.cfg['GROUND_FRICTION'],
-                        linearDamping=0.0, angularDamping=0.05)
-        
-        for wheel_link in self.wheel_ids:
-            # spinningFriction resists the wheel spinning around the contact normal (Z),
-            # which is what causes yaw torque from wheel-ground contact asymmetry.
-            # rollingFriction adds realistic rolling resistance.
-            p.changeDynamics(self.body_id, wheel_link,
-                            lateralFriction=self.cfg['WHEEL_FRICTION'],
-                            spinningFriction=0.01,
-                            rollingFriction=0.001,
-                            linearDamping=0.0, angularDamping=0.0)
-    
-    def get_state(self, *, noise: bool = True):
-        """
-        Read robot state from PyBullet (simulated IMU).
-        
-        Computes pitch in the BODY frame so the reading is correct regardless
-        of the robot's yaw angle. The "pitch" is the forward tilt — the angle
-        between the body's up-vector and world vertical, projected onto the
-        body's forward-lateral plane.
+        # Disable default joint motors
+        for wid in self.wheel_ids:
+            p.setJointMotorControl2(self.body_id, wid, p.VELOCITY_CONTROL,
+                                    targetVelocity=0.0, force=0.0)
 
-        Returns:
-            pitch_angle: Body pitch in radians (positive = tilted forward/+X body)
-            pitch_rate: Body pitch angular velocity in rad/s
-        """
+        # Dynamics
+        p.changeDynamics(self.body_id, -1, lateralFriction=self.cfg['GROUND_FRICTION'],
+                         linearDamping=0.0, angularDamping=0.05)
+        for wid in self.wheel_ids:
+            p.changeDynamics(self.body_id, wid,
+                             lateralFriction=self.cfg['WHEEL_FRICTION'],
+                             spinningFriction=0.01, rollingFriction=0.001,
+                             linearDamping=0.0, angularDamping=0.0)
+
+    def _get_true_state(self):
+        """Read true pitch from physics (body-frame, yaw-invariant)."""
         pos, orn = p.getBasePositionAndOrientation(self.body_id)
         lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
-        
-        # --- Pitch angle (yaw-invariant) ---
-        # Get the rotation matrix from the quaternion.
-        # p.getMatrixFromQuaternion returns a flat 9-element list (row-major 3x3).
+
         rot = p.getMatrixFromQuaternion(orn)
-        # Body's local Z-axis (up) expressed in world coordinates:
-        #   body_up_world = R * [0, 0, 1]
-        # That's the third column of the rotation matrix.
-        body_up_x = rot[2]   # R[0][2]
-        body_up_y = rot[5]   # R[1][2]
-        body_up_z = rot[8]   # R[2][2]
-
-        # Body's local X-axis (forward) expressed in world coordinates:
-        body_fwd_x = rot[0]  # R[0][0]
-        body_fwd_y = rot[3]  # R[1][0]
-        body_fwd_z = rot[6]  # R[2][0]
-
-        # The "forward tilt" pitch is how much the body's up-vector is tilted
-        # in the body's forward direction. Project body_up onto body_fwd in the
-        # world XY plane isn't right — instead use the direct geometric approach:
-        # pitch = atan2( -(body_up projected onto body_fwd), (body_up projected onto world_up) )
-        # Equivalently: pitch = atan2(-body_fwd_z_component_of_up, body_up_z)
-        # Simplest: pitch = atan2(-body_fwd_z, body_up_z)
-        # where body_fwd_z is the Z component of the body's forward (X) axis.
-        # If body is upright: body_fwd_z=0, body_up_z=1 -> pitch=0  ✓
-        # If body tilts forward: body_fwd_z<0, body_up_z<1 -> pitch>0 ✓
+        body_up_z = rot[8]
+        body_fwd_z = rot[6]
         pitch = math.atan2(-body_fwd_z, body_up_z)
 
-        # --- Pitch rate (in body frame) ---
-        # Angular velocity from getBaseVelocity is in WORLD frame.
-        # Transform to body frame: omega_body = R^T * omega_world
-        # The pitch rate is the body-frame Y component of angular velocity.
-        # Body Y-axis in world = second column of R: (rot[1], rot[4], rot[7])
-        # body_omega_y = dot(body_y_world, omega_world)
         pitch_rate = rot[1] * ang_vel[0] + rot[4] * ang_vel[1] + rot[7] * ang_vel[2]
 
-        # Add sensor noise if enabled
-        if noise and self.cfg['ADD_SENSOR_NOISE']:
-            pitch += np.random.normal(0, self.cfg['IMU_ANGLE_NOISE_STD'])
-            pitch_rate += np.random.normal(0, self.cfg['IMU_GYRO_NOISE_STD'])
-        
         return pitch, pitch_rate
-    
-    def update_control(self):
-        """
-        Update the PID controller and apply forces to wheels.
-        
-        The controller uses pitch angle and pitch rate as feedback to maintain balance.
-        We apply linear force to the wheels which creates motion and balancing torque.
-        """
-        pitch, pitch_rate = self.get_state(noise=True)
-        self.pitch_angle = pitch
-        self.pitch_rate = pitch_rate
-        
-        # PID control law
-        # Goal: pitch angle -> 0, pitch rate -> 0
-        pitch_error = 0.0 - pitch  # positive error -> positive force forward
-        
-        # Proportional term
-        p_term = self.cfg['PID_KP'] * pitch_error
-        
-        # Derivative term (damping)
-        d_term = self.cfg['PID_KD'] * (0.0 - pitch_rate)
-        
-        # Integral term (long-term bias correction)
-        self.integral_pitch_error += pitch_error * self.cfg['TIMESTEP']
-        # Clamp integral to prevent windup
-        self.integral_pitch_error = np.clip(self.integral_pitch_error, -0.5, 0.5)
-        i_term = self.cfg['PID_KI'] * self.integral_pitch_error
-        
-        # Total control torque (about the wheel axle, Y)
-        torque = p_term + d_term + i_term
-        torque = float(np.clip(torque, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']))
-        self.control_torque = torque
 
-        # Apply the same torque to both wheels (differential drive forward/back)
-        for wheel_joint in self.wheel_ids:
+    def update(self, sim_time, dt):
+        """
+        Update sensor reading, control loop, and motor output.
+        Called every physics timestep, but PID only runs at CONTROL_RATE_HZ.
+        """
+        # --- Read true state and pass through IMU model ---
+        true_pitch, true_pitch_rate = self._get_true_state()
+        measured_pitch, measured_pitch_rate = self.imu.read(
+            true_pitch, true_pitch_rate, sim_time, dt
+        )
+        self.pitch_angle = measured_pitch
+        self.pitch_rate = measured_pitch_rate
+
+        # --- Control loop runs at limited rate with jitter ---
+        jitter = np.random.normal(0, self.cfg['CONTROL_JITTER_STD']) if self.cfg['ADD_SENSOR_NOISE'] else 0
+        if sim_time >= self.next_control_time:
+            self.next_control_time = sim_time + self.control_period + jitter
+
+            # PID on measured (noisy, delayed) state
+            pitch_error = 0.0 - measured_pitch
+            p_term = self.cfg['PID_KP'] * pitch_error
+            d_term = self.cfg['PID_KD'] * (0.0 - measured_pitch_rate)
+            self.integral_pitch_error += pitch_error * self.control_period
+            self.integral_pitch_error = np.clip(self.integral_pitch_error, -0.5, 0.5)
+            i_term = self.cfg['PID_KI'] * self.integral_pitch_error
+
+            commanded_torque = p_term + d_term + i_term
+            commanded_torque = float(np.clip(commanded_torque,
+                                             -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']))
+
+            # Push into delay buffer (simulates sample-compute-actuate pipeline)
+            self.torque_delay_buffer.append(commanded_torque)
+            self.control_torque = commanded_torque
+
+        # Pop delayed torque command
+        if len(self.torque_delay_buffer) > self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1:
+            delayed_torque = self.torque_delay_buffer.pop(0)
+        else:
+            delayed_torque = self.torque_delay_buffer[0]
+
+        # --- Apply through motor model (per wheel) ---
+        for i, wid in enumerate(self.wheel_ids):
+            wheel_vel = p.getJointState(self.body_id, wid)[1]
+
+            # Add wheel imbalance (periodic disturbance)
+            wheel_pos = p.getJointState(self.body_id, wid)[0]
+            imbalance = self.cfg['WHEEL_IMBALANCE_TORQUE'] * math.sin(wheel_pos)
+
+            actual_torque = self.motors[i].update(delayed_torque, wheel_vel, dt)
+            actual_torque += imbalance
+
+            self.actual_torques[i] = actual_torque
+
             p.setJointMotorControl2(
-                bodyUniqueId=self.body_id,
-                jointIndex=wheel_joint,
+                self.body_id, wid,
                 controlMode=p.TORQUE_CONTROL,
-                force=torque,
+                force=actual_torque
             )
 
     def get_debug_state(self):
-        """
-        Return comprehensive debug info for all axes.
-        Helps verify that axes are set up correctly.
-        """
+        """Return comprehensive debug info."""
         pos, orn = p.getBasePositionAndOrientation(self.body_id)
         lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
         euler = p.getEulerFromQuaternion(orn)
 
-        # Get wheel joint states
         wheel_states = []
         for wid in self.wheel_ids:
             js = p.getJointState(self.body_id, wid)
-            wheel_states.append({
-                'pos': js[0],     # joint position (angle in rad)
-                'vel': js[1],     # joint velocity (rad/s)
-                'torque': js[3],  # applied torque
-            })
+            wheel_states.append({'pos': js[0], 'vel': js[1], 'torque': js[3]})
 
         return {
             'pos': pos,
@@ -339,153 +435,89 @@ class BalanceBot:
 
     def check_fallen(self):
         """Check if robot has fallen over (abs pitch > 45 degrees)."""
-        pitch, _ = self.get_state(noise=False)
-        return abs(pitch) > math.radians(45)
+        true_pitch, _ = self._get_true_state()
+        return abs(true_pitch) > math.radians(45)
 
 
 # ============================================================================
-# SIMULATION SETUP AND MAIN LOOP
+# SIMULATION MAIN LOOP
 # ============================================================================
 
 def run_simulation():
     """Run the self-balancing robot simulation."""
-    
+
     print("=" * 70)
-    print("Self-Balancing Robot Simulation - PyBullet + PID Control")
+    print("Self-Balancing Robot — Realistic Simulation")
     print("=" * 70)
-    
-    # Connect to PyBullet (GUI mode for visualization)
+
     physics_client = p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    
-    # Setup simulation
+
     p.setGravity(0, 0, CONFIG['GRAVITY'])
     p.setPhysicsEngineParameter(fixedTimeStep=CONFIG['TIMESTEP'], numSubSteps=1)
-    
-    # Load ground plane
+
     ground_id = p.loadURDF("plane.urdf")
     p.changeDynamics(ground_id, -1, lateralFriction=CONFIG['GROUND_FRICTION'])
-    
-    # Create robot
+
     robot = BalanceBot(physics_client, CONFIG)
-    
-    # Set camera distance to 2m from robot
-    p.resetDebugVisualizerCamera(cameraDistance=1.0, cameraYaw=90, cameraPitch=-30, cameraTargetPosition=[0, 0, 0.1])
-    
-    # Print configuration
-    print(f"\nRobot Configuration:")
-    print(f"  Mass: {CONFIG['ROBOT_MASS']} kg")
-    print(f"  Body: {CONFIG['BODY_WIDTH']}m x {CONFIG['BODY_DEPTH']}m x {CONFIG['BODY_HEIGHT']}m")
-    print(f"  Wheels: {CONFIG['WHEEL_DIAMETER']}m diameter, {CONFIG['AXLE_WIDTH']}m apart")
-    print(f"  Initial pitch: {math.degrees(CONFIG['INITIAL_PITCH']):.1f}°")
-    
-    print(f"\nControl Configuration:")
-    print(f"  PID Gains: Kp={CONFIG['PID_KP']}, Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
-    print(f"  Max torque: {CONFIG['MAX_TORQUE']} Nm")
-    print(f"  Simulation rate: {1/CONFIG['TIMESTEP']:.0f} Hz")
-    
-    print(f"\nStarting simulation for {CONFIG['SIM_DURATION']} seconds...")
+
+    p.resetDebugVisualizerCamera(cameraDistance=1.0, cameraYaw=90, cameraPitch=-30,
+                                 cameraTargetPosition=[0, 0, 0.1])
+
+    print(f"\nRobot: {CONFIG['ROBOT_MASS']}kg, body {CONFIG['BODY_HEIGHT']}m tall, "
+          f"wheels ø{CONFIG['WHEEL_DIAMETER']}m")
+    print(f"PID: Kp={CONFIG['PID_KP']}, Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
+    print(f"Motor: τ={CONFIG['MOTOR_TAU']*1000:.0f}ms lag, "
+          f"back-EMF K={CONFIG['MOTOR_BACK_EMF_K']}, "
+          f"cogging={CONFIG['MOTOR_COGGING_AMPLITUDE']}Nm, "
+          f"deadband={CONFIG['MOTOR_DEADBAND']}Nm")
+    print(f"IMU: complementary filter α={CONFIG['COMP_FILTER_ALPHA']}, "
+          f"gyro drift={CONFIG['IMU_GYRO_DRIFT_RATE']} rad/s²")
+    print(f"Control: {CONFIG['CONTROL_RATE_HZ']}Hz, "
+          f"{CONFIG['SENSOR_TO_ACTUATOR_DELAY_STEPS']} step pipeline delay")
+    print(f"Initial pitch: {math.degrees(CONFIG['INITIAL_PITCH']):.1f}°")
     print("-" * 70)
-    
-    # Simulation loop
+
     sim_time = 0.0
-    log_interval = 0.1  # Print status every 0.1 seconds
+    log_interval = 0.1
     last_log_time = 0.0
-    
+
     while sim_time < CONFIG['SIM_DURATION']:
-        # Update robot control
-        robot.update_control()
-        
-        # Step simulation
+        robot.update(sim_time, CONFIG['TIMESTEP'])
         p.stepSimulation()
         sim_time += CONFIG['TIMESTEP']
-        
-        # Check if fallen
+
         if robot.check_fallen():
             print(f"\n[{sim_time:.2f}s] Robot fell over!")
             break
-        
-        # Log status periodically
+
         if sim_time - last_log_time >= log_interval:
             dbg = robot.get_debug_state()
             rx, ry, rz = dbg['euler_deg']
             wx, wy, wz = dbg['ang_vel_deg']
-            w0 = dbg['wheels'][0]
-            w1 = dbg['wheels'][1]
+            w0, w1 = dbg['wheels']
+            at0, at1 = robot.actual_torques
             print(f"[{sim_time:5.2f}s] "
                   f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
                   f"AngVel(x={wx:6.1f} y={wy:6.1f} z={wz:6.1f})°/s | "
                   f"Whl({w0['vel']:6.1f},{w1['vel']:6.1f})rad/s | "
-                  f"Trq: {robot.control_torque:6.3f}")
+                  f"Cmd:{robot.control_torque:6.3f} Act:{at0:6.3f},{at1:6.3f}")
             last_log_time = sim_time
-        
-        # Small sleep to prevent GUI from freezing
+
         time.sleep(CONFIG['TIMESTEP'])
-    
+
     print("-" * 70)
     final_pitch_deg = math.degrees(robot.pitch_angle)
-    print(f"\nSimulation complete!")
-    print(f"Final pitch: {final_pitch_deg:.2f}°")
-    
+    print(f"\nSimulation complete! Final pitch: {final_pitch_deg:.2f}°")
     if abs(final_pitch_deg) < 10:
-        print("✓ Robot successfully balanced!")
+        print("✓ Robot balanced!")
     else:
-        print("✗ Robot did not achieve stable balance.")
-    
+        print("✗ Robot fell.")
+
     print("\nClose the PyBullet window to exit.")
-    
-    # Keep simulation running until user closes the window
     while p.isConnected(physics_client):
         time.sleep(0.01)
-    
     p.disconnect()
-
-
-# ============================================================================
-# TUNING GUIDE
-# ============================================================================
-"""
-If the robot is not balancing well, try adjusting these parameters:
-
-PID_KP (Proportional Gain):
-    - Increase: Robot responds more aggressively to tilt
-    - Decrease: Robot responds more slowly
-    - Too high: Oscillation and instability
-    - Start: 5-12 N
-
-PID_KD (Derivative Gain):
-    - Increase: Damps oscillations, slows response
-    - Decrease: Less damping, more oscillatory
-    - Too high: Sluggish response
-    - Start: 2-4 N/(rad/s)
-
-PID_KI (Integral Gain):
-    - Increase: Corrects steady-state errors, reduces bias
-    - Decrease: Less correction of bias
-    - Too high: Integral windup, slow instability
-    - Start: 0.05-0.2 N
-
-MAX_TORQUE:
-    - Increase: Motor can exert more force
-    - Decrease: Simulate weaker motor
-    - Too low: Motor cannot balance robot
-
-WHEEL_FRICTION:
-    - Increase: Better traction, can apply force more effectively
-    - Decrease: Wheels slip more, reduced control authority
-
-If the robot oscillates:
-    - Increase KD (more damping)
-    - Decrease KP (less aggressive response)
-
-If the robot drifts and doesn't recover:
-    - Increase KI (correct steady-state bias)
-    - Decrease KP (may be oscillating)
-
-If the robot responds too slowly:
-    - Increase KP
-    - Decrease KI (can cause instability)
-"""
 
 
 if __name__ == "__main__":
