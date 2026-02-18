@@ -49,10 +49,18 @@ CONFIG = {
     'INITIAL_PITCH': -0.05,  # rad (~2.9 degrees)
     'INITIAL_HEIGHT': 0.08,
 
-    # PID Controller gains
+    # PID Controller gains (inner loop: pitch → torque)
     'PID_KP': 2.0,
     'PID_KD': 0.1,
     'PID_KI': 0.5,
+
+    # Outer-loop PID gains (position → target pitch angle)
+    # This loop keeps the robot from drifting by commanding a lean angle
+    'POS_PID_KP': 0.15,        # proportional: position error → lean angle
+    'POS_PID_KD': 0.03,         # derivative: velocity damping
+    'POS_PID_KI': 0.01,        # integral: correct steady-state drift
+    'POS_PID_MAX_PITCH': 0.15, # rad (~8.6°) — max lean angle the outer loop can request
+    'POS_PID_RATE_HZ': 50,     # outer loop runs slower than inner loop
 
     # Motor/actuator limits (realistic small brushless)
     'MAX_TORQUE': 0.5,  # Nm (stall torque)
@@ -88,7 +96,11 @@ CONFIG = {
 
     # Mechanical imperfections
     'WHEEL_IMBALANCE_TORQUE': 0.002,  # Nm, periodic torque from wheel imbalance
+
+    # Yaw damping gain
+    'YAW_DAMPING_K': 0.05
 }
+
 
 
 # ============================================================================
@@ -250,9 +262,18 @@ class BalanceBot:
         self.wheel_ids = []
         self._create_robot()
 
-        # PID controller state
+        # Inner PID controller state (pitch → torque)
         self.prev_pitch_error = 0.0
         self.integral_pitch_error = 0.0
+
+        # Outer PID controller state (position → target pitch)
+        self.target_pitch = 0.0          # output of outer loop, setpoint for inner loop
+        self.position = 0.0              # estimated position from wheel encoders (meters)
+        self.prev_position = 0.0         # for velocity estimation
+        self.integral_pos_error = 0.0
+        self.target_position = 0.0       # desired position (hold where we start)
+        self.pos_control_period = 1.0 / config['POS_PID_RATE_HZ']
+        self.next_pos_control_time = 0.0
 
         # Realistic motor models (one per wheel)
         self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
@@ -267,7 +288,7 @@ class BalanceBot:
 
         # Sensor-to-actuator delay buffer
         delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
-        self.torque_delay_buffer = [0.0] * (delay_steps + 1)
+        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
 
         # Output state for logging
         self.pitch_angle = 0.0
@@ -369,13 +390,41 @@ class BalanceBot:
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
-        # --- Control loop runs at limited rate with jitter ---
+        # --- Estimate position from wheel encoders (average of both wheels) ---
+        wheel_radius = self.cfg['WHEEL_DIAMETER'] / 2
+        w0_pos = p.getJointState(self.body_id, self.wheel_ids[0])[0]
+        w1_pos = p.getJointState(self.body_id, self.wheel_ids[1])[0]
+        self.position = wheel_radius * (w0_pos + w1_pos) / 2.0
+
+        # --- Outer PID loop: position → target pitch (runs at lower rate) ---
+        if sim_time >= self.next_pos_control_time:
+            self.next_pos_control_time = sim_time + self.pos_control_period
+
+            pos_error = self.position - self.target_position
+            velocity = (self.position - self.prev_position) / self.pos_control_period
+            self.prev_position = self.position
+
+            # PID terms — positive position error → positive (backward) lean
+            # to drive the robot back toward target
+            pos_p = self.cfg['POS_PID_KP'] * pos_error
+            pos_d = self.cfg['POS_PID_KD'] * velocity
+            self.integral_pos_error += pos_error * self.pos_control_period
+            self.integral_pos_error = np.clip(self.integral_pos_error, -1.0, 1.0)
+            pos_i = self.cfg['POS_PID_KI'] * self.integral_pos_error
+
+            self.target_pitch = float(np.clip(
+                pos_p + pos_d + pos_i,
+                -self.cfg['POS_PID_MAX_PITCH'],
+                 self.cfg['POS_PID_MAX_PITCH']
+            ))
+
+        # --- Inner control loop runs at limited rate with jitter ---
         jitter = np.random.normal(0, self.cfg['CONTROL_JITTER_STD']) if self.cfg['ADD_SENSOR_NOISE'] else 0
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
 
-            # PID on measured (noisy, delayed) state
-            pitch_error = 0.0 - measured_pitch
+            # PID on measured (noisy, delayed) state — setpoint from outer loop
+            pitch_error = self.target_pitch - measured_pitch
             p_term = self.cfg['PID_KP'] * pitch_error
             d_term = self.cfg['PID_KD'] * (0.0 - measured_pitch_rate)
             self.integral_pitch_error += pitch_error * self.control_period
@@ -386,17 +435,26 @@ class BalanceBot:
             commanded_torque = float(np.clip(commanded_torque,
                                              -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']))
 
+            # --- Yaw damping: oppose yaw rate with differential torque ---
+            _, ang_vel = p.getBaseVelocity(self.body_id)
+            # Project world yaw rate onto body-up axis
+            _, orn = p.getBasePositionAndOrientation(self.body_id)
+            rot = p.getMatrixFromQuaternion(orn)
+            yaw_rate = rot[2]*ang_vel[0] + rot[5]*ang_vel[1] + rot[8]*ang_vel[2]
+            yaw_correction = self.cfg['YAW_DAMPING_K'] * yaw_rate  # differential torque
+
             # Push into delay buffer (simulates sample-compute-actuate pipeline)
-            self.torque_delay_buffer.append(commanded_torque)
-            self.control_torque = commanded_torque
+            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
 
         # Pop delayed torque command
         if len(self.torque_delay_buffer) > self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1:
-            delayed_torque = self.torque_delay_buffer.pop(0)
+            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
         else:
-            delayed_torque = self.torque_delay_buffer[0]
+            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
 
         # --- Apply through motor model (per wheel) ---
+        # Left wheel gets +yaw_correction, right wheel gets -yaw_correction
+        yaw_signs = [+1.0, -1.0]
         for i, wid in enumerate(self.wheel_ids):
             wheel_vel = p.getJointState(self.body_id, wid)[1]
 
@@ -404,7 +462,9 @@ class BalanceBot:
             wheel_pos = p.getJointState(self.body_id, wid)[0]
             imbalance = self.cfg['WHEEL_IMBALANCE_TORQUE'] * math.sin(wheel_pos)
 
-            actual_torque = self.motors[i].update(delayed_torque, wheel_vel, dt)
+            actual_torque = self.motors[i].update(
+                delayed_torque + yaw_signs[i] * delayed_yaw, wheel_vel, dt
+            )
             actual_torque += imbalance
 
             self.actual_torques[i] = actual_torque
@@ -461,12 +521,14 @@ def run_simulation():
 
     robot = BalanceBot(physics_client, CONFIG)
 
-    p.resetDebugVisualizerCamera(cameraDistance=1.0, cameraYaw=90, cameraPitch=-30,
+    p.resetDebugVisualizerCamera(cameraDistance=1.0, cameraYaw=0, cameraPitch=-30,
                                  cameraTargetPosition=[0, 0, 0.1])
 
     print(f"\nRobot: {CONFIG['ROBOT_MASS']}kg, body {CONFIG['BODY_HEIGHT']}m tall, "
           f"wheels ø{CONFIG['WHEEL_DIAMETER']}m")
-    print(f"PID: Kp={CONFIG['PID_KP']}, Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
+    print(f"Inner PID (pitch→torque): Kp={CONFIG['PID_KP']}, Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
+    print(f"Outer PID (pos→pitch):   Kp={CONFIG['POS_PID_KP']}, Ki={CONFIG['POS_PID_KI']}, "
+          f"Kd={CONFIG['POS_PID_KD']}, max_pitch={math.degrees(CONFIG['POS_PID_MAX_PITCH']):.1f}°")
     print(f"Motor: τ={CONFIG['MOTOR_TAU']*1000:.0f}ms lag, "
           f"back-EMF K={CONFIG['MOTOR_BACK_EMF_K']}, "
           f"cogging={CONFIG['MOTOR_COGGING_AMPLITUDE']}Nm, "
@@ -499,7 +561,7 @@ def run_simulation():
             at0, at1 = robot.actual_torques
             print(f"[{sim_time:5.2f}s] "
                   f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
-                  f"AngVel(x={wx:6.1f} y={wy:6.1f} z={wz:6.1f})°/s | "
+                  f"Pos:{robot.position:6.3f}m TgtPitch:{math.degrees(robot.target_pitch):5.2f}° | "
                   f"Whl({w0['vel']:6.1f},{w1['vel']:6.1f})rad/s | "
                   f"Cmd:{robot.control_torque:6.3f} Act:{at0:6.3f},{at1:6.3f}")
             last_log_time = sim_time
