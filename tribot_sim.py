@@ -64,7 +64,7 @@ CONFIG = {
     'POS_PID_RATE_HZ': 50,
 
     # Motor / actuator limits
-    'MAX_TORQUE': 0.5,             # Nm (stall torque per motor, one motor per side)
+    'MAX_TORQUE': 1.0,             # Nm (stall torque per motor, one motor per side)
 
     # === REALISM PARAMETERS ===
 
@@ -507,12 +507,12 @@ class TribotBalanceBot:
         if sim_time >= self.next_pos_control_time:
             self.next_pos_control_time = sim_time + self.pos_control_period
 
-            pos_error = self.position - self.target_position
+            pos_error = self.target_position - self.position
             velocity = (self.position - self.prev_position) / self.pos_control_period
             self.prev_position = self.position
 
             pos_p = self.cfg['POS_PID_KP'] * pos_error
-            pos_d = self.cfg['POS_PID_KD'] * velocity
+            pos_d = -self.cfg['POS_PID_KD'] * velocity
             self.integral_pos_error += pos_error * self.pos_control_period
             self.integral_pos_error = np.clip(self.integral_pos_error, -1.0, 1.0)
             pos_i = self.cfg['POS_PID_KI'] * self.integral_pos_error
@@ -561,13 +561,20 @@ class TribotBalanceBot:
             delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
 
         # --- Apply motor torque through motor models ---
-        # Left motor (+yaw_correction), Right motor (-yaw_correction)
+        # The motor stator is mounted on the BODY, driving the wheel shaft
+        # through the free-spinning triplet hub bearing.  In the URDF chain
+        # (body → triplet → wheel), we must apply the same motor torque to:
+        #   1. Wheel joints  (+τ on wheels, −τ reaction on triplet)
+        #   2. Triplet joint  (+τ on triplet, −τ reaction on body)
+        # Net: wheels +τ, triplet 0 (free), body −τ (motor reaction).
+        #
+        # Left motor (+yaw_correction), Right motor (−yaw_correction)
         side_configs = [
-            (0, self.l_wheel_joints, +1.0),  # left motor, left wheels, yaw sign
-            (1, self.r_wheel_joints, -1.0),  # right motor, right wheels, yaw sign
+            (0, self.l_wheel_joints, self.l_triplet_joint, +1.0),
+            (1, self.r_wheel_joints, self.r_triplet_joint, -1.0),
         ]
 
-        for motor_idx, wheel_joints, yaw_sign in side_configs:
+        for motor_idx, wheel_joints, triplet_joint, yaw_sign in side_configs:
             # Representative wheel velocity (belt-coupled, all same)
             wheel_vel = p.getJointState(self.body_id, wheel_joints[0])[1]
 
@@ -578,8 +585,23 @@ class TribotBalanceBot:
             )
             self.actual_torques[motor_idx] = motor_torque
 
-            # Distribute torque equally among 3 belt-coupled wheels
-            torque_per_wheel = motor_torque / 3.0
+            # --- Triplet hub joint: transfer reaction from triplet to body ---
+            # The motor stator is on the BODY; in the URDF chain
+            # (body → triplet → wheel) the wheel-joint reaction goes to the
+            # free-spinning triplet, not the body.  We must explicitly apply
+            # the reaction through the triplet joint so the body feels it.
+            # force = -motor_torque balances the triplet (keeps it free) and
+            # delivers the reaction to the body.
+            p.setJointMotorControl2(
+                self.body_id, triplet_joint,
+                controlMode=p.TORQUE_CONTROL,
+                force=-motor_torque
+            )
+
+            # --- Wheel joints: distribute torque among 3 belt-coupled wheels ---
+            # Negate because URDF wheel axis is +Y, whereas bullet_sim's
+            # effective axis is -Y; same PID sign needs opposite joint torque.
+            torque_per_wheel = -motor_torque / 3.0
 
             for wj in wheel_joints:
                 # Add wheel imbalance (per-wheel periodic disturbance)
@@ -696,8 +718,9 @@ def run_simulation():
             at0, at1 = robot.actual_torques
             print(
                 f"[{sim_time:5.2f}s] "
-                f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
-                f"Pos:{robot.position:6.3f}m "
+                # f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
+                f"Euler(p={ry:6.1f})° | "
+                # f"Pos:{robot.position:6.3f}m "
                 f"TgtPitch:{math.degrees(robot.target_pitch):5.2f}° | "
                 f"Triplet({tv[0]:5.1f},{tv[1]:5.1f}) "
                 f"Whl({wv[0]:5.1f},{wv[1]:5.1f})rad/s | "
