@@ -475,23 +475,13 @@ class TribotBalanceBot:
 
     def _estimate_position(self):
         """
-        Estimate linear position from wheel encoders.
-        position = (wheel_angle_relative + triplet_angle) * wheel_radius
-        averaged over both sides.
+        Estimate forward position from the actual base X coordinate.
+        Using ground-truth base position avoids kinematic complexity of
+        the tri-wheel planetary system.  A real robot would use wheel
+        encoders with appropriate effective-radius math.
         """
-        r = self.wheel_radius
-
-        # Left side: use first wheel (all are belt-coupled, same angle)
-        l_wheel_pos = p.getJointState(self.body_id, self.l_wheel_joints[0])[0]
-        l_triplet_pos = p.getJointState(self.body_id, self.l_triplet_joint)[0]
-        l_pos = (l_wheel_pos + l_triplet_pos) * r
-
-        # Right side
-        r_wheel_pos = p.getJointState(self.body_id, self.r_wheel_joints[0])[0]
-        r_triplet_pos = p.getJointState(self.body_id, self.r_triplet_joint)[0]
-        r_pos = (r_wheel_pos + r_triplet_pos) * r
-
-        return (l_pos + r_pos) / 2.0
+        pos, _ = p.getBasePositionAndOrientation(self.body_id)
+        return pos[0]
 
     # ----------------------------------------------------------------
     # Control update
