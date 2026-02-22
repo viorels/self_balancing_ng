@@ -33,9 +33,9 @@
 
   <link name="c_body">
     <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0.247" rpy="0 0 0"/>
       <mass value="2.716678"/>
-      <inertia ixx="19.330253" ixy="-0.001179" ixz="0.084629" iyy="16.167134" iyz="0.015899" izz="4.307331"/>
+      <inertia ixx="0.330253" ixy="-0.001179" ixz="0.084629" iyy="0.167134" iyz="0.015899" izz="4.307331"/>
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -180,7 +180,7 @@
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="0.253511"/>
-      <inertia ixx="1.139031" ixy="0.003424" ixz="0.006477" iyy="1.243780" iyz="0.000094" izz="1.137363"/>
+      <inertia ixx="0.339031" ixy="0.003424" ixz="0.006477" iyy="1.243780" iyz="0.000094" izz="1.137363"/>
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
