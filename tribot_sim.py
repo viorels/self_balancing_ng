@@ -47,19 +47,14 @@ CONFIG = {
     'WHEEL_RADIUS': 0.058,         # Small drive wheel radius (m) — measured from STL AABB
     'TRIPLET_RADIUS': 0.12,        # Circumradius of the wheel triangle (m)
 
-    # Inertia scaling: CAD exports often have non-SI inertia units.
-    # Set to 1.0 if the URDF inertias are already in kg·m².
-    # Typical CAD exports may need 1e-6 (kg·mm² → kg·m²) or similar.
-    'INERTIA_SCALE': 1e-6,
-
     # Initial conditions
     'INITIAL_PITCH': -0.03,        # rad (~1.7°) — slight initial tilt
-    'INITIAL_HEIGHT': 0.19,        # m — c_body origin above ground (≈ triplet_radius + wheel_radius + margin)
+    'INITIAL_HEIGHT': 0.12,        # m — c_body origin above ground (bottom wheel at ~ground level)
 
     # Inner PID gains (pitch → motor torque)
-    'PID_KP': 20.0,
-    'PID_KD': 1.0,
-    'PID_KI': 5.0,
+    'PID_KP': 15.0,
+    'PID_KD': 0.8,
+    'PID_KI': 3.0,
 
     # Outer PID gains (position → target pitch angle)
     'POS_PID_KP': 0.15,
@@ -347,7 +342,9 @@ class TribotBalanceBot:
                     [0, self.cfg['INITIAL_PITCH'], 0]
                 ),
                 useFixedBase=False,
-                flags=p.URDF_USE_INERTIA_FROM_FILE
+                # Do NOT use URDF_USE_INERTIA_FROM_FILE — the CAD-exported
+                # inertia values are in wrong units.  Let PyBullet compute
+                # inertias from the collision meshes + URDF masses instead.
             )
         finally:
             os.unlink(temp_urdf)
@@ -383,7 +380,7 @@ class TribotBalanceBot:
         print(f"    R wheels:  joints {self.r_wheel_joints}")
 
     def _configure_dynamics(self):
-        """Set friction, damping, and optionally rescale inertias."""
+        """Set friction, damping for all links."""
         num_joints = p.getNumJoints(self.body_id)
 
         # Disable all default joint motors (we'll apply torques explicitly)
@@ -393,17 +390,14 @@ class TribotBalanceBot:
                 targetVelocity=0.0, force=0.0
             )
 
-        # Scale inertias if needed (CAD export unit correction)
-        scale = self.cfg['INERTIA_SCALE']
-        if scale != 1.0:
-            for i in range(-1, num_joints):
-                dyn = p.getDynamicsInfo(self.body_id, i)
-                inertia = dyn[2]  # local inertia diagonal (ixx, iyy, izz)
-                if dyn[0] > 0:    # only if mass > 0
-                    scaled = [v * scale for v in inertia]
-                    p.changeDynamics(self.body_id, i,
-                                     localInertiaDiagonal=scaled)
-            print(f"  Inertias scaled by {scale}")
+        # Print computed inertias for debugging
+        for i in range(-1, num_joints):
+            dyn = p.getDynamicsInfo(self.body_id, i)
+            if i == -1:
+                name = 'c_body(base)'
+            else:
+                name = p.getJointInfo(self.body_id, i)[12].decode()
+            print(f"    {name}: mass={dyn[0]:.4f} inertia={tuple(round(v,6) for v in dyn[2])}")
 
         # Body base link: moderate friction, slight angular damping
         p.changeDynamics(self.body_id, -1,
