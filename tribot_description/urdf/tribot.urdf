@@ -1,0 +1,287 @@
+<?xml version="1.0"?>
+<robot name="tribot">
+
+<!-- material color setting -->
+<material name="#ffffff">
+  <color rgba="1.000 1.000 1.000 1.0"/>
+</material>
+<material name="#848484">
+  <color rgba="0.518 0.518 0.518 1.0"/>
+</material>
+<material name="#505050">
+  <color rgba="0.314 0.314 0.314 1.0"/>
+</material>
+<material name="#e4e4e4">
+  <color rgba="0.898 0.898 0.898 1.0"/>
+</material>
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+
+  <joint name="base_link_to_c_body" type="revolute">
+    <origin xyz="0 0 0" rpy="0.0 0.0 0.0"/>
+    <axis xyz="1 0 0"/>
+    <parent link="base_link"/>
+    <child link="c_body"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="c_body">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="2.716678"/>
+      <inertia ixx="19.330253" ixy="-0.001179" ixz="0.084629" iyy="16.167134" iyz="0.015899" izz="4.307331"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/c_body.stl"/>
+      </geometry>
+      <material name="#848484"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/c_body.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="c_body_to_l_triplet" type="revolute">
+    <origin xyz="0.0 -0.0825 0.0" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="c_body"/>
+    <child link="l_triplet"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="l_triplet">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.253511"/>
+      <inertia ixx="0.365590" ixy="0.003080" ixz="0.005835" iyy="0.635536" iyz="-0.000084" izz="0.360583"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_triplet.stl"/>
+      </geometry>
+      <material name="#e4e4e4"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_triplet.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="l_triplet_to_l_wheel_1" type="revolute">
+    <origin xyz="0.0 -0.07 0.12" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="l_triplet"/>
+    <child link="l_wheel_1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="l_wheel_1">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.007164" ixy="-0.000000" ixz="-0.000000" iyy="0.011874" iyz="0.000000" izz="0.007165"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="l_triplet_to_l_wheel_2" type="revolute">
+    <origin xyz="-0.10414 -0.07 -0.060125" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="l_triplet"/>
+    <child link="l_wheel_2"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="l_wheel_2">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.007164" ixy="-0.000000" ixz="-0.000000" iyy="0.011874" iyz="0.000000" izz="0.007165"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="l_triplet_to_l_wheel_3" type="revolute">
+    <origin xyz="0.10414 -0.07 -0.060125" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="l_triplet"/>
+    <child link="l_wheel_3"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="l_wheel_3">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.007164" ixy="-0.000000" ixz="-0.000000" iyy="0.011874" iyz="0.000000" izz="0.007165"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/l_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="c_body_to_r_triplet" type="revolute">
+    <origin xyz="0.0 0.0825 0.0" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="c_body"/>
+    <child link="r_triplet"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="r_triplet">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.253511"/>
+      <inertia ixx="1.139031" ixy="0.003424" ixz="0.006477" iyy="1.243780" iyz="0.000094" izz="1.137363"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_triplet.stl"/>
+      </geometry>
+      <material name="#e4e4e4"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_triplet.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="r_triplet_to_r_wheel_1" type="revolute">
+    <origin xyz="0.0 0.07 0.12" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="r_triplet"/>
+    <child link="r_wheel_1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="r_wheel_1">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.011900" ixy="-0.000000" ixz="-0.000000" iyy="0.012727" iyz="-0.000000" izz="0.011901"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="r_triplet_to_r_wheel_2" type="revolute">
+    <origin xyz="-0.10414 0.07 -0.060125" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="r_triplet"/>
+    <child link="r_wheel_2"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="r_wheel_2">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.011900" ixy="-0.000000" ixz="-0.000000" iyy="0.012727" iyz="-0.000000" izz="0.011901"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="r_triplet_to_r_wheel_3" type="revolute">
+    <origin xyz="0.10414 0.07 -0.060125" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0 1 0"/>
+    <parent link="r_triplet"/>
+    <child link="r_wheel_3"/>
+    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
+  </joint>
+
+  <link name="r_wheel_3">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.027132"/>
+      <inertia ixx="0.011900" ixy="-0.000000" ixz="-0.000000" iyy="0.012727" iyz="-0.000000" izz="0.011901"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+      <material name="#505050"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://tribot_description/meshes/r_wheel.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+</robot>

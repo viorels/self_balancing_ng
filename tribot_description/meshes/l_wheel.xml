@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urdf_part>
+    <material name="#505050">
+        <color rgba="0.314000 0.314000 0.314000 1.0" />
+    </material>
+    <link name="l_wheel">
+        <visual>
+            <origin xyz="0.000040 -0.022083 -0.000025" rpy="0 0 0"/>
+            <material name="#505050" />
+        </visual>
+        <inertial>
+            <origin xyz="0.000040 -0.022083 -0.000025"/>
+            <mass value="0.027132165700"/>
+            <volume value="0.000271321657"/>
+            <inertia ixx="0.00716389" ixy="-0.00000000" ixz="-0.00000000" iyy="0.01187354" iyz="0.00000000" izz="0.00716480"/>
+        </inertial>
+        <center_of_mass>0.000040 -0.022083 -0.000025</center_of_mass>
+    </link>
+    <joint>
+        <axis xyz="0 1 0" />
+    </joint>
+</urdf_part>
