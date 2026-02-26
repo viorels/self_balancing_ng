@@ -52,12 +52,11 @@
     </collision>
   </link>
 
-  <joint name="c_body_to_l_triplet" type="revolute">
+  <joint name="c_body_to_l_triplet" type="continuous">
     <origin xyz="0.0 -0.0825 0.0" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="c_body"/>
     <child link="l_triplet"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="l_triplet">
@@ -81,12 +80,11 @@
     </collision>
   </link>
 
-  <joint name="l_triplet_to_l_wheel_1" type="revolute">
+  <joint name="l_triplet_to_l_wheel_1" type="continuous">
     <origin xyz="0.0 -0.07 0.12" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="l_triplet"/>
     <child link="l_wheel_1"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="l_wheel_1">
@@ -110,12 +108,11 @@
     </collision>
   </link>
 
-  <joint name="l_triplet_to_l_wheel_2" type="revolute">
+  <joint name="l_triplet_to_l_wheel_2" type="continuous">
     <origin xyz="-0.10414 -0.07 -0.060125" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="l_triplet"/>
     <child link="l_wheel_2"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="l_wheel_2">
@@ -139,12 +136,11 @@
     </collision>
   </link>
 
-  <joint name="l_triplet_to_l_wheel_3" type="revolute">
+  <joint name="l_triplet_to_l_wheel_3" type="continuous">
     <origin xyz="0.10414 -0.07 -0.060125" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="l_triplet"/>
     <child link="l_wheel_3"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="l_wheel_3">
@@ -168,12 +164,11 @@
     </collision>
   </link>
 
-  <joint name="c_body_to_r_triplet" type="revolute">
+  <joint name="c_body_to_r_triplet" type="continuous">
     <origin xyz="0.0 0.0825 0.0" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="c_body"/>
     <child link="r_triplet"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="r_triplet">
@@ -197,12 +192,11 @@
     </collision>
   </link>
 
-  <joint name="r_triplet_to_r_wheel_1" type="revolute">
+  <joint name="r_triplet_to_r_wheel_1" type="continuous">
     <origin xyz="0.0 0.07 0.12" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="r_triplet"/>
     <child link="r_wheel_1"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="r_wheel_1">
@@ -226,12 +220,11 @@
     </collision>
   </link>
 
-  <joint name="r_triplet_to_r_wheel_2" type="revolute">
+  <joint name="r_triplet_to_r_wheel_2" type="continuous">
     <origin xyz="-0.10414 0.07 -0.060125" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="r_triplet"/>
     <child link="r_wheel_2"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="r_wheel_2">
@@ -255,12 +248,11 @@
     </collision>
   </link>
 
-  <joint name="r_triplet_to_r_wheel_3" type="revolute">
+  <joint name="r_triplet_to_r_wheel_3" type="continuous">
     <origin xyz="0.10414 0.07 -0.060125" rpy="0.0 0.0 0.0"/>
     <axis xyz="0 1 0"/>
     <parent link="r_triplet"/>
     <child link="r_wheel_3"/>
-    <limit lower="-3.14159" upper="3.14159" effort="0" velocity="0"/>
   </joint>
 
   <link name="r_wheel_3">
