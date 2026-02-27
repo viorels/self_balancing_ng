@@ -105,13 +105,16 @@ def build_state_space(config):
     M_tot = m_b + m_w              # total translational mass
 
     # Coupled mass matrix:
-    #   [M_tot   m_b*l] [x_ddot ]   [  0  ] [x  ]   [-1/r]
-    #   [m_b*l   I_eff] [θ_ddot ] = [m_b*g*l] [θ  ] + [  1 ] u
+    #   [M_tot   m_b*l] [x_ddot ]   [  0  ] [x  ]   [+1/r]
+    #   [m_b*l   I_eff] [θ_ddot ] = [m_b*g*l] [θ  ] + [ +1 ] u
     #
-    # Note: the input vector is [-1/r; +1] (not [+1/r; -1]) because in the
-    # simulation the wheel joint torque is negated relative to the commanded
-    # motor torque (URDF +Y axis convention).  Positive u (commanded torque)
-    # therefore accelerates the body *backward* and decelerates the pitch.
+    # x is the robot's forward distance (positive = forward).
+    # In the simulation, positive commanded torque → negative wheel joint
+    # torque (URDF axis negation) → robot moves in -X world → forward
+    # distance increases.  So the effective input vector is [+1/r; +1].
+    #
+    # Gravity coupling: forward lean (positive θ) → forward acceleration
+    # → positive x_ddot.  So a13 is positive.
     #
     # Invert the 2×2 mass matrix to get x_ddot, θ_ddot as functions of θ and u.
 
@@ -119,12 +122,12 @@ def build_state_space(config):
 
     # Gravity terms  (only θ column is non-zero)
     # inv(M) @ [0; m_b*g*l]
-    a13 = -(m_b * l) * (m_b * g * l) / det   # x_ddot from θ  (coupling)
+    a13 =  (m_b * l) * (m_b * g * l) / det    # x_ddot from θ  (coupling)
     a33 =  M_tot     * (m_b * g * l) / det    # θ_ddot from θ
 
     # Input terms
-    # inv(M) @ [-1/r; +1]
-    b1 = -(I_eff / (det * r)) - (m_b * l) / det    # x_ddot from u
+    # inv(M) @ [+1/r; +1]
+    b1 =  (I_eff / (det * r)) + (m_b * l) / det    # x_ddot from u
     b3 =  (m_b * l) / (det * r) + M_tot  / det     # θ_ddot from u
 
     A = np.array([
@@ -263,8 +266,10 @@ class LQRBalanceController:
         else:
             delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
 
-        # Per-side torques (left +yaw, right −yaw)
-        left_torque = delayed_torque + delayed_yaw
-        right_torque = delayed_torque - delayed_yaw
+        # Per-side torques (left −yaw, right +yaw)
+        # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
+        # Positive yaw_correction → more torque on right side → turns right.
+        left_torque = delayed_torque - delayed_yaw
+        right_torque = delayed_torque + delayed_yaw
 
         return left_torque, right_torque

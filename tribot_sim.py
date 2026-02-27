@@ -489,13 +489,12 @@ class TribotBalanceBot:
 
     def _estimate_position(self):
         """
-        Estimate forward position from the actual base X coordinate.
-        Using ground-truth base position avoids kinematic complexity of
-        the tri-wheel planetary system.  A real robot would use wheel
-        encoders with appropriate effective-radius math.
+        Estimate forward position (positive = robot's forward direction).
+        The robot's forward is -X in world frame (due to URDF wheel axis
+        convention), so we negate the world X coordinate.
         """
         pos, _ = p.getBasePositionAndOrientation(self.body_id)
-        return pos[0]
+        return -pos[0]
 
     # ----------------------------------------------------------------
     # Control update
@@ -518,10 +517,11 @@ class TribotBalanceBot:
         self.position = self._estimate_position()
 
         # --- Yaw rate (body-frame) for yaw damping ---
+        # Negated so that positive yaw_rate = turning right (from behind)
         _, ang_vel = p.getBaseVelocity(self.body_id)
         _, orn = p.getBasePositionAndOrientation(self.body_id)
         rot = p.getMatrixFromQuaternion(orn)
-        yaw_rate = rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2]
+        yaw_rate = -(rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2])
 
         # --- Cascaded PID controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(

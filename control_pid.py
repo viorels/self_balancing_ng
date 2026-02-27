@@ -136,8 +136,10 @@ class BalanceController:
         else:
             delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
 
-        # === Per-side torques (left gets +yaw, right gets −yaw) ===
-        left_torque = delayed_torque + delayed_yaw
-        right_torque = delayed_torque - delayed_yaw
+        # === Per-side torques (left −yaw, right +yaw) ===
+        # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
+        # Positive yaw_correction → more torque on right side → turns right.
+        left_torque = delayed_torque - delayed_yaw
+        right_torque = delayed_torque + delayed_yaw
 
         return left_torque, right_torque
