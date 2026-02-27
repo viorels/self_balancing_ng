@@ -28,6 +28,8 @@ import numpy as np
 import pybullet as p
 import pybullet_data
 
+from control_pid import BalanceController
+
 
 # ============================================================================
 # CONFIGURATION - All parameters are easily tunable here
@@ -288,18 +290,8 @@ class TribotBalanceBot:
         self._configure_dynamics()
         self._setup_belt_constraints()
 
-        # Inner PID controller state (pitch → torque)
-        self.prev_pitch_error = 0.0
-        self.integral_pitch_error = 0.0
-
-        # Outer PID controller state (position → target pitch)
-        self.target_pitch = 0.0
-        self.position = 0.0
-        self.prev_position = 0.0
-        self.integral_pos_error = 0.0
-        self.target_position = 0.0
-        self.pos_control_period = 1.0 / config['POS_PID_RATE_HZ']
-        self.next_pos_control_time = 0.0
+        # Balance controller (cascaded PID)
+        self.controller = BalanceController(config)
 
         # Two motors (one per side)
         self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
@@ -307,21 +299,13 @@ class TribotBalanceBot:
         # IMU sensor model
         self.imu = IMUSensorModel(config)
 
-        # Control loop timing
-        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
-        self.next_control_time = 0.0
-
-        # Sensor-to-actuator delay buffer
-        delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
-
         # Estimated wheel radius (may be overridden from AABB after loading)
         self.wheel_radius = config['WHEEL_RADIUS']
 
-        # Output state for logging
+        # Current state for logging
+        self.position = 0.0
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
-        self.control_torque = 0.0
         self.actual_torques = [0.0, 0.0]
 
     # ----------------------------------------------------------------
@@ -500,65 +484,20 @@ class TribotBalanceBot:
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
-        # --- Position estimation from wheel encoders ---
+        # --- Position estimation ---
         self.position = self._estimate_position()
 
-        # --- Outer PID loop: position → target pitch (lower rate) ---
-        if sim_time >= self.next_pos_control_time:
-            self.next_pos_control_time = sim_time + self.pos_control_period
+        # --- Yaw rate (body-frame) for yaw damping ---
+        _, ang_vel = p.getBaseVelocity(self.body_id)
+        _, orn = p.getBasePositionAndOrientation(self.body_id)
+        rot = p.getMatrixFromQuaternion(orn)
+        yaw_rate = rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2]
 
-            pos_error = self.target_position - self.position
-            velocity = (self.position - self.prev_position) / self.pos_control_period
-            self.prev_position = self.position
-
-            pos_p = self.cfg['POS_PID_KP'] * pos_error
-            pos_d = -self.cfg['POS_PID_KD'] * velocity
-            self.integral_pos_error += pos_error * self.pos_control_period
-            self.integral_pos_error = np.clip(self.integral_pos_error, -1.0, 1.0)
-            pos_i = self.cfg['POS_PID_KI'] * self.integral_pos_error
-
-            self.target_pitch = float(np.clip(
-                pos_p + pos_d + pos_i,
-                -self.cfg['POS_PID_MAX_PITCH'],
-                 self.cfg['POS_PID_MAX_PITCH']
-            ))
-
-        # --- Inner control loop (pitch → torque) at limited rate ---
-        jitter = (np.random.normal(0, self.cfg['CONTROL_JITTER_STD'])
-                  if self.cfg['ADD_SENSOR_NOISE'] else 0)
-        if sim_time >= self.next_control_time:
-            self.next_control_time = sim_time + self.control_period + jitter
-
-            pitch_error = self.target_pitch - measured_pitch
-            p_term = self.cfg['PID_KP'] * pitch_error
-            d_term = self.cfg['PID_KD'] * (0.0 - measured_pitch_rate)
-            self.integral_pitch_error += pitch_error * self.control_period
-            self.integral_pitch_error = np.clip(self.integral_pitch_error, -0.5, 0.5)
-            i_term = self.cfg['PID_KI'] * self.integral_pitch_error
-
-            commanded_torque = p_term + d_term + i_term
-            commanded_torque = float(np.clip(
-                commanded_torque,
-                -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']
-            ))
-            self.control_torque = commanded_torque
-
-            # --- Yaw damping: oppose yaw rate with differential torque ---
-            _, ang_vel = p.getBaseVelocity(self.body_id)
-            _, orn = p.getBasePositionAndOrientation(self.body_id)
-            rot = p.getMatrixFromQuaternion(orn)
-            # Yaw rate = angular velocity projected onto body Z axis
-            yaw_rate = rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2]
-            yaw_correction = self.cfg['YAW_DAMPING_K'] * yaw_rate
-
-            # Push into delay buffer
-            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
-
-        # Pop delayed torque command
-        if len(self.torque_delay_buffer) > self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
-        else:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
+        # --- Cascaded PID controller → per-side commanded torques ---
+        left_cmd, right_cmd = self.controller.update(
+            measured_pitch, measured_pitch_rate,
+            self.position, yaw_rate, sim_time, dt
+        )
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -570,18 +509,17 @@ class TribotBalanceBot:
         #
         # Left motor (+yaw_correction), Right motor (−yaw_correction)
         side_configs = [
-            (0, self.l_wheel_joints, self.l_triplet_joint, +1.0),
-            (1, self.r_wheel_joints, self.r_triplet_joint, -1.0),
+            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd),
+            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd),
         ]
 
-        for motor_idx, wheel_joints, triplet_joint, yaw_sign in side_configs:
+        for motor_idx, wheel_joints, triplet_joint, cmd_torque in side_configs:
             # Representative wheel velocity (belt-coupled, all same)
             wheel_vel = p.getJointState(self.body_id, wheel_joints[0])[1]
 
             # Motor produces total torque for this side
             motor_torque = self.motors[motor_idx].update(
-                delayed_torque + yaw_sign * delayed_yaw,
-                wheel_vel, dt
+                cmd_torque, wheel_vel, dt
             )
             self.actual_torques[motor_idx] = motor_torque
 
@@ -721,7 +659,7 @@ def run_simulation():
                 # f"Euler(r={rx:6.1f} p={ry:6.1f} y={rz:6.1f})° | "
                 f"Euler(p={ry:6.1f})° | "
                 # f"Pos:{robot.position:6.3f}m "
-                f"TgtPitch:{math.degrees(robot.target_pitch):5.2f}° | "
+                f"TgtPitch:{math.degrees(robot.controller.target_pitch):5.2f}° | "
                 f"Triplet({tv[0]:5.1f},{tv[1]:5.1f}) "
                 f"Whl({wv[0]:5.1f},{wv[1]:5.1f})rad/s | "
                 f"Act:{at0:6.3f},{at1:6.3f}"
