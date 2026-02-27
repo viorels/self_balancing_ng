@@ -1,0 +1,256 @@
+"""
+LQR Balance Controller for Self-Balancing Robots
+
+Full-state feedback using the linearised inverted-pendulum-on-wheels model.
+State:  x = [position, velocity, pitch, pitch_rate]
+Input:  u = total wheel torque (Nm, both sides combined)
+
+The continuous-time plant is derived from first principles and the gain
+matrix K is computed by solving the continuous algebraic Riccati equation
+(CARE).  At runtime, the controller simply computes:
+
+    u = -K @ (x - x_ref)
+
+with torque clamping and yaw damping identical to the PID controller,
+plus the same sensor-to-actuator delay pipeline for realism.
+
+Inputs:  measured pitch, gyro rate, forward position, yaw rate
+Outputs: per-side commanded torques (left, right)
+"""
+
+import math
+import numpy as np
+
+
+# ============================================================================
+# Algebraic Riccati solver (no scipy dependency)
+# ============================================================================
+
+def _solve_care(A, B, Q, R):
+    """
+    Solve the continuous-time algebraic Riccati equation:
+        A'P + PA - PBR^{-1}B'P + Q = 0
+    using the Schur / eigendecomposition method on the Hamiltonian matrix.
+
+    Returns P (symmetric positive-definite solution).
+    """
+    n = A.shape[0]
+    R_inv = np.linalg.inv(R)
+    BR_inv_BT = B @ R_inv @ B.T
+
+    # Hamiltonian matrix
+    H = np.block([
+        [A, -BR_inv_BT],
+        [-Q, -A.T]
+    ])
+
+    # Eigen-decomposition
+    eigvals, eigvecs = np.linalg.eig(H)
+
+    # Select the n eigenvectors with negative real part (stable subspace)
+    idx = np.argsort(eigvals.real)
+    stable_idx = idx[:n]
+    U = eigvecs[:, stable_idx]
+
+    U1 = U[:n, :]
+    U2 = U[n:, :]
+
+    # P = U2 @ inv(U1)
+    P = np.real(U2 @ np.linalg.inv(U1))
+    # Ensure symmetry
+    P = (P + P.T) / 2.0
+    return P
+
+
+def compute_lqr_gain(A, B, Q, R):
+    """
+    Compute LQR gain K such that u = -K x minimises
+    J = ∫ (x'Qx + u'Ru) dt.
+
+    Returns K = R^{-1} B' P.
+    """
+    P = _solve_care(A, B, Q, R)
+    K = np.linalg.inv(R) @ B.T @ P
+    return K
+
+
+# ============================================================================
+# Linearised plant model
+# ============================================================================
+
+def build_state_space(config):
+    """
+    Build the continuous-time A, B matrices for the linearised
+    inverted-pendulum-on-wheels system.
+
+    State:  x = [position, velocity, pitch, pitch_rate]
+    Input:  u = total motor torque (Nm)
+
+    Physical parameters (from config):
+        BODY_MASS       – mass of the body above the wheel axis (kg)
+        WHEEL_MASS      – total wheel/triplet mass (kg)
+        COG_HEIGHT      – distance from wheel axis to body CoG (m)
+        BODY_INERTIA    – body pitch inertia about its CoG (kg·m²)
+        WHEEL_RADIUS    – effective wheel radius (m)
+    """
+    m_b = config['LQR_BODY_MASS']
+    m_w = config['LQR_WHEEL_MASS']
+    l   = config['LQR_COG_HEIGHT']
+    I_b = config['LQR_BODY_INERTIA']
+    r   = config['WHEEL_RADIUS']
+    g   = abs(config['GRAVITY'])
+
+    # Effective rotational inertia about the wheel contact point
+    I_eff = I_b + m_b * l**2       # parallel-axis theorem
+    M_tot = m_b + m_w              # total translational mass
+
+    # Coupled mass matrix:
+    #   [M_tot   m_b*l] [x_ddot ]   [  0  ] [x  ]   [-1/r]
+    #   [m_b*l   I_eff] [θ_ddot ] = [m_b*g*l] [θ  ] + [  1 ] u
+    #
+    # Note: the input vector is [-1/r; +1] (not [+1/r; -1]) because in the
+    # simulation the wheel joint torque is negated relative to the commanded
+    # motor torque (URDF +Y axis convention).  Positive u (commanded torque)
+    # therefore accelerates the body *backward* and decelerates the pitch.
+    #
+    # Invert the 2×2 mass matrix to get x_ddot, θ_ddot as functions of θ and u.
+
+    det = M_tot * I_eff - (m_b * l)**2
+
+    # Gravity terms  (only θ column is non-zero)
+    # inv(M) @ [0; m_b*g*l]
+    a13 = -(m_b * l) * (m_b * g * l) / det   # x_ddot from θ  (coupling)
+    a33 =  M_tot     * (m_b * g * l) / det    # θ_ddot from θ
+
+    # Input terms
+    # inv(M) @ [-1/r; +1]
+    b1 = -(I_eff / (det * r)) - (m_b * l) / det    # x_ddot from u
+    b3 =  (m_b * l) / (det * r) + M_tot  / det     # θ_ddot from u
+
+    A = np.array([
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, a13, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, a33, 0.0],
+    ])
+
+    B = np.array([[0.0], [b1], [0.0], [b3]])
+
+    return A, B
+
+
+# ============================================================================
+# LQR Balance Controller
+# ============================================================================
+
+class LQRBalanceController:
+    """
+    Full-state-feedback LQR controller for a self-balancing robot.
+
+    Config keys used (in addition to the plant-model keys above):
+        LQR_Q_DIAG       – list of 4 diagonal Q weights [pos, vel, pitch, pitch_rate]
+        LQR_R             – scalar R weight (torque penalty)
+        MAX_TORQUE        – saturation limit per motor (Nm)
+        CONTROL_RATE_HZ   – control update rate
+        CONTROL_JITTER_STD
+        SENSOR_TO_ACTUATOR_DELAY_STEPS
+        ADD_SENSOR_NOISE
+        YAW_DAMPING_K
+    """
+
+    def __init__(self, config):
+        self.cfg = config
+
+        # Build linearised model and compute gain
+        A, B = build_state_space(config)
+        Q = np.diag(config['LQR_Q_DIAG'])
+        R = np.array([[config['LQR_R']]])
+        self.K = compute_lqr_gain(A, B, Q, R)
+
+        print(f"  LQR gain K = [{', '.join(f'{k:.4f}' for k in self.K[0])}]")
+        print(f"  LQR Q_diag = {config['LQR_Q_DIAG']},  R = {config['LQR_R']}")
+
+        # --- Reference state ---
+        self.target_position = 0.0
+
+        # --- Velocity estimation (finite difference) ---
+        self.prev_position = 0.0
+        self.velocity = 0.0
+        self.vel_filter_alpha = 0.1   # low-pass on velocity estimate
+
+        # --- Control loop timing ---
+        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
+        self.next_control_time = 0.0
+
+        # --- Sensor-to-actuator delay buffer ---
+        delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
+        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
+
+        # --- Exposed for logging ---
+        self.control_torque = 0.0
+        self.target_pitch = 0.0       # always 0 for LQR (included for log compat)
+
+    def set_target_position(self, position):
+        """Set the desired forward position (m)."""
+        self.target_position = position
+
+    def update(self, measured_pitch, measured_pitch_rate,
+               position, yaw_rate, sim_time, dt):
+        """
+        Run one controller tick.
+
+        Args:
+            measured_pitch:      fused pitch angle (rad)
+            measured_pitch_rate: gyro pitch rate (rad/s)
+            position:            forward position estimate (m)
+            yaw_rate:            body-frame yaw rate (rad/s)
+            sim_time:            current simulation time (s)
+            dt:                  physics timestep (s)
+
+        Returns:
+            (left_torque, right_torque): commanded motor torques (Nm)
+        """
+        # --- Velocity estimation ---
+        if dt > 0:
+            raw_vel = (position - self.prev_position) / dt
+            self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
+        self.prev_position = position
+
+        # --- LQR update at CONTROL_RATE_HZ ---
+        jitter = (np.random.normal(0, self.cfg['CONTROL_JITTER_STD'])
+                  if self.cfg.get('ADD_SENSOR_NOISE', False) else 0)
+
+        if sim_time >= self.next_control_time:
+            self.next_control_time = sim_time + self.control_period + jitter
+
+            # State error vector
+            x = np.array([
+                position - self.target_position,
+                self.velocity,
+                measured_pitch,
+                measured_pitch_rate,
+            ])
+
+            # u = -K x  (total torque for both sides)
+            u = float(-self.K @ x)
+            u = np.clip(u, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+            commanded_torque = float(u)
+            self.control_torque = commanded_torque
+
+            # Yaw damping
+            yaw_correction = self.cfg['YAW_DAMPING_K'] * yaw_rate
+
+            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
+
+        # === Pop delayed torque command ===
+        delay_depth = self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1
+        if len(self.torque_delay_buffer) > delay_depth:
+            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
+        else:
+            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
+
+        # Per-side torques (left +yaw, right −yaw)
+        left_torque = delayed_torque + delayed_yaw
+        right_torque = delayed_torque - delayed_yaw
+
+        return left_torque, right_torque

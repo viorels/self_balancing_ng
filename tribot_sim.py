@@ -29,6 +29,7 @@ import pybullet as p
 import pybullet_data
 
 from control_pid import BalanceController
+from control_lqr import LQRBalanceController
 
 
 # ============================================================================
@@ -109,6 +110,22 @@ CONFIG = {
 
     # Virtual belt stiffness (gear constraint max force)
     'BELT_MAX_FORCE': 100.0,
+
+    # === CONTROLLER SELECTION ===
+    # 'lqr' or 'pid'
+    'CONTROLLER': 'lqr',
+
+    # === LQR PARAMETERS ===
+    # Linearised plant physical constants (derived from URDF via PyBullet)
+    'LQR_BODY_MASS': 2.7167,       # kg — c_body (from URDF mesh + mass)
+    'LQR_WHEEL_MASS': 0.6698,      # kg — 2 triplets + 6 wheels
+    'LQR_COG_HEIGHT': 0.247,       # m  — c_body CoG z above wheel axis
+    'LQR_BODY_INERTIA': 0.056436,  # kg·m² — c_body Iyy (PyBullet-computed)
+
+    # Q diagonal: [position, velocity, pitch, pitch_rate]
+    'LQR_Q_DIAG': [1.0, 0.5, 80.0, 5.0],
+    # R: torque cost (scalar)
+    'LQR_R': 1.0,
 }
 
 
@@ -290,8 +307,11 @@ class TribotBalanceBot:
         self._configure_dynamics()
         self._setup_belt_constraints()
 
-        # Balance controller (cascaded PID)
-        self.controller = BalanceController(config)
+        # Balance controller
+        if config.get('CONTROLLER', 'lqr') == 'lqr':
+            self.controller = LQRBalanceController(config)
+        else:
+            self.controller = BalanceController(config)
 
         # Two motors (one per side)
         self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
@@ -618,12 +638,21 @@ def run_simulation():
     # Print configuration summary
     total_mass = sum(p.getDynamicsInfo(robot.body_id, i)[0]
                      for i in range(-1, p.getNumJoints(robot.body_id)))
+    ctrl_type = CONFIG.get('CONTROLLER', 'lqr').upper()
     print(f"\nRobot total mass: {total_mass:.3f} kg")
-    print(f"Inner PID (pitch→torque): Kp={CONFIG['PID_KP']}, "
-          f"Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
-    print(f"Outer PID (pos→pitch):   Kp={CONFIG['POS_PID_KP']}, "
-          f"Ki={CONFIG['POS_PID_KI']}, Kd={CONFIG['POS_PID_KD']}, "
-          f"max_pitch={math.degrees(CONFIG['POS_PID_MAX_PITCH']):.1f}°")
+    print(f"Controller: {ctrl_type}")
+    if ctrl_type == 'PID':
+        print(f"  Inner PID (pitch\u2192torque): Kp={CONFIG['PID_KP']}, "
+              f"Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
+        print(f"  Outer PID (pos\u2192pitch):   Kp={CONFIG['POS_PID_KP']}, "
+              f"Ki={CONFIG['POS_PID_KI']}, Kd={CONFIG['POS_PID_KD']}, "
+              f"max_pitch={math.degrees(CONFIG['POS_PID_MAX_PITCH']):.1f}\u00b0")
+    else:
+        print(f"  Q_diag={CONFIG['LQR_Q_DIAG']}, R={CONFIG['LQR_R']}")
+        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
+              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
+              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
+              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
     print(f"Motor: τ={CONFIG['MOTOR_TAU']*1000:.0f}ms lag, "
           f"back-EMF K={CONFIG['MOTOR_BACK_EMF_K']}, "
           f"deadband={CONFIG['MOTOR_DEADBAND']}Nm")
