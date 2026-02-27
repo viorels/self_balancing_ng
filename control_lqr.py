@@ -191,9 +191,16 @@ class LQRBalanceController:
         self.control_torque = 0.0
         self.target_pitch = 0.0       # always 0 for LQR (included for log compat)
 
+        # --- Yaw rate setpoint (for joystick control) ---
+        self.yaw_rate_setpoint = 0.0
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
+
+    def set_yaw_rate(self, yaw_rate):
+        """Set desired yaw rate (rad/s). 0 = drive straight."""
+        self.yaw_rate_setpoint = yaw_rate
 
     def update(self, measured_pitch, measured_pitch_rate,
                position, yaw_rate, sim_time, dt):
@@ -244,8 +251,8 @@ class LQRBalanceController:
             commanded_torque = float(u)
             self.control_torque = commanded_torque
 
-            # Yaw damping
-            yaw_correction = self.cfg['YAW_DAMPING_K'] * yaw_rate
+            # Yaw damping relative to setpoint
+            yaw_correction = self.cfg['YAW_DAMPING_K'] * (yaw_rate - self.yaw_rate_setpoint)
 
             self.torque_delay_buffer.append((commanded_torque, yaw_correction))
 

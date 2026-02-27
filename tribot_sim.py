@@ -30,6 +30,7 @@ import pybullet_data
 
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
+from gamepad import Gamepad
 
 
 # ============================================================================
@@ -102,7 +103,7 @@ CONFIG = {
     'WHEEL_IMBALANCE_TORQUE': 0.002,   # Nm, periodic torque from wheel imbalance
 
     # Yaw damping gain (differential torque to oppose yaw rotation)
-    'YAW_DAMPING_K': 0.05,
+    'YAW_DAMPING_K': 0.5,
 
     # Wheel contact properties
     'WHEEL_FRICTION': 1.2,
@@ -127,6 +128,14 @@ CONFIG = {
     # R: torque cost (scalar) — higher = less aggressive, more robust to
     # unmodeled motor dynamics (lag, deadband, back-EMF)
     'LQR_R': 10.0,
+
+    # === GAMEPAD ===
+    'GAMEPAD_DEVICE': '/dev/input/js0',
+    'GAMEPAD_DEADZONE': 0.08,
+    'GAMEPAD_SPEED_AXIS': 4,        # Right stick Y
+    'GAMEPAD_YAW_AXIS': 3,          # Right stick X
+    'GAMEPAD_MAX_SPEED': 0.5,       # m/s max forward/backward
+    'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
 }
 
 
@@ -665,11 +674,31 @@ def run_simulation():
           f"height: {CONFIG['INITIAL_HEIGHT']:.3f}m")
     print("-" * 70)
 
+    # Gamepad
+    gp = Gamepad(CONFIG['GAMEPAD_DEVICE'], deadzone=CONFIG['GAMEPAD_DEADZONE'])
+    if gp.connected:
+        print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = speed, "
+              f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
+    target_pos = 0.0
+
     sim_time = 0.0
     log_interval = 0.1
     last_log_time = 0.0
 
     while sim_time < CONFIG['SIM_DURATION']:
+        # --- Gamepad input ---
+        gp.poll()
+        if gp.connected:
+            # Right stick Y → velocity command (push up = negative axis = forward)
+            speed_cmd = -gp.axis(CONFIG['GAMEPAD_SPEED_AXIS']) * CONFIG['GAMEPAD_MAX_SPEED']
+            # Integrate velocity → target position
+            target_pos += speed_cmd * CONFIG['TIMESTEP']
+            robot.controller.set_target_position(target_pos)
+
+            # Right stick X → yaw rate command
+            yaw_cmd = gp.axis(CONFIG['GAMEPAD_YAW_AXIS']) * CONFIG['GAMEPAD_MAX_YAW_RATE']
+            robot.controller.set_yaw_rate(yaw_cmd)
+
         robot.update(sim_time, CONFIG['TIMESTEP'])
         p.stepSimulation()
         sim_time += CONFIG['TIMESTEP']

@@ -51,9 +51,16 @@ class BalanceController:
         # --- Last commanded torque (for logging) ---
         self.control_torque = 0.0
 
+        # --- Yaw rate setpoint (for joystick control) ---
+        self.yaw_rate_setpoint = 0.0
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
+
+    def set_yaw_rate(self, yaw_rate):
+        """Set desired yaw rate (rad/s). 0 = drive straight."""
+        self.yaw_rate_setpoint = yaw_rate
 
     def update(self, measured_pitch, measured_pitch_rate,
                position, yaw_rate, sim_time, dt):
@@ -116,8 +123,8 @@ class BalanceController:
             ))
             self.control_torque = commanded_torque
 
-            # Yaw damping: oppose yaw rate with differential torque
-            yaw_correction = self.cfg['YAW_DAMPING_K'] * yaw_rate
+            # Yaw damping: oppose yaw rate relative to setpoint
+            yaw_correction = self.cfg['YAW_DAMPING_K'] * (yaw_rate - self.yaw_rate_setpoint)
 
             # Push into delay buffer
             self.torque_delay_buffer.append((commanded_torque, yaw_correction))
