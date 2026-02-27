@@ -124,8 +124,9 @@ CONFIG = {
 
     # Q diagonal: [position, velocity, pitch, pitch_rate]
     'LQR_Q_DIAG': [1.0, 0.5, 80.0, 5.0],
-    # R: torque cost (scalar)
-    'LQR_R': 1.0,
+    # R: torque cost (scalar) — higher = less aggressive, more robust to
+    # unmodeled motor dynamics (lag, deadband, back-EMF)
+    'LQR_R': 10.0,
 }
 
 

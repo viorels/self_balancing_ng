@@ -173,8 +173,9 @@ class LQRBalanceController:
         # --- Reference state ---
         self.target_position = 0.0
 
-        # --- Velocity estimation (finite difference) ---
+        # --- Velocity estimation (finite difference at control rate) ---
         self.prev_position = 0.0
+        self.prev_vel_time = 0.0
         self.velocity = 0.0
         self.vel_filter_alpha = 0.1   # low-pass on velocity estimate
 
@@ -210,11 +211,9 @@ class LQRBalanceController:
         Returns:
             (left_torque, right_torque): commanded motor torques (Nm)
         """
-        # --- Velocity estimation ---
-        if dt > 0:
-            raw_vel = (position - self.prev_position) / dt
-            self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
-        self.prev_position = position
+        # --- Velocity estimation (only at control rate to avoid noise) ---
+        # Estimating at 500Hz physics rate amplifies tiny position jitter.
+        # Instead, update velocity only when the control loop fires.
 
         # --- LQR update at CONTROL_RATE_HZ ---
         jitter = (np.random.normal(0, self.cfg['CONTROL_JITTER_STD'])
@@ -222,6 +221,14 @@ class LQRBalanceController:
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
+
+            # Velocity estimated over the control period (not physics dt)
+            vel_dt = sim_time - self.prev_vel_time if self.prev_vel_time > 0 else self.control_period
+            if vel_dt > 0:
+                raw_vel = (position - self.prev_position) / vel_dt
+                self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
+            self.prev_position = position
+            self.prev_vel_time = sim_time
 
             # State error vector
             x = np.array([
