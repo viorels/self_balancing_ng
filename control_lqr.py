@@ -194,6 +194,10 @@ class LQRBalanceController:
         self.control_torque = 0.0
         self.target_pitch = 0.0       # always 0 for LQR (included for log compat)
 
+        # --- Per-state torque contributions (for PlotJuggler / debug) ---
+        self.K_contributions = np.zeros(4)  # K[0]*x_pos, K[1]*x_vel, K[2]*x_pitch, K[3]*x_prate
+        self.state_error = np.zeros(4)
+
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
 
@@ -247,6 +251,8 @@ class LQRBalanceController:
                 measured_pitch,
                 measured_pitch_rate,
             ])
+            self.state_error = x.copy()
+            self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
 
             # u = -K x  (total torque for both sides)
             u = float(-self.K @ x)

@@ -31,6 +31,7 @@ import pybullet_data
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
 from gamepad import Gamepad
+from plotjuggler_udp import PlotJugglerStreamer
 
 
 # ============================================================================
@@ -694,6 +695,10 @@ def run_simulation():
         print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = distance, "
               f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
 
+    # PlotJuggler real-time streaming
+    pj = PlotJugglerStreamer()   # UDP → 127.0.0.1:9870
+    print("PlotJuggler UDP streamer active on 127.0.0.1:9870")
+
     # Visual target marker (vertical debug line)
     marker_id = -1
     marker_color = [0.0, 1.0, 0.0]   # green
@@ -751,6 +756,32 @@ def run_simulation():
         p.stepSimulation()
         sim_time += CONFIG['TIMESTEP']
 
+        # --- Stream signals to PlotJuggler ---
+        ctrl = robot.controller
+        true_pitch, true_pitch_rate = robot._get_true_state()
+        pj.send({
+            "timestamp": sim_time,
+            # State signals
+            "pos_err": float(ctrl.state_error[0]),
+            "vel_est": float(ctrl.state_error[1]),
+            "pitch_meas": float(ctrl.state_error[2]),
+            "pitch_rate_meas": float(ctrl.state_error[3]),
+            "true_pitch": true_pitch,
+            "true_pitch_rate": true_pitch_rate,
+            # Torque signals
+            "torque_cmd": float(ctrl.control_torque),
+            "torque_L_actual": float(robot.actual_torques[0]),
+            "torque_R_actual": float(robot.actual_torques[1]),
+            # Per-state LQR contributions (K_i * x_i)
+            "K_pos": float(ctrl.K_contributions[0]),
+            "K_vel": float(ctrl.K_contributions[1]),
+            "K_pitch": float(ctrl.K_contributions[2]),
+            "K_pitch_rate": float(ctrl.K_contributions[3]),
+            # Targets
+            "target_pos": float(ctrl.target_position),
+            "position": float(robot.position),
+        })
+
         if robot.check_fallen():
             print(f"\n[{sim_time:.2f}s] Robot fell over!")
             break
@@ -784,6 +815,7 @@ def run_simulation():
     else:
         print("✗ Robot fell.")
 
+    pj.close()
     print("\nClose the PyBullet window to exit.")
     while p.isConnected(physics_client):
         time.sleep(0.01)
