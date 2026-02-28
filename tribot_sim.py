@@ -134,8 +134,9 @@ CONFIG = {
     'GAMEPAD_DEADZONE': 0.08,
     'GAMEPAD_SPEED_AXIS': 4,        # Right stick Y
     'GAMEPAD_YAW_AXIS': 3,          # Right stick X
-    'GAMEPAD_MAX_SPEED': 0.5,       # m/s max forward/backward
+    'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
     'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
+    'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
 }
 
 
@@ -608,6 +609,19 @@ class TribotBalanceBot:
             'wheel_vel': (lw_vel, rw_vel),
         }
 
+    def get_world_pose_2d(self):
+        """
+        Return (x, y, yaw, fwd_x, fwd_y) in world frame.
+        Robot forward is body -X (URDF convention).
+        """
+        pos, orn = p.getBasePositionAndOrientation(self.body_id)
+        rot = p.getMatrixFromQuaternion(orn)
+        # Body -X in world = (-rot[0], -rot[3], -rot[6])
+        fwd_x = -rot[0]
+        fwd_y = -rot[3]
+        yaw = math.atan2(fwd_y, fwd_x)
+        return pos[0], pos[1], yaw, fwd_x, fwd_y
+
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 45°)."""
         true_pitch, _ = self._get_true_state()
@@ -625,7 +639,7 @@ def run_simulation():
     print("Tribot Self-Balancing Robot — URDF-based Simulation")
     print("=" * 70)
 
-    physics_client = p.connect(p.GUI)
+    physics_client = p.connect(p.GUI, options="--width=1920 --height=1080 --maximized")
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
     p.setGravity(0, 0, CONFIG['GRAVITY'])
@@ -677,9 +691,18 @@ def run_simulation():
     # Gamepad
     gp = Gamepad(CONFIG['GAMEPAD_DEVICE'], deadzone=CONFIG['GAMEPAD_DEADZONE'])
     if gp.connected:
-        print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = speed, "
+        print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = distance, "
               f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
+
+    # Visual target marker (vertical debug line)
+    marker_id = -1
+    marker_color = [0.0, 1.0, 0.0]   # green
+    marker_h = CONFIG['TARGET_MARKER_HEIGHT']
+
+    # Target position (1-D, robot forward axis). Latched when stick is idle.
     target_pos = 0.0
+    # World-frame marker position (latched alongside target_pos)
+    marker_world = [0.0, 0.0]
 
     sim_time = 0.0
     log_interval = 0.1
@@ -689,15 +712,40 @@ def run_simulation():
         # --- Gamepad input ---
         gp.poll()
         if gp.connected:
-            # Right stick Y → velocity command (push up = negative axis = forward)
-            speed_cmd = -gp.axis(CONFIG['GAMEPAD_SPEED_AXIS']) * CONFIG['GAMEPAD_MAX_SPEED']
-            # Integrate velocity → target position
-            target_pos += speed_cmd * CONFIG['TIMESTEP']
-            robot.controller.set_target_position(target_pos)
+            # Right stick Y → forward distance offset (push up = negative axis = in front)
+            forward_offset = -gp.axis(CONFIG['GAMEPAD_SPEED_AXIS']) * CONFIG['GAMEPAD_MAX_DISTANCE']
 
             # Right stick X → yaw rate command
             yaw_cmd = gp.axis(CONFIG['GAMEPAD_YAW_AXIS']) * CONFIG['GAMEPAD_MAX_YAW_RATE']
             robot.controller.set_yaw_rate(yaw_cmd)
+
+            # Update target while stick is actively deflected;
+            # when released, the last target stays fixed in world.
+            # While turning (yaw active, forward idle), reset target to
+            # current position so the robot doesn't chase a stale target.
+            if abs(forward_offset) > 1e-4:
+                target_pos = robot.position + forward_offset
+                # Compute world-frame marker position
+                rx, ry, _, fwd_x, fwd_y = robot.get_world_pose_2d()
+                marker_world = [rx + forward_offset * fwd_x,
+                                ry + forward_offset * fwd_y]
+            elif abs(yaw_cmd) > 1e-4:
+                target_pos = robot.position
+                rx, ry, _, _, _ = robot.get_world_pose_2d()
+                marker_world = [rx, ry]
+
+            robot.controller.set_target_position(target_pos)
+
+            # --- Update visual marker ---
+            pt_from = [marker_world[0], marker_world[1], 0.0]
+            pt_to   = [marker_world[0], marker_world[1], marker_h]
+            if marker_id >= 0:
+                marker_id = p.addUserDebugLine(
+                    pt_from, pt_to, marker_color, lineWidth=3,
+                    replaceItemUniqueId=marker_id)
+            else:
+                marker_id = p.addUserDebugLine(
+                    pt_from, pt_to, marker_color, lineWidth=3)
 
         robot.update(sim_time, CONFIG['TIMESTEP'])
         p.stepSimulation()
