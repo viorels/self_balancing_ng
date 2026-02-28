@@ -32,6 +32,7 @@ from control_pid import BalanceController
 from control_lqr import LQRBalanceController
 from gamepad import Gamepad
 from plotjuggler_udp import PlotJugglerStreamer
+from terrain import create_terrain
 
 
 # ============================================================================
@@ -44,6 +45,9 @@ CONFIG = {
     'TIMESTEP': 1.0 / 100.0,      # 100 Hz physics
     'SIM_DURATION': 60.0,
     'GROUND_FRICTION': 1.0,
+
+    # Terrain: 'flat', 'heightfield', or 'box_stairs'
+    'TERRAIN': 'box_stairs',
 
     # URDF model path (relative to this script)
     'URDF_PATH': 'tribot_description/urdf/tribot.urdf',
@@ -646,9 +650,8 @@ def run_simulation():
     p.setGravity(0, 0, CONFIG['GRAVITY'])
     p.setPhysicsEngineParameter(fixedTimeStep=CONFIG['TIMESTEP'], numSubSteps=1)
 
-    # Ground plane
-    ground_id = p.loadURDF("plane.urdf")
-    p.changeDynamics(ground_id, -1, lateralFriction=CONFIG['GROUND_FRICTION'])
+    # Terrain
+    ground_ids = create_terrain(CONFIG)
 
     # Create robot
     print("\nLoading tribot URDF...")
