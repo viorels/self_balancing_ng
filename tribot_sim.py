@@ -40,7 +40,7 @@ from gamepad import Gamepad
 CONFIG = {
     # Simulation parameters
     'GRAVITY': -9.81,
-    'TIMESTEP': 1.0 / 500.0,      # 500 Hz physics
+    'TIMESTEP': 1.0 / 100.0,      # 100 Hz physics
     'SIM_DURATION': 60.0,
     'GROUND_FRICTION': 1.0,
 
@@ -83,7 +83,7 @@ CONFIG = {
     # Control loop
     'CONTROL_RATE_HZ': 200,        # PID update rate (Hz)
     'CONTROL_JITTER_STD': 0.0005,  # Timing jitter std dev (s)
-    'SENSOR_TO_ACTUATOR_DELAY_STEPS': 1,
+    'SENSOR_TO_ACTUATOR_DELAY_STEPS': 0,
 
     # IMU sensor model
     'ADD_SENSOR_NOISE': True,
@@ -127,7 +127,7 @@ CONFIG = {
     'LQR_Q_DIAG': [1.0, 0.5, 80.0, 5.0],
     # R: torque cost (scalar) — higher = less aggressive, more robust to
     # unmodeled motor dynamics (lag, deadband, back-EMF)
-    'LQR_R': 10.0,
+    'LQR_R': 15.0,
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
