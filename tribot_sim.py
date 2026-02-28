@@ -30,6 +30,7 @@ import pybullet_data
 
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
+from control_mpc_hybrid import MPCHybridController
 from gamepad import Gamepad
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain
@@ -118,8 +119,25 @@ CONFIG = {
     'BELT_MAX_FORCE': 100.0,
 
     # === CONTROLLER SELECTION ===
-    # 'lqr' or 'pid'
-    'CONTROLLER': 'lqr',
+    # 'lqr', 'pid', or 'mpc'
+    'CONTROLLER': 'mpc',
+
+    # === MPC HYBRID PARAMETERS ===
+    'MPC_RATE_HZ': 40,                 # MPC solve rate (Hz) — simulates ESP32-S3 budget
+    'MPC_HORIZON': 10,                 # Prediction horizon N
+    'MPC_SIMULATED_SOLVE_MS': 25.0,    # Artificial delay per solve (ms) — realistic for ESP32-S3 SIMD
+    # Q weights: [pitch, pitch_rate, tripL, tripR, tripL_rate, tripR_rate, fwd_pos, fwd_vel]
+    'MPC_Q_DIAG': [80.0, 5.0, 2.0, 2.0, 0.5, 0.5, 1.0, 0.5],
+    # R weights: [tau_tripL, tau_tripR, tau_driveL, tau_driveR]
+    'MPC_R_DIAG': [5.0, 5.0, 10.0, 10.0],
+    'MPC_Q_TERMINAL_SCALE': 3.0,
+    'MPC_TRIPLET_TORQUE_MAX': 1.0,
+    'MPC_TRIPLET_INERTIA': 0.00238,    # kg·m² (0.5 * 0.33 * 0.12²)
+    # PD tracking gains: [trip_L, trip_R, drive_L, drive_R]
+    'MPC_PD_KP': [2.0, 2.0, 12.0, 12.0],
+    'MPC_PD_KD': [0.3, 0.3, 0.8, 0.8],
+    'MPC_PITCH_PD_CROSS_DRIVE': 8.0,
+    'MPC_PITCH_RATE_PD_CROSS_DRIVE': 0.5,
 
     # === LQR PARAMETERS ===
     # Linearised plant physical constants (derived from URDF via PyBullet)
@@ -324,7 +342,10 @@ class TribotBalanceBot:
         self._setup_belt_constraints()
 
         # Balance controller
-        if config.get('CONTROLLER', 'lqr') == 'lqr':
+        ctrl_type = config.get('CONTROLLER', 'lqr').lower()
+        if ctrl_type == 'mpc':
+            self.controller = MPCHybridController(config)
+        elif ctrl_type == 'lqr':
             self.controller = LQRBalanceController(config)
         else:
             self.controller = BalanceController(config)
@@ -529,11 +550,15 @@ class TribotBalanceBot:
         rot = p.getMatrixFromQuaternion(orn)
         yaw_rate = -(rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2])
 
-        # --- Cascaded PID controller → per-side commanded torques ---
+        # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             measured_pitch, measured_pitch_rate,
             self.position, yaw_rate, sim_time, dt
         )
+
+        # MPC controller also outputs triplet motor torques
+        triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
+        triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -545,11 +570,11 @@ class TribotBalanceBot:
         #
         # Left motor (+yaw_correction), Right motor (−yaw_correction)
         side_configs = [
-            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd),
-            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd),
+            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L),
+            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R),
         ]
 
-        for motor_idx, wheel_joints, triplet_joint, cmd_torque in side_configs:
+        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd in side_configs:
             # Representative wheel velocity (belt-coupled, all same)
             wheel_vel = p.getJointState(self.body_id, wheel_joints[0])[1]
 
@@ -559,17 +584,17 @@ class TribotBalanceBot:
             )
             self.actual_torques[motor_idx] = motor_torque
 
-            # --- Triplet hub joint: transfer reaction from triplet to body ---
-            # The motor stator is on the BODY; in the URDF chain
-            # (body → triplet → wheel) the wheel-joint reaction goes to the
-            # free-spinning triplet, not the body.  We must explicitly apply
-            # the reaction through the triplet joint so the body feels it.
-            # force = -motor_torque balances the triplet (keeps it free) and
-            # delivers the reaction to the body.
+            # --- Triplet hub joint ---
+            # Two torque components act on the triplet joint:
+            #  1. Drive motor reaction: -motor_torque transfers wheel-joint
+            #     reaction to the body (keeps the triplet hub free-spinning).
+            #  2. Triplet motor command: +triplet_cmd actively rotates the
+            #     triplet relative to the body (MPC-planned, 0 for PID/LQR).
+            triplet_total = -motor_torque + triplet_cmd
             p.setJointMotorControl2(
                 self.body_id, triplet_joint,
                 controlMode=p.TORQUE_CONTROL,
-                force=-motor_torque
+                force=triplet_total
             )
 
             # --- Wheel joints: distribute torque among 3 belt-coupled wheels ---
@@ -675,6 +700,15 @@ def run_simulation():
         print(f"  Outer PID (pos\u2192pitch):   Kp={CONFIG['POS_PID_KP']}, "
               f"Ki={CONFIG['POS_PID_KI']}, Kd={CONFIG['POS_PID_KD']}, "
               f"max_pitch={math.degrees(CONFIG['POS_PID_MAX_PITCH']):.1f}\u00b0")
+    elif ctrl_type == 'MPC':
+        print(f"  MPC rate: {CONFIG['MPC_RATE_HZ']}Hz, N={CONFIG['MPC_HORIZON']}, "
+              f"sim_solve={CONFIG['MPC_SIMULATED_SOLVE_MS']}ms")
+        print(f"  MPC Q_diag={CONFIG['MPC_Q_DIAG']}")
+        print(f"  MPC R_diag={CONFIG['MPC_R_DIAG']}")
+        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
+              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
+              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
+              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
     else:
         print(f"  Q_diag={CONFIG['LQR_Q_DIAG']}, R={CONFIG['LQR_R']}")
         print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
@@ -783,6 +817,17 @@ def run_simulation():
             # Targets
             "target_pos": float(ctrl.target_position),
             "position": float(robot.position),
+            # MPC diagnostics (only meaningful when controller is MPC)
+            **({
+                "mpc_solve_count": int(ctrl.mpc_solve_count),
+                "mpc_last_wall_ms": float(ctrl.mpc_last_wall_ms),
+                "mpc_max_wall_ms": float(ctrl.mpc_max_wall_ms),
+                "mpc_target_pitch": float(ctrl.target_pitch),
+                "mpc_ff_drive_L": float(ctrl.K_contributions[0]),
+                "mpc_ff_drive_R": float(ctrl.K_contributions[1]),
+                "mpc_pd_drive_L": float(ctrl.K_contributions[2]),
+                "mpc_pd_drive_R": float(ctrl.K_contributions[3]),
+            } if hasattr(ctrl, 'mpc_solve_count') else {}),
         })
 
         if robot.check_fallen():
