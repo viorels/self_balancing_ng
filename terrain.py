@@ -140,9 +140,9 @@ def _create_box_stairs(config):
 
     body_ids = [ground_id]
 
-    num_steps   = config.get('STAIR_NUM_STEPS', 8)
-    step_depth  = config.get('STAIR_STEP_DEPTH', 0.15)
-    step_height = config.get('STAIR_STEP_HEIGHT', 0.02)
+    num_steps   = config.get('STAIR_NUM_STEPS', 2)
+    step_depth  = config.get('STAIR_STEP_DEPTH', 0.20)
+    step_height = config.get('STAIR_STEP_HEIGHT', [0.1, 0.15])
     step_width  = config.get('STAIR_WIDTH', 0.6)
     start_x     = config.get('STAIR_START_X', 0.5)
     friction    = config['GROUND_FRICTION']
@@ -150,7 +150,7 @@ def _create_box_stairs(config):
     step_color_a = [0.55, 0.55, 0.60, 1.0]
     step_color_b = [0.65, 0.65, 0.70, 1.0]
 
-    def _make_staircase(x_origin, x_sign):
+    def _make_staircase(x_origin, x_sign, step_height):
         """Place one staircase. x_sign = +1 for +X, -1 for -X."""
         ids = []
         for i in range(num_steps):
@@ -176,8 +176,8 @@ def _create_box_stairs(config):
         return ids
 
     # Ascending staircase in +X
-    body_ids += _make_staircase(start_x, +1)
+    body_ids += _make_staircase(start_x, +1, step_height=step_height[0])
     # Ascending staircase in -X (descending when going from origin)
-    body_ids += _make_staircase(-start_x, -1)
+    body_ids += _make_staircase(-start_x, -1, step_height=step_height[1])
 
     return body_ids

@@ -158,13 +158,13 @@ CONFIG = {
     # 0.0 = free-fall (old behaviour), 1.0 = full authority (fires very late).
     # Empirical: MPC delivers ~50-70 % during impact, but 20 % is conservative
     # because motor lag & battery sag eat into the usable authority.
-    'ZMP_CTRL_AUTHORITY': 0.20,
+    'ZMP_CTRL_AUTHORITY': 0.3,
     # Mechanical crash limit (rad).  Beyond this angle, recovery is impossible
     # regardless of torque.  45° is a good default for an inverted pendulum.
     'ZMP_THETA_CRASH': 0.785,       # rad (≈45°)
     # Stair-step height (m).  If 0, flat-ground assumptions are used.
     # Non-zero reduces the required triplet rotation and landing ω₀.
-    'ZMP_STAIR_HEIGHT': 0.0,
+    'ZMP_STAIR_HEIGHT': 0.1,
     # Secondary pitch-rate gate — filters out slow balance sway.
     'ZMP_MIN_FALL_RATE_DEG_S': 15.0,
     # Post-flip cooldown (s) — block re-arming after a flip completes.
@@ -708,9 +708,9 @@ class TribotBalanceBot:
         return pos[0], pos[1], yaw, fwd_x, fwd_y
 
     def check_fallen(self):
-        """Check if robot has fallen over (|pitch| > 45°)."""
+        """Check if robot has fallen over (|pitch| > 80°)."""
         true_pitch, _ = self._get_true_state()
-        return abs(true_pitch) > math.radians(45)
+        return abs(true_pitch) > math.radians(80)
 
 
 # ============================================================================
@@ -739,7 +739,7 @@ def run_simulation():
 
     # Camera
     p.resetDebugVisualizerCamera(
-        cameraDistance=0.8, cameraYaw=45, cameraPitch=-30,
+        cameraDistance=1.2, cameraYaw=0, cameraPitch=-30,
         cameraTargetPosition=[0, 0, 0.15]
     )
 
