@@ -88,7 +88,7 @@ CONFIG = {
     'MOTOR_TORQUE_NOISE_STD': 0.005,   # Nm
 
     # Control loop
-    'CONTROL_RATE_HZ': 500,        # PD update rate (Hz) — matches physics for 2WD
+    'CONTROL_RATE_HZ': 200,        # PD tracking loop rate (Hz) — independent of physics
     'CONTROL_JITTER_STD': 0.0005,  # Timing jitter std dev (s)
     'SENSOR_TO_ACTUATOR_DELAY_STEPS': 0,
 
@@ -127,9 +127,9 @@ CONFIG = {
     'CONTROLLER': 'mpc',
 
     # === MPC HYBRID PARAMETERS ===
-    'MPC_RATE_HZ': 50,                 # MPC solve rate (Hz) — simulates ESP32-S3 budget
-    'MPC_HORIZON': 20,                 # Prediction horizon N (long enough for non-min-phase)
-    'MPC_SIMULATED_SOLVE_MS': 25.0,    # Artificial delay per solve (ms) — realistic for ESP32-S3 SIMD
+    'MPC_RATE_HZ': 30,                 # MPC solve rate (Hz) — realistic for ESP32-S3
+    'MPC_HORIZON': 10,                 # Prediction horizon N (DARE terminal cost handles the rest)
+    'MPC_SIMULATED_SOLVE_MS': 20.0,    # Artificial delay per solve (ms) — realistic for ESP32-S3 SIMD
     # Q weights: [pitch, pitch_rate, tripL, tripR, tripL_rate, tripR_rate, fwd_pos, fwd_vel]
     'MPC_Q_DIAG': [50.0, 5.0, 40.0, 40.0, 5.0, 5.0, 12.0, 5.0],
     # R weights: [tau_tripL, tau_tripR, tau_driveL, tau_driveR]
