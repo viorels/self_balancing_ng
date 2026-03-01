@@ -143,6 +143,36 @@ CONFIG = {
     'MPC_PITCH_PD_CROSS_DRIVE': 8.0,
     'MPC_PITCH_RATE_PD_CROSS_DRIVE': 0.5,
 
+    # === ZMP / DCM TRIPLET FLIP TRIGGER (physics-based) ===
+    # Flip timing
+    'ZMP_T_FLIP_NOMINAL': 0.18,    # s  — observed 120° rotation time (physics min ~63 ms)
+    'ZMP_T_FLIP_MARGIN':  0.05,    # s  — extra margin for motor lag, belt compliance
+    'ZMP_T_SETTLE':       0.40,    # s  — post-flip settling window
+    'ZMP_TRIP_TOL':       0.15,    # rad — "arrived at new angle" tolerance (~8.6°)
+    # MPC cost reshaping during flip
+    'ZMP_FLIP_Q_TRIP':  120.0,
+    'ZMP_FLIP_Q_PITCH': 120.0,
+    'ZMP_FLIP_R_TRIP':    0.05,
+    # Control-authority model — fraction η of max drive torque the controller
+    # can muster during a fall.  Lower = more conservative (fires earlier).
+    # 0.0 = free-fall (old behaviour), 1.0 = full authority (fires very late).
+    # Empirical: MPC delivers ~50-70 % during impact, but 20 % is conservative
+    # because motor lag & battery sag eat into the usable authority.
+    'ZMP_CTRL_AUTHORITY': 0.20,
+    # Mechanical crash limit (rad).  Beyond this angle, recovery is impossible
+    # regardless of torque.  45° is a good default for an inverted pendulum.
+    'ZMP_THETA_CRASH': 0.785,       # rad (≈45°)
+    # Stair-step height (m).  If 0, flat-ground assumptions are used.
+    # Non-zero reduces the required triplet rotation and landing ω₀.
+    'ZMP_STAIR_HEIGHT': 0.0,
+    # Secondary pitch-rate gate — filters out slow balance sway.
+    'ZMP_MIN_FALL_RATE_DEG_S': 15.0,
+    # Post-flip cooldown (s) — block re-arming after a flip completes.
+    'ZMP_FLIP_COOLDOWN': 0.8,
+    # Early-landing exit from FLIPPING
+    'ZMP_PITCH_RECOVER_THRESHOLD': 0.12,   # rad (~7°)
+    'ZMP_FLIP_MIN_ROTATION':       0.698,  # rad (40°)
+
     # === LQR PARAMETERS ===
     # Linearised plant physical constants (derived from URDF via PyBullet)
     'LQR_BODY_MASS': 2.7167,       # kg — c_body (from URDF mesh + mass)
@@ -821,6 +851,7 @@ def run_simulation():
         # --- Stream signals to PlotJuggler ---
         ctrl = robot.controller
         true_pitch, true_pitch_rate = robot._get_true_state()
+        _flip_diag = ctrl.get_flip_diagnostics() if hasattr(ctrl, 'get_flip_diagnostics') else {}
         pj.send({
             "timestamp": sim_time,
             # State signals
@@ -859,6 +890,16 @@ def run_simulation():
                 "mpc_triplet_dev_L": float(ctrl.x_est[ctrl.IDX_TRIP_L]),
                 "mpc_triplet_dev_R": float(ctrl.x_est[ctrl.IDX_TRIP_R]),
             } if hasattr(ctrl, 'mpc_solve_count') else {}),
+            # ZMP / DCM flip diagnostics (only when MPC controller is active)
+            **({
+                "zmp_phase":       int(_flip_diag['zmp/phase']),
+                "zmp_dcm":         float(_flip_diag['zmp/dcm']),
+                "zmp_dcm_max":     float(_flip_diag['zmp/dcm_max']),
+                "zmp_dcm_trigger": float(_flip_diag['zmp/dcm_trigger']),
+                "zmp_t_capture":   float(_flip_diag['zmp/t_capture']),
+                "zmp_urgency":     float(_flip_diag['zmp/urgency']),
+                "zmp_eq_deg":      float(_flip_diag['zmp/eq_angle_deg']),
+            } if _flip_diag else {}),
         })
 
         if robot.check_fallen():

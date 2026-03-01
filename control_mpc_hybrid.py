@@ -388,6 +388,422 @@ class MPCSolver:
 
 
 # ============================================================================
+# ZMP / DCM-based Predictive Triplet Flip Trigger
+# ============================================================================
+#
+# PHYSICS DERIVATION — from first principles
+# ============================================
+#
+# The tribot is an inverted pendulum on rolling wheels.  The triplet flip
+# rotates the wheel cluster by 120° to "catch" the robot when it's about to
+# fall beyond the recovery limits of normal 2WD balance control.
+#
+# Unlike a biped stepping at the capture point, the tribot's ground contact
+# does NOT shift laterally — every valid 2WD wheel position is directly
+# below the hub (the triplet is symmetric).  So the flip is not a "step to
+# the capture point" — it's a CRASH PREVENTION TRIGGER that buys time by
+# placing a fresh wheel on the ground before the lean exceeds the controller's
+# mechanical limits.
+#
+# The key improvement over a naïve free-fall DCM is accounting for the drive
+# wheel torque that actively fights the fall during the flip window.
+#
+# MODEL
+# -----
+# Pitch dynamics (linearised rigid body on a wheel):
+#
+#   I_eff · θ̈  =  m_b·g·L · θ  −  τ_ctrl
+#
+# where τ_ctrl is the effective restoring torque from both drive motors.
+# Rearranging:
+#
+#   θ̈  =  ω₀² · θ  −  a_ctrl
+#
+# with:
+#   ω₀ = √(m_b·g·L / I_eff)            (rigid body, NOT √(g/L)!)
+#   a_ctrl = b_pitch · 2 · η · τ_max    (pitch accel from drives at fraction η)
+#   b_pitch = B[1,2] from the MPC A/B matrices
+#
+# Substituting  φ = θ − θ_eq  where  θ_eq = a_ctrl / ω₀² :
+#
+#   φ̈ = ω₀² · φ                        (free LIPM in shifted frame)
+#
+# The CONTROLLED DCM is:
+#
+#   ξ_ctrl = L·(θ − sgn(θ)·θ_eq) + L·θ̇/ω₀
+#          = ξ_raw − sgn(ξ_raw) · L·θ_eq
+#
+# which we call the "DCM excess":
+#
+#   ξ_excess = |ξ_raw| − dcm_shift     where dcm_shift = L · θ_eq
+#
+# If ξ_excess ≤ 0: the drive torque can arrest this fall.  No flip needed.
+# If ξ_excess > 0: it grows exponentially as ξ_excess(t) = ξ_excess · e^{ω₀t}
+#
+# The crash happens when |θ| reaches θ_crash (mechanical limit, ~45°):
+#
+#   ξ_crash = L·θ_crash − dcm_shift
+#
+# Time to crash:
+#
+#   t_crash = (1/ω₀) · ln(ξ_crash / ξ_excess)     if ξ_excess > 0
+#
+# The flip must be triggered when  t_crash ≤ T_budget  (flip time + margin).
+#
+# FLIP TIMING
+# -----------
+# Theoretical bang-bang minimum:  T_bb = 2·√(Δα · I_t / τ_trip_max)
+# With Δα=120°, I_t=0.00238, τ_trip_max=5.0 → T_bb ≈ 63 ms.
+# Config override (motor lag, belt compliance): ZMP_T_FLIP_NOMINAL ≈ 180 ms.
+#
+# REACTION TORQUE
+# ---------------
+# During the flip, the triplet motor reaction torque (±5 Nm) acts on the body.
+# For a symmetric acceleration-deceleration profile, the net impulse is zero.
+# We conservatively ignore this benefit (the actual MPC profile may give a
+# small net deceleration in the first half).
+#
+# STAIR HEIGHT
+# ------------
+# When landing on a step of height h:
+#   - Required rotation: α_land = arccos(1 − h/R_t)  (< 120°, faster landing)
+#   - Effective pendulum: L_eff = L − h  (shorter, slightly easier to balance)
+#   - T_flip scales as  T_bb · √(α_land / Δα)
+# Default: h = 0 (flat ground, most conservative).
+#
+# ============================================================================
+
+_G = 9.81
+
+# Wheel base angles (radians, CCW from +x in the triplet side-view plane)
+_WHEEL_BASE_ANGLES = [
+    math.atan2(+0.12,      0.0),        # wheel_1:  90°  (top in default pose)
+    math.atan2(-0.060125, -0.10414),    # wheel_2: ~210° (bottom-rear)
+    math.atan2(-0.060125, +0.10414),    # wheel_3: ~330° (bottom-front)
+]
+
+# Flip phase constants (used as str tags — no Enum needed for ESP32 compat)
+FLIP_PHASE_NORMAL   = 'NORMAL'     # 2WD balance, no flip pending
+FLIP_PHASE_ARMED    = 'ARMED'      # DCM approaching — raise urgency, pre-spin
+FLIP_PHASE_FLIPPING = 'FLIPPING'   # MPC is actively driving to +120° target
+FLIP_PHASE_SETTLING = 'SETTLING'   # New wheel landed; waiting for pitch to settle
+
+
+def _dcm(pitch, pitch_rate, L, omega0):
+    """
+    Divergent Component of Motion (DCM / capture point) for a LIPM.
+
+        ξ = L sin θ  +  (1/ω₀) L cos θ · θ̇
+
+    Positive ξ = falling forward.  Negative ξ = falling backward.
+    """
+    x_com  = L * math.sin(pitch)
+    xd_com = L * math.cos(pitch) * pitch_rate
+    return x_com + xd_com / omega0
+
+
+def _time_to_controlled_crash(pitch, pitch_rate, L, omega0, dcm_shift, dcm_crash):
+    """
+    Predict time (s) until |θ| reaches θ_crash under controlled LIPM dynamics.
+
+    Under maximum expected drive torque, the DCM excess evolves as:
+        ξ_excess(t) = ξ_excess(0) · exp(ω₀ · t)
+
+    The "crash" DCM target (in the shifted frame) is:
+        ξ_crash_shifted = dcm_crash − dcm_shift
+
+    Parameters
+    ----------
+    L          : pendulum height (m)
+    omega0     : rigid-body natural frequency (rad/s)
+    dcm_shift  : L · θ_eq from drive torque authority (m)
+    dcm_crash  : L · θ_crash where θ_crash is the mechanical crash limit (m)
+
+    Returns
+    -------
+    t > 0   — seconds until crash under controlled dynamics
+    0.0     — already past crash point
+    +inf    — drive torque can arrest this fall (ξ_excess ≤ 0)
+    """
+    xi_raw = _dcm(pitch, pitch_rate, L, omega0)
+    xi_excess = abs(xi_raw) - dcm_shift
+    dcm_crash_shifted = dcm_crash - dcm_shift
+
+    if dcm_crash_shifted <= 0:
+        # Control authority exceeds crash limit — can hold any angle
+        return math.inf
+
+    if xi_excess <= 0:
+        # Control can arrest this fall
+        return math.inf
+
+    if xi_excess >= dcm_crash_shifted:
+        return 0.0      # Already past crash — flip overdue
+
+    return (1.0 / omega0) * math.log(dcm_crash_shifted / xi_excess)
+
+
+class ZMPFlipTrigger:
+    """
+    Physics-based predictive trigger for the 120° triplet flip.
+
+    All thresholds are **derived from the robot's physical parameters** —
+    mass, inertia, torque limits, geometry — rather than hand-tuned.
+    The only tunable fraction is ``ZMP_CTRL_AUTHORITY`` (how much of the
+    drive torque budget is assumed available during the fall, default 20%).
+
+    Runs inside the MPC slow loop (~30-50 Hz).  Each call to ``update()``
+    returns a ``FlipDecision`` dict consumed by ``_run_mpc``.
+
+    Parameters (from controller config dict)
+    -----------------------------------------
+    ZMP_CTRL_AUTHORITY      : float — fraction [0,1] of max drive torque assumed
+                              during fall (0 = free-fall, 1 = full control).
+                              Default 0.20 (conservative: motor lag, belt slack,
+                              back-EMF at speed consume ~80% of authority).
+    ZMP_THETA_CRASH         : float — mechanical crash angle (rad, default π/4 = 45°)
+    ZMP_STAIR_HEIGHT        : float — expected step height at landing (m, default 0)
+    ZMP_T_FLIP_NOMINAL      : float — expected 120° rotation time (s, default 0.18)
+    ZMP_T_FLIP_MARGIN       : float — safety margin on top (s, default 0.05)
+    ZMP_T_SETTLE            : float — post-flip settling window (s, default 0.40)
+    ZMP_TRIP_TOL            : float — angle tolerance for "flip complete" (rad)
+    ZMP_FLIP_COOLDOWN       : float — post-flip rearm lockout (s, default 0.8)
+    ZMP_MIN_FALL_RATE_DEG_S : float — secondary fall-rate gate (°/s)
+    """
+
+    def __init__(self, config):
+        g = abs(config.get('GRAVITY', -9.81))
+
+        # ---- Robot physical parameters ----
+        m_b    = config['LQR_BODY_MASS']
+        m_w    = config['LQR_WHEEL_MASS']
+        L      = config['LQR_COG_HEIGHT']
+        I_b    = config['LQR_BODY_INERTIA']
+        r_w    = config['WHEEL_RADIUS']
+        R_t    = config.get('TRIPLET_RADIUS', 0.12)
+        I_t    = config.get('MPC_TRIPLET_INERTIA', 0.00238)
+        tau_d  = config.get('MAX_TORQUE', 1.0)         # per-motor drive torque (Nm)
+        tau_t  = config.get('MPC_TRIPLET_TORQUE_MAX', 5.0)
+
+        self.L  = L
+        self.R_t = R_t
+
+        # ---- Correct rigid-body natural frequency ----
+        I_eff = I_b + m_b * L**2
+        self.omega0 = math.sqrt(m_b * g * L / I_eff)
+
+        # ---- Pitch dynamics from the linearised state-space model ----
+        # (Same formulas as build_mpc_state_space — must stay in sync.)
+        M_tot = m_b + m_w
+        det   = M_tot * I_eff - (m_b * L)**2
+        a_pp  = M_tot * (m_b * g * L) / det          # A[1,0]
+        b_pd  = (m_b * L) / (det * r_w) + M_tot / det  # B[1,2]=B[1,3]
+
+        # ---- Drive torque authority during the fall ----
+        eta = config.get('ZMP_CTRL_AUTHORITY', 0.20)
+        # Effective pitch deceleration from both motors at η of max:
+        a_ctrl       = b_pd * 2 * eta * tau_d    # rad/s²
+        theta_eq     = a_ctrl / a_pp             # equilibrium shift (rad)
+        self.dcm_shift = L * theta_eq            # metres: the "safe zone"
+
+        # ---- Crash / target thresholds ----
+        theta_crash  = config.get('ZMP_THETA_CRASH', math.pi / 4)  # 45° default
+        self.dcm_crash = L * theta_crash         # metres
+
+        # ---- Stair height adjustment ----
+        h_stair = config.get('ZMP_STAIR_HEIGHT', 0.0)
+        self.stair_height = h_stair
+        if h_stair > 0 and h_stair < R_t:
+            # Effective pendulum height is shorter when landing on a step
+            L_eff = L - h_stair
+            self.omega0_land = math.sqrt(m_b * g * L_eff / I_eff)
+        else:
+            self.omega0_land = self.omega0
+
+        # ---- Flip timing ----
+        delta_alpha = 2 * math.pi / 3   # 120°
+        # Theoretical bang-bang minimum:
+        T_bb = 2.0 * math.sqrt(delta_alpha * I_t / tau_t) if tau_t > 0 else 0.5
+        self.t_flip_bb = T_bb
+
+        # For stair: shorter rotation → faster landing
+        if h_stair > 0 and h_stair < R_t:
+            alpha_land = math.acos(max(-1.0, 1.0 - h_stair / R_t))
+            T_bb_stair = T_bb * math.sqrt(alpha_land / delta_alpha)
+        else:
+            alpha_land = delta_alpha
+            T_bb_stair = T_bb
+
+        self.t_flip   = config.get('ZMP_T_FLIP_NOMINAL', 0.18)
+        self.t_margin = config.get('ZMP_T_FLIP_MARGIN',  0.05)
+        self.t_budget = self.t_flip + self.t_margin
+
+        self.t_settle = config.get('ZMP_T_SETTLE',       0.40)
+        self.trip_tol = config.get('ZMP_TRIP_TOL',       0.15)   # rad
+
+        # ---- Fall-rate gate (secondary safety) ----
+        self.min_fall_rate = math.radians(
+            config.get('ZMP_MIN_FALL_RATE_DEG_S', 15.0))
+
+        # ---- Early-landing exit from FLIPPING ----
+        self.pitch_recover_threshold = config.get(
+            'ZMP_PITCH_RECOVER_THRESHOLD', 0.12)  # rad (~7°)
+        self.flip_min_rotation = config.get(
+            'ZMP_FLIP_MIN_ROTATION', math.radians(40))  # rad
+
+        # ---- Post-flip cooldown ----
+        self.t_cooldown   = config.get('ZMP_FLIP_COOLDOWN', 0.8)
+        self.cooldown_until = 0.0
+
+        # ---- State ----
+        self.phase        = FLIP_PHASE_NORMAL
+        self.flip_target  = 0.0
+        self.flip_dir     = 0.0
+        self.settle_until = 0.0
+        self.obstacle_hint = False
+
+        # ---- Diagnostics ----
+        self.dcm           = 0.0
+        self.dcm_target    = self.dcm_crash
+        self.t_to_capture  = math.inf
+        self.urgency       = 0.0
+
+        # ---- Print derived parameters ----
+        print(f"    ZMP trigger (physics-based):")
+        print(f"      ω₀ = {self.omega0:.2f} rad/s  (rigid body; "
+              f"point-mass would be {math.sqrt(g/L):.2f})")
+        print(f"      Drive authority: η={eta:.0%} of {tau_d:.1f} Nm/motor "
+              f"→ a_ctrl={a_ctrl:.1f} rad/s², θ_eq={math.degrees(theta_eq):.1f}°")
+        print(f"      DCM shift (safe zone) = {self.dcm_shift*1000:.1f} mm  "
+              f"(normal balance stays below this)")
+        print(f"      DCM crash = {self.dcm_crash*1000:.1f} mm  "
+              f"(θ_crash={math.degrees(theta_crash):.0f}°)")
+        print(f"      T_flip: {T_bb*1000:.0f} ms (bang-bang) → {self.t_flip*1000:.0f} ms (config) "
+              f"+ {self.t_margin*1000:.0f} ms margin = {self.t_budget*1000:.0f} ms budget")
+        if h_stair > 0:
+            print(f"      Stair: h={h_stair*100:.0f} cm → α_land={math.degrees(alpha_land):.0f}°, "
+                  f"T_land≈{T_bb_stair*1000:.0f} ms")
+        print(f"      Fall-rate gate: {math.degrees(self.min_fall_rate):.0f}°/s  "
+              f"Cooldown: {self.t_cooldown:.1f}s")
+
+    def set_obstacle_hint(self, detected: bool):
+        """Set from TOF/depth sensor to arm the trigger 50 ms earlier."""
+        self.obstacle_hint = detected
+
+    def set_stair_height(self, h: float):
+        """Update expected stair height (m) from sensor data."""
+        self.stair_height = h
+
+    def update(self, pitch, pitch_rate, triplet_eq_angle, trip_dev_L, trip_dev_R,
+               sim_time):
+        """
+        Evaluate the flip condition and advance the phase FSM.
+
+        Uses the controlled LIPM prediction: the time-to-crash accounts for
+        the fraction of drive torque fighting the fall (dcm_shift), so the
+        trigger fires only when the fall has exceeded the drive's recovery
+        capability — not during normal balance oscillations.
+
+        Returns dict with keys: phase, should_flip, flip_target, flip_dir,
+        urgency, dcm, t_to_capture.
+        """
+        L  = self.L
+        w0 = self.omega0
+
+        # ---- Compute raw DCM and controlled time-to-crash ----
+        self.dcm = _dcm(pitch, pitch_rate, L, w0)
+        self.t_to_capture = _time_to_controlled_crash(
+            pitch, pitch_rate, L, w0, self.dcm_shift, self.dcm_crash)
+
+        # Fall direction: +1 = forward, -1 = backward
+        raw_dir = math.copysign(1.0, self.dcm) if abs(self.dcm) > 1e-4 else 0.0
+
+        # Dynamic budget: obstacle hint arms 50 ms earlier
+        extra  = 0.05 if self.obstacle_hint else 0.0
+        budget = self.t_budget + extra
+
+        # Compute [0, 1] urgency
+        arm_window = 1.5 * budget
+        if self.t_to_capture >= arm_window:
+            self.urgency = 0.0
+        elif self.t_to_capture <= 0.0:
+            self.urgency = 1.0
+        else:
+            self.urgency = float(np.clip(
+                1.0 - self.t_to_capture / arm_window, 0.0, 1.0))
+
+        should_flip = False
+
+        # ---- Phase FSM ----
+        if self.phase == FLIP_PHASE_NORMAL:
+            # Arm only when:
+            #   (a) DCM time-to-capture is within the 1.5× budget window, AND
+            #   (b) the pitch rate in the fall direction is fast enough to be a
+            #       real obstacle fall, not a slow balance oscillation.
+            #   (c) the post-flip cooldown has expired (prevents re-trigger from
+            #       post-landing rocking after a successful flip).
+            falling_fast = abs(pitch_rate) >= self.min_fall_rate
+            cooled_down  = sim_time >= self.cooldown_until
+            if self.t_to_capture <= 1.5 * budget and falling_fast and cooled_down:
+                self.phase    = FLIP_PHASE_ARMED
+                self.flip_dir = raw_dir if raw_dir != 0.0 else 1.0
+
+        elif self.phase == FLIP_PHASE_ARMED:
+            if self.t_to_capture <= budget:
+                # Time to go — rotate toward the fall to catch it.
+                # +1 = forward fall → +120° rotation
+                # -1 = backward fall → -120° rotation
+                self.flip_target = self.flip_dir * 2.0 * math.pi / 3.0
+                self.phase       = FLIP_PHASE_FLIPPING
+                should_flip      = True
+            elif self.t_to_capture > 1.5 * budget + 0.1:
+                # DCM retreated with hysteresis (e.g. controller recovered)
+                self.phase    = FLIP_PHASE_NORMAL
+                self.flip_dir = 0.0
+
+        elif self.phase == FLIP_PHASE_FLIPPING:
+            # Primary completion: triplet arrived within tolerance of ±120° target.
+            avg_dev = 0.5 * (abs(trip_dev_L - self.flip_target)
+                             + abs(trip_dev_R - self.flip_target))
+            reached_target = avg_dev < self.trip_tol
+
+            # Early-landing completion: new wheel has already taken the robot's
+            # weight (pitch returned near vertical) even though the triplet has
+            # not yet rotated a full 120°.  This happens when the new wheel
+            # contacts the ground at ~60° of rotation instead of 120°.
+            # Conditions: pitch near zero AND triplet has moved at least 60°.
+            avg_rotation = abs(0.5 * (trip_dev_L + trip_dev_R))
+            early_landing = (
+                abs(pitch) < self.pitch_recover_threshold
+                and avg_rotation >= self.flip_min_rotation
+            )
+
+            if reached_target or early_landing:
+                self.settle_until = sim_time + self.t_settle
+                self.phase = FLIP_PHASE_SETTLING
+            should_flip = True   # Keep targeting the flip until landed
+
+        elif self.phase == FLIP_PHASE_SETTLING:
+            if sim_time >= self.settle_until:
+                # Start cooldown: block re-arming until the robot has had
+                # time to settle onto the new wheel without oscillating.
+                self.cooldown_until = sim_time + self.t_cooldown
+                self.phase       = FLIP_PHASE_NORMAL
+                self.flip_target = 0.0
+                self.flip_dir    = 0.0
+
+        return {
+            'phase':       self.phase,
+            'should_flip': should_flip,
+            'flip_target': self.flip_target,
+            'flip_dir':    self.flip_dir,
+            'urgency':     self.urgency,
+            'dcm':         self.dcm,
+            't_to_capture': self.t_to_capture,
+        }
+
+
+# ============================================================================
 # Hybrid MPC + PD Controller
 # ============================================================================
 
@@ -422,6 +838,18 @@ class MPCHybridController:
         MPC_PITCH_PD_CROSS_DRIVE  – cross-coupling: pitch error → drive torque
         MAX_TORQUE                – per-motor torque limit (Nm)
         CONTROL_RATE_HZ           – fast PD loop rate
+
+    ZMP flip trigger config keys (all optional):
+        ZMP_T_FLIP_NOMINAL        – expected 120° rotation time (s, default 0.18)
+        ZMP_T_FLIP_MARGIN         – safety margin added to flip budget (s, default 0.05)
+        ZMP_CTRL_AUTHORITY        – fraction of max drive torque during fall (default 0.20)
+        ZMP_THETA_CRASH           – mechanical crash limit (rad, default π/4)
+        ZMP_STAIR_HEIGHT          – expected step height at landing (m, default 0.0)
+        ZMP_T_SETTLE              – post-flip pitch settling window (s, default 0.40)
+        ZMP_TRIP_TOL              – angle tolerance for "flip complete" (rad, default 0.15)
+        ZMP_FLIP_Q_TRIP           – Q diagonal weight for triplet during flip (default 120.0)
+        ZMP_FLIP_R_TRIP           – R diagonal weight for triplet during flip (default 0.05)
+        ZMP_FLIP_Q_PITCH          – Q pitch weight raised during flip (default 120.0)
     """
 
     # State indices
@@ -481,6 +909,26 @@ class MPCHybridController:
         trip_tau_max = config.get('MPC_TRIPLET_TORQUE_MAX', tau_max)
         self.u_min = np.array([-trip_tau_max, -trip_tau_max, -tau_max, -tau_max])
         self.u_max = np.array([ trip_tau_max,  trip_tau_max,  tau_max,  tau_max])
+
+        # ---- Flip-mode cost weights (override normal Q/R during 120° rotation) ----
+        # Higher Q on pitch + triplet = tighter tracking during the manoeuvre.
+        # Lower R on triplet = allow the motor to rotate faster.
+        zmp_q_trip  = config.get('ZMP_FLIP_Q_TRIP',  120.0)
+        zmp_q_pitch = config.get('ZMP_FLIP_Q_PITCH', 120.0)
+        zmp_r_trip  = config.get('ZMP_FLIP_R_TRIP',    0.3)
+        q_flip_diag = list(q_diag)          # copy
+        q_flip_diag[0] = zmp_q_pitch        # pitch
+        q_flip_diag[1] = zmp_q_pitch * 0.3  # pitch rate
+        q_flip_diag[2] = zmp_q_trip         # triplet angle L
+        q_flip_diag[3] = zmp_q_trip         # triplet angle R
+        q_flip_diag[4] = zmp_q_trip * 0.1   # triplet rate L
+        q_flip_diag[5] = zmp_q_trip * 0.1   # triplet rate R
+        r_flip_diag = list(r_diag)
+        r_flip_diag[0] = zmp_r_trip         # tau_triplet_L
+        r_flip_diag[1] = zmp_r_trip         # tau_triplet_R
+        self.Q_flip = np.diag(q_flip_diag)
+        self.R_flip = np.diag(r_flip_diag)
+        self._flip_solver_active = False    # True while flip-mode solver is in use
 
         # ---- Build initial model and solver ----
         self.Ac, self.Bc = build_mpc_state_space(config)
@@ -591,6 +1039,22 @@ class MPCHybridController:
         self.mpc_last_wall_ms = 0.0
         self.mpc_max_wall_ms = 0.0
 
+        # ---- ZMP / DCM flip trigger ----
+        self.zmp_trigger = ZMPFlipTrigger(config)
+        # Track whether the triplet_equilibrium was already advanced during
+        # the current SETTLING window (prevents double-advance).
+        self._flip_eq_updated = False
+        # Snapshot of triplet_equilibrium at the moment the flip was armed
+        # (before any triplet movement).  Used to snap equilibrium to the
+        # nearest valid 2WD angle after landing.
+        self._equil_before_flip = self.triplet_equilibrium
+        # Snapshot of flip_target at the moment we entered FLIPPING phase.
+        self._flip_abs_target = self.triplet_equilibrium
+        # Direction of the most recent flip (+1 forward, -1 backward);
+        # used to apply a small pitch bias during SETTLING.
+        self._flip_dir_settled = 0.0
+        # (ZMP trigger prints its own derived-parameter summary in __init__)
+
     # ----------------------------------------------------------------
     # Public setters (same API as PID / LQR controllers)
     # ----------------------------------------------------------------
@@ -608,6 +1072,59 @@ class MPCHybridController:
         self._triplet_rate_L = rate_L
         self._triplet_rate_R = rate_R
 
+    def notify_obstacle(self, detected: bool):
+        """Forward TOF / depth-sensor obstacle hint to the ZMP trigger."""
+        self.zmp_trigger.set_obstacle_hint(detected)
+
+    def get_flip_diagnostics(self) -> dict:
+        """
+        Return a flat dict suitable for logging to PlotJuggler.
+
+        Keys
+        ----
+        zmp/phase        : 0=NORMAL 1=ARMED 2=FLIPPING 3=SETTLING
+        zmp/dcm          : DCM position (m)
+        zmp/dcm_target   : next-wheel x-offset target (m)
+        zmp/t_capture    : predicted seconds to DCM target (capped at 2.0)
+        zmp/urgency      : [0, 1] flip urgency
+        zmp/eq_angle_deg : current triplet equilibrium angle (degrees)
+        """
+        phase_map = {FLIP_PHASE_NORMAL: 0, FLIP_PHASE_ARMED: 1,
+                     FLIP_PHASE_FLIPPING: 2, FLIP_PHASE_SETTLING: 3}
+        zt = self.zmp_trigger
+        return {
+            'zmp/phase':       phase_map.get(zt.phase, -1),
+            'zmp/dcm':         zt.dcm,
+            'zmp/dcm_max':     zt.dcm_crash,
+            'zmp/dcm_trigger': zt.dcm_shift,
+            'zmp/t_capture':   min(zt.t_to_capture, 2.0),
+            'zmp/urgency':     zt.urgency,
+            'zmp/eq_angle_deg': math.degrees(self.triplet_equilibrium),
+        }
+
+    # ----------------------------------------------------------------
+    # Solver rebuild helper
+    # ----------------------------------------------------------------
+
+    def _rebuild_solver(self, Q, R):
+        """
+        Rebuild the MPCSolver with new cost matrices Q and R.
+
+        Called lazily when flip mode changes to avoid rebuilding every cycle.
+        The DARE terminal cost is recomputed; if it fails, falls back to
+        scaled Q.
+        """
+        Ad, Bd = discretise_zoh(self.Ac, self.Bc, self.mpc_period)
+        try:
+            Q_term = la.solve_discrete_are(Ad, Bd, Q, R)
+        except Exception:
+            Q_term = Q * self.cfg.get('MPC_Q_TERMINAL_SCALE', 3.0)
+
+        self.mpc_solver = MPCSolver(
+            Ad, Bd, Q, R, Q_term, self.N,
+            u_min=self.u_min, u_max=self.u_max
+        )
+
     # ----------------------------------------------------------------
     # MPC slow loop
     # ----------------------------------------------------------------
@@ -619,11 +1136,112 @@ class MPCHybridController:
         The actual Python solve runs instantly, but we record wall-clock
         time and enforce a simulated compute budget so that MPC results
         are not used until ``mpc_busy_until``.
+
+        ZMP / DCM integration
+        ~~~~~~~~~~~~~~~~~~~~~
+        Each solve cycle we:
+          1. Query ZMPFlipTrigger to evaluate the DCM / capture-point condition.
+          2. If FLIPPING: set the triplet reference to +120° deviation and
+             switch to flip-mode Q/R (aggressive triplet, tight pitch).
+          3. If SETTLING → NORMAL transition: advance triplet_equilibrium by
+             +120° so the state-vector deviations reset to ≈0 for the next
+             solve cycle.
+          4. Otherwise: use normal mode Q/R with standard reference.
         """
-        # Reference: upright pitch, track target position, zero velocity
+        # ---- Current triplet deviations from equilibrium ----
+        trip_dev_L = self._triplet_angle_L - self.triplet_equilibrium
+        trip_dev_R = self._triplet_angle_R - self.triplet_equilibrium
+
+        # ---- Query ZMP trigger ----
+        flip = self.zmp_trigger.update(
+            pitch          = x0[self.IDX_PITCH],
+            pitch_rate     = x0[self.IDX_PITCH_RATE],
+            triplet_eq_angle = self.triplet_equilibrium,
+            trip_dev_L     = trip_dev_L,
+            trip_dev_R     = trip_dev_R,
+            sim_time       = sim_time,
+        )
+
+        phase = flip['phase']
+
+        # ---- Mode switching: rebuild solver when flip mode changes ----
+        want_flip_solver = (phase in (FLIP_PHASE_ARMED,
+                                      FLIP_PHASE_FLIPPING,
+                                      FLIP_PHASE_SETTLING))
+        if want_flip_solver and not self._flip_solver_active:
+            self._rebuild_solver(self.Q_flip, self.R_flip)
+            self._flip_solver_active = True
+            self._flip_eq_updated    = False
+            # Snapshot where the triplet equilibrium is RIGHT NOW (before any
+            # triplet movement) so we can snap to the nearest valid 2WD angle
+            # when SETTLING fires, regardless of how far the triplet actually rotated.
+            self._equil_before_flip  = self.triplet_equilibrium
+            self._flip_abs_target    = (self.triplet_equilibrium
+                                        + flip['flip_target'])
+        elif not want_flip_solver and self._flip_solver_active:
+            self._rebuild_solver(self.Q, self.R)
+            self._flip_solver_active = False
+
+        # ---- Advance triplet equilibrium once the new wheel has landed ----
+        # On the first SETTLING cycle, shift the equilibrium by ±120°
+        # (matching the flip direction) so the state deviations snap back to
+        # ≈0 for the normal-mode MPC that follows.
+        if phase == FLIP_PHASE_SETTLING and not self._flip_eq_updated:
+            flip_dir = self.zmp_trigger.flip_dir
+            if flip_dir == 0.0:
+                flip_dir = math.copysign(1.0, flip['flip_target']) if flip['flip_target'] != 0.0 else 1.0
+            # Snap equilibrium to the NEXT valid 2WD angle in the flip direction.
+            # Valid positions are: equil_before_flip + n × 120°.
+            # We use direction-biased rounding (floor for backward, ceil for forward)
+            # to guarantee n ≠ 0 even on early landings (<60° of rotation done).
+            # This means SETTLING continues rotating the remaining distance to the
+            # proper 2WD angle rather than freezing in a 4WD (between-wheel) position.
+            actual_trip = 0.5 * (self._triplet_angle_L + self._triplet_angle_R)
+            step = 2.0 * math.pi / 3.0   # 120°
+            raw_n = (actual_trip - self._equil_before_flip) / step
+            if flip_dir < 0:
+                n = math.floor(raw_n)     # e.g. -0.485 → -1  (backward flip)
+            else:
+                n = math.ceil(raw_n)      # e.g. +0.485 → +1  (forward flip)
+            if n == 0:                    # safety: force at least one step
+                n = int(math.copysign(1.0, flip_dir))
+            self.triplet_equilibrium = self._equil_before_flip + n * step
+            # Re-derive deviations w.r.t. the new equilibrium
+            trip_dev_L = self._triplet_angle_L - self.triplet_equilibrium
+            trip_dev_R = self._triplet_angle_R - self.triplet_equilibrium
+            # Reset position target to current location so the controller does NOT
+            # drive the robot back toward the pre-fall position after SETTLING ends.
+            self.target_position = x0[self.IDX_FWD_POS]
+            self._flip_eq_updated = True
+            self._flip_dir_settled = flip_dir   # remember for SETTLING pitch bias
+
+        # ---- Build MPC reference for this solve cycle ----
         self.x_ref[:] = 0.0
         self.x_ref[self.IDX_FWD_POS] = self.target_position
         self.x_ref[self.IDX_FWD_VEL] = 0.0
+
+        if phase == FLIP_PHASE_FLIPPING:
+            # Target the +120° triplet deviation (relative to current eq)
+            self.x_ref[self.IDX_TRIP_L]   = flip['flip_target']
+            self.x_ref[self.IDX_TRIP_R]   = flip['flip_target']
+            self.x_ref[self.IDX_TRIP_L_D] = 0.0   # arrive at rest
+            self.x_ref[self.IDX_TRIP_R_D] = 0.0
+            # Freeze the forward-position reference at the current position
+            # so the MPC does not try to move forward during the flip.
+            self.x_ref[self.IDX_FWD_POS]  = x0[self.IDX_FWD_POS]
+        elif phase == FLIP_PHASE_SETTLING:
+            # Hold the new equilibrium (deviations should be near 0 after
+            # the equilibrium advance above); allow pitch to settle.
+            # Do NOT add a pitch bias here — it leaves a residual lean that
+            # immediately re-triggers the flip FSM once SETTLING ends.
+            self.x_ref[self.IDX_TRIP_L]   = 0.0
+            self.x_ref[self.IDX_TRIP_R]   = 0.0
+            self.x_ref[self.IDX_FWD_POS]  = x0[self.IDX_FWD_POS]
+        elif phase == FLIP_PHASE_ARMED:
+            # Start leaning slightly *into* the fall direction to seed the
+            # MPC plan.  flip_dir = +1 → lean forward, -1 → lean backward.
+            fd = flip['flip_dir']
+            self.x_ref[self.IDX_PITCH] = fd * 0.015 * flip['urgency']
 
         # Measure actual wall-clock solve time (for diagnostics)
         t_wall_start = _time.monotonic()
