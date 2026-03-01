@@ -43,7 +43,7 @@ from terrain import create_terrain
 CONFIG = {
     # Simulation parameters
     'GRAVITY': -9.81,
-    'TIMESTEP': 1.0 / 100.0,      # 100 Hz physics
+    'TIMESTEP': 1.0 / 500.0,      # 500 Hz physics (required for 2WD triplet stability)
     'SIM_DURATION': 60.0,
     'GROUND_FRICTION': 1.0,
 
@@ -59,7 +59,8 @@ CONFIG = {
 
     # Initial conditions
     'INITIAL_PITCH': -0.03,        # rad (~1.7°) — slight initial tilt
-    'INITIAL_HEIGHT': 0.12,        # m — c_body origin above ground (bottom wheel at ~ground level)
+    'INITIAL_HEIGHT': 0.18,        # m — c_body origin above ground (2WD: triplet_R + wheel_R)
+    'INITIAL_TRIPLET_ANGLE': 1.0472,  # rad (60° = π/3) — 2WD mode: one wheel down per side
 
     # Inner PID gains (pitch → motor torque)
     'PID_KP': 15.0,
@@ -87,7 +88,7 @@ CONFIG = {
     'MOTOR_TORQUE_NOISE_STD': 0.005,   # Nm
 
     # Control loop
-    'CONTROL_RATE_HZ': 200,        # PID update rate (Hz)
+    'CONTROL_RATE_HZ': 500,        # PD update rate (Hz) — matches physics for 2WD
     'CONTROL_JITTER_STD': 0.0005,  # Timing jitter std dev (s)
     'SENSOR_TO_ACTUATOR_DELAY_STEPS': 0,
 
@@ -118,24 +119,27 @@ CONFIG = {
     # Virtual belt stiffness (gear constraint max force)
     'BELT_MAX_FORCE': 100.0,
 
+    # Triplet hub joint damping (simulates motor back-EMF / bearing friction)
+    'TRIPLET_JOINT_DAMPING': 0.05,     # Nm·s/rad
+
     # === CONTROLLER SELECTION ===
     # 'lqr', 'pid', or 'mpc'
     'CONTROLLER': 'mpc',
 
     # === MPC HYBRID PARAMETERS ===
-    'MPC_RATE_HZ': 40,                 # MPC solve rate (Hz) — simulates ESP32-S3 budget
-    'MPC_HORIZON': 10,                 # Prediction horizon N
+    'MPC_RATE_HZ': 50,                 # MPC solve rate (Hz) — simulates ESP32-S3 budget
+    'MPC_HORIZON': 20,                 # Prediction horizon N (long enough for non-min-phase)
     'MPC_SIMULATED_SOLVE_MS': 25.0,    # Artificial delay per solve (ms) — realistic for ESP32-S3 SIMD
     # Q weights: [pitch, pitch_rate, tripL, tripR, tripL_rate, tripR_rate, fwd_pos, fwd_vel]
-    'MPC_Q_DIAG': [80.0, 5.0, 2.0, 2.0, 0.5, 0.5, 1.0, 0.5],
+    'MPC_Q_DIAG': [50.0, 5.0, 40.0, 40.0, 5.0, 5.0, 12.0, 5.0],
     # R weights: [tau_tripL, tau_tripR, tau_driveL, tau_driveR]
-    'MPC_R_DIAG': [5.0, 5.0, 10.0, 10.0],
+    'MPC_R_DIAG': [1.0, 1.0, 8.0, 8.0],
     'MPC_Q_TERMINAL_SCALE': 3.0,
-    'MPC_TRIPLET_TORQUE_MAX': 1.0,
+    'MPC_TRIPLET_TORQUE_MAX': 5.0,     # Nm — larger triplet motor for 2WD balance
     'MPC_TRIPLET_INERTIA': 0.00238,    # kg·m² (0.5 * 0.33 * 0.12²)
     # PD tracking gains: [trip_L, trip_R, drive_L, drive_R]
-    'MPC_PD_KP': [2.0, 2.0, 12.0, 12.0],
-    'MPC_PD_KD': [0.3, 0.3, 0.8, 0.8],
+    'MPC_PD_KP': [10.0, 10.0, 3.0, 3.0],
+    'MPC_PD_KD': [1.0, 1.0, 0.3, 0.3],
     'MPC_PITCH_PD_CROSS_DRIVE': 8.0,
     'MPC_PITCH_RATE_PD_CROSS_DRIVE': 0.5,
 
@@ -338,6 +342,7 @@ class TribotBalanceBot:
         # Load and configure the robot
         self._load_robot()
         self._discover_joints()
+        self._set_initial_pose()
         self._configure_dynamics()
         self._setup_belt_constraints()
 
@@ -368,6 +373,14 @@ class TribotBalanceBot:
     # ----------------------------------------------------------------
     # Robot setup
     # ----------------------------------------------------------------
+
+    def _set_initial_pose(self):
+        """Set initial triplet angles for 2WD mode (one wheel down per side)."""
+        trip_angle = self.cfg.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        if abs(trip_angle) > 1e-6:
+            p.resetJointState(self.body_id, self.l_triplet_joint, trip_angle, 0.0)
+            p.resetJointState(self.body_id, self.r_triplet_joint, trip_angle, 0.0)
+            print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° (2WD mode)")
 
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
@@ -446,12 +459,14 @@ class TribotBalanceBot:
                          linearDamping=0.0,
                          angularDamping=0.05)
 
-        # Triplet hubs: low friction (shouldn't touch ground much)
+        # Triplet hubs: low friction + joint damping (simulates motor back-EMF)
+        trip_damping = self.cfg.get('TRIPLET_JOINT_DAMPING', 0.05)
         for tj in [self.l_triplet_joint, self.r_triplet_joint]:
             p.changeDynamics(self.body_id, tj,
                              lateralFriction=self.cfg['TRIPLET_FRICTION'],
                              linearDamping=0.0,
-                             angularDamping=0.0)
+                             angularDamping=0.0,
+                             jointDamping=trip_damping)
 
         # Drive wheels: high friction for traction
         for wj in self.l_wheel_joints + self.r_wheel_joints:
@@ -550,6 +565,15 @@ class TribotBalanceBot:
         rot = p.getMatrixFromQuaternion(orn)
         yaw_rate = -(rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2])
 
+        # --- Triplet encoders → controller (for MPC) ---
+        lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
+        rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
+        if hasattr(self.controller, 'set_triplet_state'):
+            self.controller.set_triplet_state(
+                lt_state[0], rt_state[0],   # angles
+                lt_state[1], rt_state[1],   # rates
+            )
+
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             measured_pitch, measured_pitch_rate,
@@ -635,6 +659,7 @@ class TribotBalanceBot:
             'pos': pos,
             'euler_deg': tuple(math.degrees(e) for e in euler),
             'ang_vel_deg': tuple(math.degrees(v) for v in ang_vel),
+            'triplet_ang': (lt_state[0], rt_state[0]),
             'triplet_vel': (lt_state[1], rt_state[1]),
             'wheel_vel': (lw_vel, rw_vel),
         }
@@ -827,6 +852,12 @@ def run_simulation():
                 "mpc_ff_drive_R": float(ctrl.K_contributions[1]),
                 "mpc_pd_drive_L": float(ctrl.K_contributions[2]),
                 "mpc_pd_drive_R": float(ctrl.K_contributions[3]),
+                "mpc_triplet_torque_L": float(ctrl.triplet_torque_L),
+                "mpc_triplet_torque_R": float(ctrl.triplet_torque_R),
+                "mpc_triplet_angle_L": float(ctrl._triplet_angle_L),
+                "mpc_triplet_angle_R": float(ctrl._triplet_angle_R),
+                "mpc_triplet_dev_L": float(ctrl.x_est[ctrl.IDX_TRIP_L]),
+                "mpc_triplet_dev_R": float(ctrl.x_est[ctrl.IDX_TRIP_R]),
             } if hasattr(ctrl, 'mpc_solve_count') else {}),
         })
 
@@ -839,6 +870,7 @@ def run_simulation():
             rx, ry, rz = dbg['euler_deg']
             tv = dbg['triplet_vel']
             wv = dbg['wheel_vel']
+            ta = dbg.get('triplet_ang', (0.0, 0.0))
             at0, at1 = robot.actual_torques
             print(
                 f"[{sim_time:5.2f}s] "
@@ -846,7 +878,7 @@ def run_simulation():
                 f"Euler(p={ry:6.1f})° | "
                 # f"Pos:{robot.position:6.3f}m "
                 f"TgtPitch:{math.degrees(robot.controller.target_pitch):5.2f}° | "
-                f"Triplet({tv[0]:5.1f},{tv[1]:5.1f}) "
+                f"TripAng({math.degrees(ta[0]):5.1f},{math.degrees(ta[1]):5.1f})° "
                 f"Whl({wv[0]:5.1f},{wv[1]:5.1f})rad/s | "
                 f"Act:{at0:6.3f},{at1:6.3f}"
             )

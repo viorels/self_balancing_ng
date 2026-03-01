@@ -28,13 +28,12 @@ Interface is compatible with BalanceController / LQRBalanceController:
     Inputs:  measured_pitch, pitch_rate, position, yaw_rate, sim_time, dt
     Outputs: (left_torque, right_torque)
 
-Note: In the current URDF the triplet joints are free-spinning hubs,
-not actuated.  The MPC *plans* triplet trajectories but the actual
-triplet torques are not applied to the simulation (they would require
-separate triplet motors).  The drive-motor outputs (u[2], u[3]) are
-what physically drives the robot.  Triplet feedforward terms are
-kept in the code for completeness — they will become active once
-triplet actuators are added to the hardware/URDF.
+2WD mode: the triplet assemblies are rotated 60° so one wheel per side
+touches the ground.  The MPC actively controls both triplet and drive
+torques.  Triplet encoders (angles + rates) are fed back into the
+state estimate.  Triplet motors have a higher torque limit (5 Nm)
+than the drive motors (1 Nm) since they must maintain the 2WD pose
+against gravity and disturbances.
 """
 
 import math
@@ -486,6 +485,18 @@ class MPCHybridController:
         # ---- Build initial model and solver ----
         self.Ac, self.Bc = build_mpc_state_space(config)
         Ad, Bd = discretise_zoh(self.Ac, self.Bc, self.mpc_period)
+
+        # Compute DARE (infinite-horizon LQR) terminal cost.
+        # This gives the MPC proper handling of the non-minimum-phase
+        # pitch/position coupling without needing an outer position loop.
+        try:
+            P_dare = la.solve_discrete_are(Ad, Bd, self.Q, self.R)
+            self.Q_terminal = P_dare
+            print(f"    Using DARE terminal cost (infinite-horizon LQR)")
+        except Exception as e:
+            print(f"    DARE failed ({e}), falling back to scaled Q")
+            self.Q_terminal = self.Q * q_term_scale
+
         self.mpc_solver = MPCSolver(
             Ad, Bd, self.Q, self.R, self.Q_terminal, self.N,
             u_min=self.u_min, u_max=self.u_max
@@ -529,18 +540,32 @@ class MPCHybridController:
         self.traj_valid = False
 
         # ---- MPC state estimate ----
-        # (pitch and fwd from sensor, triplet from URDF joints — zeroed here)
         self.x_est = np.zeros(self.nx)
+
+        # ---- Triplet equilibrium angle (2WD operating point) ----
+        # State-vector triplet angles are deviations from this equilibrium.
+        self.triplet_equilibrium = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
+
+        # Triplet encoder readings (set by set_triplet_state before each update)
+        self._triplet_angle_L = self.triplet_equilibrium
+        self._triplet_angle_R = self.triplet_equilibrium
+        self._triplet_rate_L = 0.0
+        self._triplet_rate_R = 0.0
 
         # ---- Velocity estimator ----
         self.prev_position = 0.0
-        self.prev_vel_time = 0.0
+        self.prev_vel_time = -1.0    # sentinel: first call initialises only
         self.velocity = 0.0
-        self.vel_filter_alpha = 0.1
+        self.vel_filter_alpha = 0.2   # slightly faster filter than LQR default
 
         # ---- Reference / target ----
         self.target_position = 0.0
         self.x_ref = np.zeros(self.nx)     # reference state for MPC
+
+        # Position tracking is handled directly by the MPC via Q_pos
+        # weight + DARE terminal cost.  No outer position loop needed —
+        # the DARE terminal cost encodes the correct pitch/position
+        # tradeoff for the non-minimum-phase dynamics.
 
         # ---- Yaw control (same interface as LQR/PID controllers) ----
         self.yaw_rate_setpoint = 0.0
@@ -576,6 +601,13 @@ class MPCHybridController:
     def set_yaw_rate(self, yaw_rate):
         self.yaw_rate_setpoint = yaw_rate
 
+    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R):
+        """Update triplet encoder readings (called each tick from tribot_sim)."""
+        self._triplet_angle_L = angle_L
+        self._triplet_angle_R = angle_R
+        self._triplet_rate_L = rate_L
+        self._triplet_rate_R = rate_R
+
     # ----------------------------------------------------------------
     # MPC slow loop
     # ----------------------------------------------------------------
@@ -588,9 +620,10 @@ class MPCHybridController:
         time and enforce a simulated compute budget so that MPC results
         are not used until ``mpc_busy_until``.
         """
-        # Reference: drive all states to x_ref
+        # Reference: upright pitch, track target position, zero velocity
         self.x_ref[:] = 0.0
         self.x_ref[self.IDX_FWD_POS] = self.target_position
+        self.x_ref[self.IDX_FWD_VEL] = 0.0
 
         # Measure actual wall-clock solve time (for diagnostics)
         t_wall_start = _time.monotonic()
@@ -700,8 +733,8 @@ class MPCHybridController:
                                     + self.Kd_pd[3] * e_fwd_d
                                     + pitch_correction)
 
-        # Clamp each channel
-        tau = np.clip(tau, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+        # Clamp each channel (per-actuator limits: triplet 5 Nm, drive 1 Nm)
+        tau = np.clip(tau, self.u_min, self.u_max)
 
         return tau
 
@@ -721,23 +754,20 @@ class MPCHybridController:
         left_torque, right_torque : float
             Commanded motor torques (Nm) for left and right drive motors.
         """
-        # ---- Velocity estimation (same approach as LQR controller) ----
-        vel_dt = sim_time - self.prev_vel_time if self.prev_vel_time > 0 else dt
-        if vel_dt > 0:
-            raw_vel = (position - self.prev_position) / vel_dt
-            self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
-        self.prev_position = position
-        self.prev_vel_time = sim_time
+        # ---- Velocity estimation (only at control rate — avoids noise
+        # amplification at 500 Hz physics rate; matches LQR approach) ----
+        # Moved inside the fast-loop gate below.
 
         # ---- Build full 8-state estimate ----
-        # Pitch and forward come from sensors; triplet states are zero
-        # for now (triplet joints are unactuated in current URDF).
+        # Pitch and forward from sensors; triplet from encoders.
+        # Triplet angles are expressed as deviations from the 2WD
+        # equilibrium so the linearised model (around 0) stays valid.
         self.x_est[self.IDX_PITCH]      = measured_pitch
         self.x_est[self.IDX_PITCH_RATE] = measured_pitch_rate
-        self.x_est[self.IDX_TRIP_L]     = 0.0
-        self.x_est[self.IDX_TRIP_R]     = 0.0
-        self.x_est[self.IDX_TRIP_L_D]   = 0.0
-        self.x_est[self.IDX_TRIP_R_D]   = 0.0
+        self.x_est[self.IDX_TRIP_L]     = self._triplet_angle_L - self.triplet_equilibrium
+        self.x_est[self.IDX_TRIP_R]     = self._triplet_angle_R - self.triplet_equilibrium
+        self.x_est[self.IDX_TRIP_L_D]   = self._triplet_rate_L
+        self.x_est[self.IDX_TRIP_R_D]   = self._triplet_rate_R
         self.x_est[self.IDX_FWD_POS]    = position
         self.x_est[self.IDX_FWD_VEL]    = self.velocity
 
@@ -753,6 +783,20 @@ class MPCHybridController:
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
 
+            # Velocity estimation at control rate (not every physics tick)
+            if self.prev_vel_time < 0:
+                # First call: just initialise position reference
+                self.prev_position = position
+                self.prev_vel_time = sim_time
+            else:
+                vel_dt = sim_time - self.prev_vel_time
+                if vel_dt > 1e-6:
+                    raw_vel = (position - self.prev_position) / vel_dt
+                    self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
+                self.prev_position = position
+                self.prev_vel_time = sim_time
+            self.x_est[self.IDX_FWD_VEL] = self.velocity
+
             # Interpolate MPC trajectory at current sim_time
             # If MPC is still "computing" (sim_time < mpc_busy_until),
             # we use the previous trajectory — just like real hardware.
@@ -761,10 +805,9 @@ class MPCHybridController:
             # PD tracking step
             tau_4 = self._pd_step(x_ref, u_ff, self.x_est)
 
-            # The tribot_sim expects a single drive torque per side.
-            # Combine: drive torque = u_drive + (triplet feedback mapped
-            # through the physical coupling).
-            # Since triplet actuators don't exist yet, we only use drive outputs.
+            # The tribot_sim expects drive + triplet torques separately.
+            # Drive torques are returned from update(); triplet torques are
+            # exposed via self.triplet_torque_L / R for tribot_sim to apply.
             drive_torque_L = float(tau_4[self.IDX_U_DRIVE_L])
             drive_torque_R = float(tau_4[self.IDX_U_DRIVE_R])
             trip_torque_L  = float(tau_4[self.IDX_U_TRIP_L])
