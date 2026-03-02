@@ -168,10 +168,30 @@ class LQRBalanceController:
         A, B = build_state_space(config)
         Q = np.diag(config['LQR_Q_DIAG'])
         R = np.array([[config['LQR_R']]])
-        self.K = compute_lqr_gain(A, B, Q, R)
+        self.K_normal = compute_lqr_gain(A, B, Q, R)
 
-        print(f"  LQR gain K = [{', '.join(f'{k:.4f}' for k in self.K[0])}]")
+        print(f"  LQR gain K_normal    = [{', '.join(f'{k:.4f}' for k in self.K_normal[0])}]")
         print(f"  LQR Q_diag = {config['LQR_Q_DIAG']},  R = {config['LQR_R']}")
+
+        # --- Gain-scheduled aggressive mode ---
+        if 'LQR_AGGRESSIVE_Q_DIAG' in config:
+            Q_agg = np.diag(config['LQR_AGGRESSIVE_Q_DIAG'])
+            R_agg = np.array([[config['LQR_AGGRESSIVE_R']]])
+            self.K_aggressive = compute_lqr_gain(A, B, Q_agg, R_agg)
+            self.switch_threshold = config.get('LQR_SWITCH_THRESHOLD', 0.20)
+            self.switch_hysteresis = config.get('LQR_SWITCH_HYSTERESIS', 0.05)
+            print(f"  LQR gain K_aggressive= [{', '.join(f'{k:.4f}' for k in self.K_aggressive[0])}]")
+            print(f"  LQR Q_agg = {config['LQR_AGGRESSIVE_Q_DIAG']},  R_agg = {config['LQR_AGGRESSIVE_R']}")
+            print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
+                  f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
+        else:
+            self.K_aggressive = None
+            self.switch_threshold = 0.0
+            self.switch_hysteresis = 0.0
+
+        # Active gain (start in normal mode)
+        self.K = self.K_normal
+        self.aggressive_active = False
 
         # --- Reference state ---
         self.target_position = 0.0
@@ -252,6 +272,17 @@ class LQRBalanceController:
                 measured_pitch_rate,
             ])
             self.state_error = x.copy()
+
+            # --- Gain scheduling: switch K based on position error ---
+            pos_err = abs(x[0])
+            if self.K_aggressive is not None:
+                if not self.aggressive_active and pos_err > self.switch_threshold:
+                    self.aggressive_active = True
+                    self.K = self.K_aggressive
+                elif self.aggressive_active and pos_err < (self.switch_threshold - self.switch_hysteresis):
+                    self.aggressive_active = False
+                    self.K = self.K_normal
+
             self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
 
             # u = -K x  (total torque for both sides)

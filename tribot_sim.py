@@ -186,6 +186,14 @@ CONFIG = {
     # unmodeled motor dynamics (lag, deadband, back-EMF)
     'LQR_R': 2.0,
 
+    # === GAIN-SCHEDULED LQR (aggressive mode while far from target) ===
+    # When |pos_error| > threshold, switch to aggressive Q/R for fast tracking.
+    # Hysteresis band prevents chattering around the boundary.
+    'LQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 35.0, 3.0],   # lean harder, chase faster
+    'LQR_AGGRESSIVE_R': 1.0,                              # allow more torque
+    'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
+    'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
+
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
     'GAMEPAD_DEADZONE': 0.08,
@@ -870,6 +878,8 @@ def run_simulation():
             "K_vel": float(ctrl.K_contributions[1]),
             "K_pitch": float(ctrl.K_contributions[2]),
             "K_pitch_rate": float(ctrl.K_contributions[3]),
+            # Gain-scheduled LQR mode (1=aggressive, 0=normal)
+            "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
             "target_pos": float(ctrl.target_position),
             "position": float(robot.position),
