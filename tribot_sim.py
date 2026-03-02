@@ -403,6 +403,9 @@ class TribotBalanceBot:
         self.wheel_radius = config['WHEEL_RADIUS']
 
         # Current state for logging
+        # NOTE: position is accumulated by integrating forward velocity
+        # projected onto the robot's current heading, so it stays valid
+        # after yaw rotations (unlike a raw world-X projection).
         self.position = 0.0
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
@@ -569,9 +572,8 @@ class TribotBalanceBot:
 
     def _estimate_position(self):
         """
-        Estimate forward position (positive = robot's forward direction).
-        The robot's forward is -X in world frame (due to URDF wheel axis
-        convention), so we negate the world X coordinate.
+        NOT USED — position is now integrated in update().
+        Left here for reference only.
         """
         pos, _ = p.getBasePositionAndOrientation(self.body_id)
         return -pos[0]
@@ -593,15 +595,20 @@ class TribotBalanceBot:
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
-        # --- Position estimation ---
-        self.position = self._estimate_position()
-
         # --- Yaw rate (body-frame) for yaw damping ---
         # Negated so that positive yaw_rate = turning right (from behind)
-        _, ang_vel = p.getBaseVelocity(self.body_id)
+        lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
         _, orn = p.getBasePositionAndOrientation(self.body_id)
         rot = p.getMatrixFromQuaternion(orn)
         yaw_rate = -(rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2])
+
+        # --- Forward odometry: integrate velocity projected onto heading ---
+        # Robot forward is body -X.  Project world linear velocity onto that
+        # axis so position accumulates correctly after any yaw rotation.
+        body_fwd_x = -rot[0]   # body -X in world X
+        body_fwd_y = -rot[3]   # body -X in world Y
+        fwd_vel = lin_vel[0] * body_fwd_x + lin_vel[1] * body_fwd_y
+        self.position += fwd_vel * dt
 
         # --- Triplet encoders → controller (for MPC) ---
         lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
