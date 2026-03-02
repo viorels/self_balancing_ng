@@ -124,7 +124,7 @@ CONFIG = {
 
     # === CONTROLLER SELECTION ===
     # 'lqr', 'pid', or 'mpc'
-    'CONTROLLER': 'mpc',
+    'CONTROLLER': 'lqr',
 
     # === MPC HYBRID PARAMETERS ===
     'MPC_RATE_HZ': 30,                 # MPC solve rate (Hz) — realistic for ESP32-S3
@@ -181,10 +181,10 @@ CONFIG = {
     'LQR_BODY_INERTIA': 0.056436,  # kg·m² — c_body Iyy (PyBullet-computed)
 
     # Q diagonal: [position, velocity, pitch, pitch_rate]
-    'LQR_Q_DIAG': [1.0, 0.5, 80.0, 5.0],
+    'LQR_Q_DIAG': [12.0, 4.0, 55.0, 4.0],
     # R: torque cost (scalar) — higher = less aggressive, more robust to
     # unmodeled motor dynamics (lag, deadband, back-EMF)
-    'LQR_R': 15.0,
+    'LQR_R': 2.0,
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
