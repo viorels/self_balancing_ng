@@ -195,6 +195,8 @@ class LQRBalanceController:
 
         # --- Reference state ---
         self.target_position = 0.0
+        self.target_pitch = 0.0       # commanded lean angle (rad)
+        self.target_pitch_rate = 0.0  # predicted lean rate (rad/s)
 
         # --- Velocity estimation (finite difference at control rate) ---
         self.prev_position = 0.0
@@ -212,7 +214,6 @@ class LQRBalanceController:
 
         # --- Exposed for logging ---
         self.control_torque = 0.0
-        self.target_pitch = 0.0       # always 0 for LQR (included for log compat)
 
         # --- Per-state torque contributions (for PlotJuggler / debug) ---
         self.K_contributions = np.zeros(4)  # K[0]*x_pos, K[1]*x_vel, K[2]*x_pitch, K[3]*x_prate
@@ -224,6 +225,18 @@ class LQRBalanceController:
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
+
+    def set_target_pitch(self, pitch, pitch_rate=0.0):
+        """
+        Set the desired body lean angle (rad) and its predicted rate (rad/s).
+
+        The LQR state-error vector will use (measured_pitch − target_pitch)
+        and (measured_pitch_rate − target_pitch_rate), so the controller
+        treats the commanded lean as the equilibrium and only corrects
+        deviations from it.
+        """
+        self.target_pitch = pitch
+        self.target_pitch_rate = pitch_rate
 
     def set_yaw_rate(self, yaw_rate):
         """Set desired yaw rate (rad/s). 0 = drive straight."""
@@ -264,12 +277,14 @@ class LQRBalanceController:
             self.prev_position = position
             self.prev_vel_time = sim_time
 
-            # State error vector
+            # State error vector (deviation from reference)
+            # Pitch and pitch_rate are relative to the commanded lean,
+            # so the LQR only corrects perturbations around the lean setpoint.
             x = np.array([
                 position - self.target_position,
                 self.velocity,
-                measured_pitch,
-                measured_pitch_rate,
+                measured_pitch - self.target_pitch,
+                measured_pitch_rate - self.target_pitch_rate,
             ])
             self.state_error = x.copy()
 

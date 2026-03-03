@@ -45,6 +45,7 @@ class Gamepad:
         self.deadzone = deadzone
         self._axes = {}
         self._buttons = {}
+        self._prev_buttons = {}
         self._fd = None
         self._connected = False
         self._open()
@@ -66,6 +67,8 @@ class Gamepad:
         """Read all pending joystick events (non-blocking)."""
         if not self._connected:
             return
+        # Snapshot previous button state for edge detection
+        self._prev_buttons = dict(self._buttons)
         while True:
             try:
                 data = os.read(self._fd, 8)
@@ -90,6 +93,12 @@ class Gamepad:
     def button(self, index):
         """Get button state (True/False)."""
         return self._buttons.get(index, False)
+
+    def button_pressed(self, index):
+        """True on the poll-cycle when button transitions from released to pressed."""
+        now = self._buttons.get(index, False)
+        prev = self._prev_buttons.get(index, False)
+        return now and not prev
 
     def close(self):
         if self._fd is not None:

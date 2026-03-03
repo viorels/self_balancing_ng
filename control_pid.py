@@ -33,6 +33,8 @@ class BalanceController:
 
         # --- Outer PID state (position → target pitch) ---
         self.target_pitch = 0.0
+        self.lean_target_pitch = 0.0     # commanded lean from gamepad
+        self.lean_target_pitch_rate = 0.0
         self.target_position = 0.0
         self.prev_position = 0.0
         self.integral_pos_error = 0.0
@@ -51,12 +53,24 @@ class BalanceController:
         # --- Last commanded torque (for logging) ---
         self.control_torque = 0.0
 
+        # --- Compatibility with LQR telemetry interface ---
+        self.state_error = np.zeros(4)
+        self.K_contributions = np.zeros(4)
+
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
 
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
+
+    def set_target_pitch(self, pitch, pitch_rate=0.0):
+        """
+        Set the desired body lean angle (rad) and its predicted rate (rad/s).
+        The outer PID output is added on top of this lean angle.
+        """
+        self.lean_target_pitch = pitch
+        self.lean_target_pitch_rate = pitch_rate
 
     def set_yaw_rate(self, yaw_rate):
         """Set desired yaw rate (rad/s). 0 = drive straight."""
@@ -96,9 +110,9 @@ class BalanceController:
             pos_i = self.cfg['POS_PID_KI'] * self.integral_pos_error
 
             self.target_pitch = float(np.clip(
-                pos_p + pos_d + pos_i,
-                -self.cfg['POS_PID_MAX_PITCH'],
-                 self.cfg['POS_PID_MAX_PITCH']
+                self.lean_target_pitch + pos_p + pos_d + pos_i,
+                -self.cfg['POS_PID_MAX_PITCH'] + self.lean_target_pitch,
+                 self.cfg['POS_PID_MAX_PITCH'] + self.lean_target_pitch
             ))
 
         # === Inner PID loop: pitch → torque (at CONTROL_RATE_HZ) ===
@@ -110,7 +124,8 @@ class BalanceController:
 
             pitch_error = self.target_pitch - measured_pitch
             p_term = self.cfg['PID_KP'] * pitch_error
-            d_term = self.cfg['PID_KD'] * (0.0 - measured_pitch_rate)
+            # D term: damp deviations from the lean rate, not absolute rate
+            d_term = self.cfg['PID_KD'] * (self.lean_target_pitch_rate - measured_pitch_rate)
             self.integral_pitch_error += pitch_error * self.control_period
             self.integral_pitch_error = float(np.clip(
                 self.integral_pitch_error, -0.5, 0.5))

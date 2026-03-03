@@ -199,9 +199,54 @@ CONFIG = {
     'GAMEPAD_DEADZONE': 0.08,
     'GAMEPAD_SPEED_AXIS': 4,        # Right stick Y
     'GAMEPAD_YAW_AXIS': 3,          # Right stick X
+    'GAMEPAD_LEAN_AXIS': 1,         # Left stick Y (lean control)
     'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
     'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
+    'GAMEPAD_MAX_LEAN_DEG': 30.0,   # deg max lean angle from left stick
+    'GAMEPAD_MODE_BUTTON': 0,       # Button index for 4WD/2WD toggle (A button on F710)
     'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
+
+    # === LEAN CONTROL ===
+    # 4WD: triplet motors hold body lean via gravity compensation PD
+    # 2WD: triplets rotate to put wheel under CoG (triplet_angle ≈ ratio × lean_angle)
+    'LEAN_TRIPLET_RATIO': 2.0,      # triplet_angle = ratio × body_lean  (2WD)
+    'LEAN_TRIPLET_KP': 15.0,        # PD proportional gain for triplet tracking
+    'LEAN_TRIPLET_KD': 1.5,         # PD derivative gain for triplet tracking
+    'LEAN_GRAVITY_COMP_KP': 15.0,   # PD proportional for 4WD triplet hold
+    'LEAN_GRAVITY_COMP_KD': 1.5,    # PD derivative for 4WD triplet hold
+    'LEAN_RATE_FILTER_ALPHA': 0.15, # Low-pass alpha for lean rate estimation
+
+    # === DRIVE MODE ===
+    # '4wd' or '2wd' — initial mode at startup
+    'INITIAL_DRIVE_MODE': '2wd',
+    'MODE_TRANSITION_TIME': 0.5,    # s — smooth triplet transition duration
+    'TRIPLET_ANGLE_4WD': 0.0,      # rad — both wheels down (0°)
+    'TRIPLET_ANGLE_2WD': 1.0472,   # rad — one wheel down (60° = π/3)
+    # 4WD handover guard: only disable wheel balance torques once the
+    # triplet has reached the 4WD geometry and is nearly stationary.
+    'FOURWD_SETTLE_ANGLE_TOL': math.radians(2.0),   # rad
+    'FOURWD_SETTLE_RATE_TOL': 1.0,                  # rad/s
+
+    # 4WD carrot-follow controller (same target-point UX as 2WD)
+    # pos_error -> v_ref -> wheel torque, plus yaw-rate correction.
+    'FOURWD_POS_KP': 1.2,              # (m/s) per m of position error
+    'FOURWD_MAX_SPEED': 0.6,           # m/s speed clamp from carrot error
+    'FOURWD_SPEED_KP': 1.0,            # Nm per (m/s) speed error
+    # Sign for fore/aft torque in settled 4WD follow mode.
+    # Positive sign means drive_torque = +K * (v_ref - v).
+    'FOURWD_DRIVE_SIGN': 1.0,
+    'FOURWD_YAW_RATE_KP': 0.35,        # Nm per (rad/s) yaw-rate error
+    'FOURWD_MAX_YAW_TORQUE': 0.35,     # Nm yaw differential clamp
+    'FOURWD_MAX_TORQUE': 0.35,         # Nm per-side clamp in 4WD follow mode
+    # While triplet is rotating into 4WD support geometry, apply a limited
+    # stabilization torque (from LQR pitch/rate terms) so the body doesn't
+    # topple passively before settled 4WD follow becomes active.
+    'FOURWD_TRANSITION_MAX_TORQUE': 0.15,
+
+    # Maximum torque that the triplet position servo may supply (N·m).
+    # Must be large enough to overcome ground-reaction forces when in
+    # 4WD or during mode transitions.  Does NOT affect 2WD free-spin.
+    'TRIPLET_SERVO_FORCE': 20.0,
 }
 
 
@@ -410,18 +455,58 @@ class TribotBalanceBot:
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
+        self._debug = {
+            'raw_left_cmd': 0.0,
+            'raw_right_cmd': 0.0,
+            'fourwd_follow_active': 0.0,
+            'fourwd_pos_error': 0.0,
+            'fourwd_v_ref': 0.0,
+            'fourwd_speed_error': 0.0,
+            'fourwd_drive_torque': 0.0,
+            'fourwd_yaw_torque': 0.0,
+            'fourwd_transition_torque': 0.0,
+            'fourwd_yaw_setpoint': 0.0,
+            'fwd_vel': 0.0,
+            'yaw_rate': 0.0,
+            'drive_sign': 0.0,
+            'left_cmd_final': 0.0,
+            'right_cmd_final': 0.0,
+            'motor_cmd_L': 0.0,
+            'motor_cmd_R': 0.0,
+            'wheel_vel_L': 0.0,
+            'wheel_vel_R': 0.0,
+        }
+
+        # --- Drive mode (4WD / 2WD) ---
+        self.drive_mode = config.get('INITIAL_DRIVE_MODE', '2wd')
+
+        # --- Lean control state ---
+        self.lean_target = 0.0            # commanded lean angle (rad)
+        self.prev_lean_target = 0.0       # previous command (for rate estimation)
+        self.lean_rate_estimate = 0.0     # filtered d(lean_target)/dt
+        self.lean_triplet_torques = [0.0, 0.0]   # last applied triplet lean torques
+
+        # --- Mode transition (smooth triplet angle interpolation) ---
+        self._mode_transitioning = False
+        self._mode_transition_start = 0.0
+        self._mode_transition_from = 0.0
+        self._mode_transition_to = 0.0
 
     # ----------------------------------------------------------------
     # Robot setup
     # ----------------------------------------------------------------
 
     def _set_initial_pose(self):
-        """Set initial triplet angles for 2WD mode (one wheel down per side)."""
-        trip_angle = self.cfg.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        """Set initial triplet angles based on initial drive mode."""
+        mode = self.cfg.get('INITIAL_DRIVE_MODE', '2wd')
+        if mode == '2wd':
+            trip_angle = self.cfg.get('TRIPLET_ANGLE_2WD', 1.0472)
+        else:
+            trip_angle = self.cfg.get('TRIPLET_ANGLE_4WD', 0.0)
         if abs(trip_angle) > 1e-6:
             p.resetJointState(self.body_id, self.l_triplet_joint, trip_angle, 0.0)
             p.resetJointState(self.body_id, self.r_triplet_joint, trip_angle, 0.0)
-            print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° (2WD mode)")
+        print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° ({mode.upper()} mode)")
 
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
@@ -545,6 +630,129 @@ class TribotBalanceBot:
               f"gear joints created")
 
     # ----------------------------------------------------------------
+    # Drive mode and lean control
+    # ----------------------------------------------------------------
+
+    def toggle_drive_mode(self, sim_time):
+        """
+        Toggle between 4WD and 2WD.  Starts a smooth triplet transition.
+        """
+        if self._mode_transitioning:
+            return  # ignore if already transitioning
+
+        # Read current triplet angle
+        lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
+        current_angle = lt_state[0]
+
+        if self.drive_mode == '2wd':
+            new_mode = '4wd'
+            target_angle = self.cfg['TRIPLET_ANGLE_4WD']
+        else:
+            new_mode = '2wd'
+            target_angle = self.cfg['TRIPLET_ANGLE_2WD']
+
+        self._mode_transitioning = True
+        self._mode_transition_start = sim_time
+        self._mode_transition_from = current_angle
+        self._mode_transition_to = target_angle
+        self.drive_mode = new_mode
+        print(f"  [{sim_time:.2f}s] Mode → {new_mode.upper()} "
+              f"(triplet {math.degrees(current_angle):.1f}° → {math.degrees(target_angle):.1f}°)")
+
+    def set_lean_target(self, lean_angle, dt):
+        """
+        Set the commanded body lean angle (rad).
+
+        Also estimates the lean rate (d/dt of the command) via low-pass
+        filtering, so the LQR can track the moving setpoint smoothly.
+        """
+        alpha = self.cfg.get('LEAN_RATE_FILTER_ALPHA', 0.15)
+        if dt > 0:
+            raw_rate = (lean_angle - self.prev_lean_target) / dt
+            self.lean_rate_estimate += alpha * (raw_rate - self.lean_rate_estimate)
+        self.prev_lean_target = self.lean_target
+        self.lean_target = lean_angle
+
+        # Feed lean setpoint + predicted rate to the balance controller
+        if hasattr(self.controller, 'set_target_pitch'):
+            self.controller.set_target_pitch(lean_angle, self.lean_rate_estimate)
+
+    def _compute_lean_triplet_torque(self, sim_time, dt):
+        """
+        Compute and return triplet motor torques to support the body lean.
+
+        4WD: Gravity compensation PD — hold triplets at 0° while body
+             leans.  The triplet motor holds the body against gravity.
+             τ = m·g·l·sin(lean) − Kp·θ_trip − Kd·ω_trip
+
+        2WD: Kinematic tracking PD — rotate triplets so the contact wheel
+             stays under the shifted CoG.
+             target_trip = LEAN_TRIPLET_RATIO × lean_target
+             τ = −Kp·(θ_trip − target_trip) − Kd·ω_trip
+
+        During a mode transition, the target triplet angle is interpolated
+        linearly from the old to the new value.
+
+        Returns (torque_L, torque_R).
+        """
+        lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
+        rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
+        trip_angles = [lt_state[0], rt_state[0]]
+        trip_rates  = [lt_state[1], rt_state[1]]
+
+        # --- Determine target triplet angles ---
+        if self._mode_transitioning:
+            elapsed = sim_time - self._mode_transition_start
+            t_trans = self.cfg.get('MODE_TRANSITION_TIME', 0.5)
+            frac = min(1.0, elapsed / t_trans) if t_trans > 0 else 1.0
+            # Smooth s-curve interpolation
+            frac = 3 * frac**2 - 2 * frac**3
+            base_target = (self._mode_transition_from
+                           + frac * (self._mode_transition_to - self._mode_transition_from))
+            if frac >= 1.0:
+                self._mode_transitioning = False
+        else:
+            if self.drive_mode == '4wd':
+                base_target = self.cfg['TRIPLET_ANGLE_4WD']
+            else:
+                base_target = self.cfg['TRIPLET_ANGLE_2WD']
+
+        # Add lean-dependent offset
+        if self.drive_mode == '2wd':
+            # Triplet rotates to move wheel under CoG
+            lean_offset = self.cfg.get('LEAN_TRIPLET_RATIO', 2.0) * self.lean_target
+            target_L = base_target + lean_offset
+            target_R = base_target + lean_offset
+            Kp = self.cfg.get('LEAN_TRIPLET_KP', 15.0)
+            Kd = self.cfg.get('LEAN_TRIPLET_KD', 1.5)
+        else:
+            # 4WD: triplets stay at base_target, gravity comp added below
+            target_L = base_target
+            target_R = base_target
+            Kp = self.cfg.get('LEAN_GRAVITY_COMP_KP', 15.0)
+            Kd = self.cfg.get('LEAN_GRAVITY_COMP_KD', 1.5)
+
+        # PD error
+        torques = []
+        for angle, rate, target in [(trip_angles[0], trip_rates[0], target_L),
+                                     (trip_angles[1], trip_rates[1], target_R)]:
+            tau = -Kp * (angle - target) - Kd * rate
+
+            # 4WD gravity compensation: triplet motor must resist
+            # the gravity torque pulling the leaned body forward.
+            # τ_gravity = m·g·l·sin(lean)  applied on the triplet joint
+            if self.drive_mode == '4wd' and abs(self.lean_target) > 1e-4:
+                m = self.cfg['LQR_BODY_MASS']
+                g = abs(self.cfg['GRAVITY'])
+                l = self.cfg['LQR_COG_HEIGHT']
+                tau += m * g * l * math.sin(self.lean_target)
+
+            torques.append(tau)
+
+        self.lean_triplet_torques = torques
+        return torques[0], torques[1], target_L, target_R
+
+    # ----------------------------------------------------------------
     # State estimation
     # ----------------------------------------------------------------
 
@@ -624,47 +832,202 @@ class TribotBalanceBot:
             measured_pitch, measured_pitch_rate,
             self.position, yaw_rate, sim_time, dt
         )
+        raw_left_cmd = left_cmd
+        raw_right_cmd = right_cmd
 
-        # MPC controller also outputs triplet motor torques
-        triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
-        triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
+        # 4WD handling:
+        #   1) During 2WD→4WD transition, force wheel torque = 0. This avoids
+        #      LQR/buffer residual commands injecting motion while support
+        #      geometry is changing.
+        #   2) In settled 4WD, use a dedicated follow controller.
+        #      For LQR, derive torque from position+velocity terms only, so we
+        #      keep the LQR sign convention without pitch-feedback runaway.
+        fourwd_follow_active = False
+        if self.drive_mode == '4wd':
+            target_4wd = self.cfg.get('TRIPLET_ANGLE_4WD', 0.0)
+            angle_tol = self.cfg.get('FOURWD_SETTLE_ANGLE_TOL', math.radians(2.0))
+            rate_tol = self.cfg.get('FOURWD_SETTLE_RATE_TOL', 1.0)
+
+            triplet_settled = (
+                abs(lt_state[0] - target_4wd) < angle_tol and
+                abs(rt_state[0] - target_4wd) < angle_tol and
+                abs(lt_state[1]) < rate_tol and
+                abs(rt_state[1]) < rate_tol
+            )
+
+            if self._mode_transitioning or (not triplet_settled):
+                # Transition stabilizer: keep body near upright while triplets
+                # move from 2WD to 4WD geometry.
+                ctrl_type_local = self.cfg.get('CONTROLLER', 'lqr').lower()
+                if ctrl_type_local == 'lqr' and hasattr(self.controller, 'K') and hasattr(self.controller, 'state_error'):
+                    x = self.controller.state_error
+                    k = self.controller.K[0]
+                    x_pitch = float(x[2])
+                    x_prate = float(x[3])
+
+                    # Transition stabilizer should only arrest body tilt/rate.
+                    # Including translational velocity coupling here can inject
+                    # forward acceleration while support geometry is changing.
+                    u_trans = -(float(k[2]) * x_pitch + float(k[3]) * x_prate)
+                    lim = self.cfg.get('FOURWD_TRANSITION_MAX_TORQUE', 0.35)
+                    u_trans = float(np.clip(u_trans, -lim, lim))
+                    left_cmd = u_trans
+                    right_cmd = u_trans
+                    self._debug['fourwd_transition_torque'] = float(u_trans)
+                else:
+                    left_cmd = 0.0
+                    right_cmd = 0.0
+                    self._debug['fourwd_transition_torque'] = 0.0
+            elif (not self._mode_transitioning) and triplet_settled:
+                fourwd_follow_active = True
+                # 4WD follow mode: same carrot/target_pos UX as 2WD, but
+                # without pitch balancing. Use direct drive control:
+                #   pos_err -> desired speed -> wheel torque
+                # with yaw-rate correction from joystick setpoint.
+                target_pos = getattr(self.controller, 'target_position', self.position)
+                yaw_setpoint = getattr(self.controller, 'yaw_rate_setpoint', 0.0)
+
+                pos_error = target_pos - self.position
+                v_ref = float(np.clip(
+                    self.cfg.get('FOURWD_POS_KP', 2.0) * pos_error,
+                    -self.cfg.get('FOURWD_MAX_SPEED', 1.2),
+                    self.cfg.get('FOURWD_MAX_SPEED', 1.2)
+                ))
+                speed_error = v_ref - fwd_vel
+                drive_torque = (
+                    self.cfg.get('FOURWD_DRIVE_SIGN', 1.0)
+                    * self.cfg.get('FOURWD_SPEED_KP', 2.5)
+                    * speed_error
+                )
+                drive_torque = float(np.clip(
+                    drive_torque,
+                    -self.cfg.get('FOURWD_MAX_TORQUE', self.cfg['MAX_TORQUE']),
+                    self.cfg.get('FOURWD_MAX_TORQUE', self.cfg['MAX_TORQUE'])
+                ))
+
+                yaw_error = yaw_setpoint - yaw_rate
+                # In 4WD idle-hold, disable yaw-rate correction unless the
+                # operator explicitly commands yaw. This avoids differential
+                # wheel torques from yaw sensor noise/coupling.
+                if abs(yaw_setpoint) > 1e-3:
+                    yaw_torque = self.cfg.get('FOURWD_YAW_RATE_KP', 0.35) * yaw_error
+                else:
+                    yaw_torque = 0.0
+                yaw_torque = float(np.clip(
+                    yaw_torque,
+                    -self.cfg.get('FOURWD_MAX_YAW_TORQUE', 0.5),
+                    self.cfg.get('FOURWD_MAX_YAW_TORQUE', 0.5)
+                ))
+
+                max_side = self.cfg.get('FOURWD_MAX_TORQUE', self.cfg['MAX_TORQUE'])
+                left_cmd = float(np.clip(drive_torque - yaw_torque, -max_side, max_side))
+                right_cmd = float(np.clip(drive_torque + yaw_torque, -max_side, max_side))
+
+                self._debug['fourwd_pos_error'] = float(pos_error)
+                self._debug['fourwd_v_ref'] = float(v_ref)
+                self._debug['fourwd_speed_error'] = float(speed_error)
+                self._debug['fourwd_drive_torque'] = float(drive_torque)
+                self._debug['fourwd_yaw_torque'] = float(yaw_torque)
+                self._debug['fourwd_yaw_setpoint'] = float(yaw_setpoint)
+                self._debug['fourwd_transition_torque'] = 0.0
+
+            self._debug['raw_left_cmd'] = float(raw_left_cmd)
+            self._debug['raw_right_cmd'] = float(raw_right_cmd)
+            self._debug['fourwd_follow_active'] = float(fourwd_follow_active)
+            self._debug['fwd_vel'] = float(fwd_vel)
+            self._debug['yaw_rate'] = float(yaw_rate)
+            self._debug['drive_sign'] = float(self.cfg.get('FOURWD_DRIVE_SIGN', 0.0))
+            self._debug['left_cmd_final'] = float(left_cmd)
+            self._debug['right_cmd_final'] = float(right_cmd)
+
+        # MPC controller also outputs triplet motor torques.
+        # For PID/LQR, compute lean-support triplet torques instead.
+        ctrl_type = self.cfg.get('CONTROLLER', 'lqr').lower()
+        if ctrl_type == 'mpc':
+            triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
+            triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
+            triplet_target_L = triplet_target_R = None
+        else:
+            triplet_cmd_L, triplet_cmd_R, triplet_target_L, triplet_target_R = \
+                self._compute_lean_triplet_torque(sim_time, dt)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
         # through the free-spinning triplet hub bearing.  In the URDF chain
-        # (body → triplet → wheel), we must apply the same motor torque to:
-        #   1. Wheel joints  (+τ on wheels, −τ reaction on triplet)
-        #   2. Triplet joint  (+τ on triplet, −τ reaction on body)
-        # Net: wheels +τ, triplet 0 (free), body −τ (motor reaction).
+        # (body → triplet → wheel), wheel joints receive drive torque and the
+        # equal/opposite reaction propagates up to the triplet joint.
+        #
+        # Triplet control strategy:
+        #   MPC  : TORQUE_CONTROL — MPC command already includes drive-reaction
+        #          feedforward, so we add the explicit −motor_torque term.
+        #   4WD  : POSITION_CONTROL — The constraint solver supplies however
+        #          much torque is needed to hold the angle.  This beats any
+        #          attempt to fight ground-reaction forces with raw PD torques.
+        #   2WD  : TORQUE_CONTROL — Triplet spins freely behind a PD that
+        #          tracks the kinematic lean target.
         #
         # Left motor (+yaw_correction), Right motor (−yaw_correction)
         side_configs = [
-            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L),
-            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R),
+            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L, triplet_target_L),
+            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R, triplet_target_R),
         ]
 
-        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd in side_configs:
+        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd, triplet_target in side_configs:
             # Representative wheel velocity (belt-coupled, all same)
             wheel_vel = p.getJointState(self.body_id, wheel_joints[0])[1]
 
             # Motor produces total torque for this side
+            motor_cmd = cmd_torque
+            if fourwd_follow_active:
+                motor_cmd = float(np.clip(
+                    cmd_torque,
+                    -self.cfg.get('FOURWD_MAX_TORQUE', self.cfg['MAX_TORQUE']),
+                    self.cfg.get('FOURWD_MAX_TORQUE', self.cfg['MAX_TORQUE'])
+                ))
+
+            if motor_idx == 0:
+                self._debug['motor_cmd_L'] = float(motor_cmd)
+                self._debug['wheel_vel_L'] = float(wheel_vel)
+            else:
+                self._debug['motor_cmd_R'] = float(motor_cmd)
+                self._debug['wheel_vel_R'] = float(wheel_vel)
+
             motor_torque = self.motors[motor_idx].update(
-                cmd_torque, wheel_vel, dt
+                motor_cmd, wheel_vel, dt
             )
             self.actual_torques[motor_idx] = motor_torque
 
             # --- Triplet hub joint ---
-            # Two torque components act on the triplet joint:
-            #  1. Drive motor reaction: -motor_torque transfers wheel-joint
-            #     reaction to the body (keeps the triplet hub free-spinning).
-            #  2. Triplet motor command: +triplet_cmd actively rotates the
-            #     triplet relative to the body (MPC-planned, 0 for PID/LQR).
-            triplet_total = -motor_torque + triplet_cmd
-            p.setJointMotorControl2(
-                self.body_id, triplet_joint,
-                controlMode=p.TORQUE_CONTROL,
-                force=triplet_total
-            )
+            if ctrl_type == 'mpc':
+                # MPC accounts for drive reaction explicitly.
+                triplet_total = -motor_torque + triplet_cmd
+                p.setJointMotorControl2(
+                    self.body_id, triplet_joint,
+                    controlMode=p.TORQUE_CONTROL,
+                    force=triplet_total
+                )
+            elif self.drive_mode == '4wd' or self._mode_transitioning:
+                # In 4WD (and during mode transitions) use POSITION_CONTROL so
+                # that PyBullet's constraint solver supplies exactly the torque
+                # needed to hold the angle against ground-reaction loads.
+                # Torque-control PD cannot overcome wheel contact forces (~1.3 Nm)
+                # at this body/wheel scale.
+                p.setJointMotorControl2(
+                    self.body_id, triplet_joint,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=triplet_target,
+                    force=self.cfg.get('TRIPLET_SERVO_FORCE', 20.0)
+                )
+            else:
+                # 2WD: TORQUE_CONTROL — triplet spins freely, PD tracks kinematic
+                # target.  Drive reaction is cancelled by feedforward (+motor_torque)
+                # so the PD has full, clean authority.
+                triplet_total = triplet_cmd
+                p.setJointMotorControl2(
+                    self.body_id, triplet_joint,
+                    controlMode=p.TORQUE_CONTROL,
+                    force=triplet_total
+                )
 
             # --- Wheel joints: distribute torque among 3 belt-coupled wheels ---
             # Negate because URDF wheel axis is +Y, whereas bullet_sim's
@@ -801,6 +1164,9 @@ def run_simulation():
     if gp.connected:
         print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = distance, "
               f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
+        print(f"         left stick Y  (axis {CONFIG['GAMEPAD_LEAN_AXIS']}) = lean "
+              f"(±{CONFIG['GAMEPAD_MAX_LEAN_DEG']:.0f}°)")
+        print(f"         button {CONFIG['GAMEPAD_MODE_BUTTON']} = toggle 4WD/2WD")
 
     # PlotJuggler real-time streaming
     pj = PlotJugglerStreamer()   # UDP → 127.0.0.1:9870
@@ -824,6 +1190,22 @@ def run_simulation():
         # --- Gamepad input ---
         gp.poll()
         if gp.connected:
+            # --- Mode toggle (edge-detected) ---
+            if gp.button_pressed(CONFIG['GAMEPAD_MODE_BUTTON']):
+                robot.toggle_drive_mode(sim_time)
+                # Anchor target position to current location on every mode
+                # switch. This prevents the LQR from chasing a stale 2WD
+                # target when entering 4WD, and prevents the robot from
+                # returning to a drift position when leaving 4WD.
+                target_pos = robot.position
+                robot.controller.set_target_position(target_pos)
+
+            # --- Left stick Y → body lean angle ---
+            # Push up (negative axis) = lean forward (positive pitch)
+            max_lean_rad = math.radians(CONFIG['GAMEPAD_MAX_LEAN_DEG'])
+            lean_cmd = -gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * max_lean_rad
+            robot.set_lean_target(lean_cmd, CONFIG['TIMESTEP'])
+
             # Right stick Y → forward distance offset (push up = negative axis = in front)
             forward_offset = -gp.axis(CONFIG['GAMEPAD_SPEED_AXIS']) * CONFIG['GAMEPAD_MAX_DISTANCE']
 
@@ -835,13 +1217,21 @@ def run_simulation():
             # when released, the last target stays fixed in world.
             # While turning (yaw active, forward idle), reset target to
             # current position so the robot doesn't chase a stale target.
+            #
+            # In 4WD mode the robot is a stable platform — the LQR position
+            # term must NOT accumulate error or it commands a lean to correct
+            # position drift, creating a runaway lean feedback loop (~30°).
+            # So in 4WD, always latch target to current position unless the
+            # operator is actively commanding a forward/back move.
             if abs(forward_offset) > 1e-4:
                 target_pos = robot.position + forward_offset
                 # Compute world-frame marker position
                 rx, ry, _, fwd_x, fwd_y = robot.get_world_pose_2d()
                 marker_world = [rx + forward_offset * fwd_x,
                                 ry + forward_offset * fwd_y]
-            elif abs(yaw_cmd) > 1e-4:
+            elif robot.drive_mode == '4wd' or abs(yaw_cmd) > 1e-4:
+                # 4WD: always track current position (no position hold)
+                # 2WD turning: reset to avoid stale target
                 target_pos = robot.position
                 rx, ry, _, _, _ = robot.get_world_pose_2d()
                 marker_world = [rx, ry]
@@ -858,6 +1248,12 @@ def run_simulation():
             else:
                 marker_id = p.addUserDebugLine(
                     pt_from, pt_to, marker_color, lineWidth=3)
+
+        # In 4WD without a gamepad, latch target position so the LQR
+        # position error can't accumulate and cause a runaway lean.
+        # (The gamepad-connected path already does this inside the block above.)
+        if robot.drive_mode == '4wd' and not gp.connected:
+            robot.controller.set_target_position(robot.position)
 
         robot.update(sim_time, CONFIG['TIMESTEP'])
         p.stepSimulation()
@@ -889,7 +1285,35 @@ def run_simulation():
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
             "target_pos": float(ctrl.target_position),
+            "target_pitch": float(ctrl.target_pitch),
+            "target_pitch_rate": float(getattr(ctrl, 'target_pitch_rate', 0.0)),
             "position": float(robot.position),
+            # Lean / drive mode diagnostics
+            "lean_target_deg": math.degrees(robot.lean_target),
+            "lean_rate_est": float(robot.lean_rate_estimate),
+            "drive_mode_4wd": float(robot.drive_mode == '4wd'),
+            "lean_trip_torque_L": float(robot.lean_triplet_torques[0]),
+            "lean_trip_torque_R": float(robot.lean_triplet_torques[1]),
+            # 4WD sign-chain diagnostics (LQR output -> 4WD remap -> motor -> wheel)
+            "dbg_raw_left_cmd": float(robot._debug['raw_left_cmd']),
+            "dbg_raw_right_cmd": float(robot._debug['raw_right_cmd']),
+            "dbg_4wd_active": float(robot._debug['fourwd_follow_active']),
+            "dbg_4wd_pos_error": float(robot._debug['fourwd_pos_error']),
+            "dbg_4wd_v_ref": float(robot._debug['fourwd_v_ref']),
+            "dbg_4wd_speed_error": float(robot._debug['fourwd_speed_error']),
+            "dbg_4wd_drive_torque": float(robot._debug['fourwd_drive_torque']),
+            "dbg_4wd_yaw_torque": float(robot._debug['fourwd_yaw_torque']),
+            "dbg_4wd_transition_torque": float(robot._debug['fourwd_transition_torque']),
+            "dbg_4wd_yaw_setpoint": float(robot._debug['fourwd_yaw_setpoint']),
+            "dbg_fwd_vel": float(robot._debug['fwd_vel']),
+            "dbg_yaw_rate": float(robot._debug['yaw_rate']),
+            "dbg_drive_sign": float(robot._debug['drive_sign']),
+            "dbg_left_cmd_final": float(robot._debug['left_cmd_final']),
+            "dbg_right_cmd_final": float(robot._debug['right_cmd_final']),
+            "dbg_motor_cmd_L": float(robot._debug['motor_cmd_L']),
+            "dbg_motor_cmd_R": float(robot._debug['motor_cmd_R']),
+            "dbg_wheel_vel_L": float(robot._debug['wheel_vel_L']),
+            "dbg_wheel_vel_R": float(robot._debug['wheel_vel_R']),
             # MPC diagnostics (only meaningful when controller is MPC)
             **({
                 "mpc_solve_count": int(ctrl.mpc_solve_count),
@@ -936,10 +1360,23 @@ def run_simulation():
                 f"Euler(p={ry:6.1f})° | "
                 # f"Pos:{robot.position:6.3f}m "
                 f"TgtPitch:{math.degrees(robot.controller.target_pitch):5.2f}° | "
+                f"Lean:{math.degrees(robot.lean_target):5.1f}° "
+                f"{robot.drive_mode.upper()} | "
                 f"TripAng({math.degrees(ta[0]):5.1f},{math.degrees(ta[1]):5.1f})° "
                 f"Whl({wv[0]:5.1f},{wv[1]:5.1f})rad/s | "
                 f"Act:{at0:6.3f},{at1:6.3f}"
             )
+            if robot.drive_mode == '4wd':
+                d = robot._debug
+                print(
+                    f"         4WDDBG act={int(d['fourwd_follow_active'])} "
+                    f"pos_err={d['fourwd_pos_error']:+.3f} v={d['fwd_vel']:+.3f} "
+                    f"vref={d['fourwd_v_ref']:+.3f} verr={d['fourwd_speed_error']:+.3f} "
+                    f"drv={d['fourwd_drive_torque']:+.3f} sign={d['drive_sign']:+.0f} "
+                    f"utr={d['fourwd_transition_torque']:+.3f} "
+                    f"cmdLR=({d['left_cmd_final']:+.3f},{d['right_cmd_final']:+.3f}) "
+                    f"mcmdLR=({d['motor_cmd_L']:+.3f},{d['motor_cmd_R']:+.3f})"
+                )
             last_log_time = sim_time
 
         time.sleep(CONFIG['TIMESTEP'])
