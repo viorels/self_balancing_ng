@@ -201,6 +201,22 @@ CONFIG = {
     'GAMEPAD_YAW_AXIS': 3,          # Right stick X
     'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
     'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
+    'GAMEPAD_BUTTON_A': 0,          # Button index for 4WD ↔2WD toggle
+
+    # === 4WD ↔2WD TRIPLET TRANSITION (torque control + trapezoidal profile) ===
+    # L and R triplets always spin in opposite directions so their reaction
+    # torques on the body cancel, leaving balance undisturbed.
+    # L rotates +60° going to 2WD (and -60° returning to 4WD).
+    # R always rotates the opposite sign to L.
+    'TRIPLET_TRANS_VEL':        3.0,   # rad/s  — peak profile velocity (approximate)
+    'TRIPLET_TRANS_ACC':       15.0,   # rad/s² — profile ramp rate
+    'TRIPLET_TRANS_KP':        40.0,   # Nm/rad — PD position gain (high: overcomes friction lag)
+    'TRIPLET_TRANS_KD':         0.5,   # Nm·s/rad — PD velocity-tracking gain
+    # Ground friction in 4WD: μ × N × r_trip × 2 wheels ≈ 1.2×13N×0.12m×2 = 3.7 Nm/side.
+    # Must exceed this; MPC uses 5.0 Nm for the same reason.
+    'TRIPLET_TRANS_TORQUE_MAX': 5.0,   # Nm    — per-side clamp (≥ ground-friction torque)
+    'TRIPLET_TRANS_SETTLE_TIME': 0.20, # s     — hold-at-target window after profile ends
+
     'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
 }
 
@@ -351,6 +367,210 @@ def preprocess_urdf(urdf_path):
 
 
 # ============================================================================
+# TRIPLET MODE-SWITCH TRANSITION CONTROLLER
+# ============================================================================
+
+class TripletTransitionController:
+    """
+    Smooth 4WD ↔2WD triplet rotation via torque control + trapezoidal profile.
+
+    Design choices (see analysis in commit message):
+      • Opposite spin directions: L rotates +θ, R rotates -θ simultaneously.
+        Their angular-momentum changes are equal and opposite, so the net
+        pitch reaction torque on the body is zero (assuming symmetric inertia).
+        Any asymmetric residual is handled by the existing balance controller.
+      • Trapezoidal velocity profile: smoothly accelerates to TRIPLET_TRANS_VEL
+        then decelerates to rest at the target angle.  Profile distance adapts
+        to however far the joint actually needs to travel (handles re-triggering
+        mid-transition cleanly).
+      • Feedforward: I_trip * α_profile + damping * ω_profile.  This open-loop
+        term pre-compensates for the dominant loads (inertia during ramps,
+        joint damping during coast) so the PD only has to correct small residuals.
+      • Torque control throughout: runs inside robot.update() at physics rate
+        (500 Hz) so there is no Python-loop aliasing on the low-inertia joint.
+    """
+
+    ROTATION_STEP = math.pi / 3.0  # 60° per mode change
+
+    _IDLE     = 0
+    _MOVING   = 1
+    _SETTLING = 2
+
+    def __init__(self, cfg, initial_theta_L: float = 0.0, initial_theta_R: float = 0.0):
+        self._omega_max  = cfg.get('TRIPLET_TRANS_VEL', 4.0)
+        self._alpha      = cfg.get('TRIPLET_TRANS_ACC', 25.0)
+        self._kp         = cfg.get('TRIPLET_TRANS_KP', 8.0)
+        self._kd         = cfg.get('TRIPLET_TRANS_KD', 0.3)
+        self._tau_max    = cfg.get('TRIPLET_TRANS_TORQUE_MAX', 1.5)
+        self._settle_t   = cfg.get('TRIPLET_TRANS_SETTLE_TIME', 0.15)
+        self._I_trip     = cfg.get('MPC_TRIPLET_INERTIA', 0.00238)
+        self._damp       = cfg.get('TRIPLET_JOINT_DAMPING', 0.05)
+
+        # 4WD baseline angles (set from actual joint state at init so we
+        # always return to exactly where we started, not a nominal 0.0).
+        self._initial_L = initial_theta_L
+        self._initial_R = initial_theta_R
+
+        self._mode    = 0        # 0 = 4WD, 1 = 2WD
+        self._state   = self._IDLE
+
+        # Trapezoidal profile scalars (track a single progress distance
+        # because |delta_L| == |delta_R| by symmetry at all times).
+        self._profile_pos = 0.0   # distance covered so far (rad)
+        self._profile_vel = 0.0   # current profile angular velocity (rad/s)
+        self._total_dist  = 0.0   # total distance to cover (rad)
+
+        # Per-side transition targets and start points
+        self._start_L  = initial_theta_L
+        self._start_R  = initial_theta_R
+        self._target_L = initial_theta_L
+        self._target_R = initial_theta_R
+        self._sign_L   = +1.0   # direction for L joint (+1 or -1)
+        # R always moves opposite to L
+
+        self._settle_acc = 0.0  # time spent in SETTLING so far
+
+        # Expose latest outputs for PlotJuggler
+        self.torque_L: float = 0.0
+        self.torque_R: float = 0.0
+
+    # ------------------------------------------------------------------
+
+    @property
+    def mode(self) -> int:
+        """Current destination mode: 0 = 4WD, 1 = 2WD."""
+        return self._mode
+
+    @property
+    def active(self) -> bool:
+        """True while a transition is in progress (MOVING or SETTLING)."""
+        return self._state != self._IDLE
+
+    # ------------------------------------------------------------------
+
+    def trigger(self, theta_L: float, theta_R: float) -> int:
+        """
+        Toggle mode (4WD↔2WD) and (re)start the transition profile.
+
+        Safe to call while already transitioning — the profile restarts
+        from the current joint angles toward the new target, so the
+        L/R symmetry is always preserved and there is no velocity step.
+
+        Returns the new destination mode (0 or 1).
+        """
+        self._mode = 1 - self._mode
+
+        if self._mode == 1:   # → 2WD: L goes +60°, R goes −60°
+            self._target_L = self._initial_L + self.ROTATION_STEP
+            self._target_R = self._initial_R - self.ROTATION_STEP
+        else:                 # → 4WD: L goes back to initial (−60°), R +60°
+            self._target_L = self._initial_L
+            self._target_R = self._initial_R
+
+        self._start_L = theta_L
+        self._start_R = theta_R
+
+        delta_L = self._target_L - theta_L
+        self._sign_L   = math.copysign(1.0, delta_L) if abs(delta_L) > 1e-6 else +1.0
+        self._total_dist = abs(delta_L)       # == abs(delta_R) by construction
+
+        # Reset profile (smooth start even when re-triggering mid-move)
+        self._profile_pos = 0.0
+        self._profile_vel = 0.0
+        self._state       = self._MOVING
+        self._settle_acc  = 0.0
+        return self._mode
+
+    # ------------------------------------------------------------------
+
+    def update(self, dt: float,
+               theta_L: float, omega_L: float,
+               theta_R: float, omega_R: float) -> tuple:
+        """
+        Advance the profile and return (torque_L, torque_R) to ADD on top of
+        whatever the balance controller is already applying to the triplet joints.
+        Called every physics timestep (dt = 1/500 s).
+        """
+        if self._state == self._IDLE:
+            self.torque_L = self.torque_R = 0.0
+            return 0.0, 0.0
+
+        # ---- SETTLING: hold at target with PD, then release ----
+        if self._state == self._SETTLING:
+            self._settle_acc += dt
+            tL = float(np.clip(
+                self._kp * (self._target_L - theta_L) - self._kd * omega_L,
+                -self._tau_max, self._tau_max))
+            tR = float(np.clip(
+                self._kp * (self._target_R - theta_R) - self._kd * omega_R,
+                -self._tau_max, self._tau_max))
+            if self._settle_acc >= self._settle_t:
+                self._state = self._IDLE
+            self.torque_L, self.torque_R = tL, tR
+            return tL, tR
+
+        # ---- MOVING: advance trapezoidal profile ----
+        remaining = max(0.0, self._total_dist - self._profile_pos)
+        old_vel   = self._profile_vel
+
+        if remaining < 1e-4:
+            # Profile complete — enter SETTLING
+            self._profile_pos = self._total_dist
+            self._profile_vel = 0.0
+            self._state       = self._SETTLING
+            self._settle_acc  = 0.0
+            tL = float(np.clip(
+                self._kp * (self._target_L - theta_L) - self._kd * omega_L,
+                -self._tau_max, self._tau_max))
+            tR = float(np.clip(
+                self._kp * (self._target_R - theta_R) - self._kd * omega_R,
+                -self._tau_max, self._tau_max))
+            self.torque_L, self.torque_R = tL, tR
+            return tL, tR
+
+        # Deceleration distance from current speed
+        decel_dist = (self._profile_vel ** 2) / (2.0 * self._alpha + 1e-9)
+        if decel_dist >= remaining:
+            # Decelerate
+            self._profile_vel = max(0.0, self._profile_vel - self._alpha * dt)
+        else:
+            # Accelerate toward peak
+            self._profile_vel = min(self._omega_max,
+                                    self._profile_vel + self._alpha * dt)
+
+        self._profile_pos = min(self._total_dist,
+                                self._profile_pos + self._profile_vel * dt)
+
+        # Profile acceleration this step — used for inertia feedforward
+        profile_acc = (self._profile_vel - old_vel) / (dt + 1e-12)
+
+        # Profile setpoints
+        setpoint_L = self._start_L + self._sign_L * self._profile_pos
+        setpoint_R = self._start_R - self._sign_L * self._profile_pos
+        setvol_L   = self._sign_L * self._profile_vel
+        setvol_R   = -self._sign_L * self._profile_vel
+
+        # Feedforward: compensates inertia during ramps + damping at all speeds.
+        # Both sides receive the same magnitude but opposite signs, preserving
+        # the pitch-cancellation property even during acceleration phases.
+        ff_mag = (self._I_trip * abs(profile_acc)
+                  + self._damp * self._profile_vel)
+        ff_L   =  self._sign_L * ff_mag
+        ff_R   = -self._sign_L * ff_mag
+
+        # PD: track the moving profile setpoint (error in both position and velocity)
+        pd_L = (self._kp * (setpoint_L - theta_L)
+                + self._kd * (setvol_L - omega_L))
+        pd_R = (self._kp * (setpoint_R - theta_R)
+                + self._kd * (setvol_R - omega_R))
+
+        tL = float(np.clip(ff_L + pd_L, -self._tau_max, self._tau_max))
+        tR = float(np.clip(ff_R + pd_R, -self._tau_max, self._tau_max))
+        self.torque_L, self.torque_R = tL, tR
+        return tL, tR
+
+
+# ============================================================================
 # TRIBOT ROBOT CLASS
 # ============================================================================
 
@@ -410,6 +630,12 @@ class TribotBalanceBot:
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
+
+        # Triplet mode-switch controller.  Initial joint angles are read
+        # after _set_initial_pose() so the 4WD baseline is exact.
+        _lt0 = p.getJointState(self.body_id, self.l_triplet_joint)
+        _rt0 = p.getJointState(self.body_id, self.r_triplet_joint)
+        self.transition = TripletTransitionController(config, _lt0[0], _rt0[0])
 
     # ----------------------------------------------------------------
     # Robot setup
@@ -630,6 +856,15 @@ class TribotBalanceBot:
         triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
         triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
 
+        # Mode-switch transition: runs every physics step (500 Hz) for
+        # smooth torque-control tracking.  L and R are given opposite signs
+        # so their angular-momentum changes cancel on the pitch axis.
+        # Output is additive: zero when IDLE, so LQR/PID operation is unchanged.
+        _tL, _tR = self.transition.update(
+            dt, lt_state[0], lt_state[1], rt_state[0], rt_state[1])
+        triplet_cmd_L += _tL
+        triplet_cmd_R += _tR
+
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
         # through the free-spinning triplet hub bearing.  In the URDF chain
@@ -722,6 +957,21 @@ class TribotBalanceBot:
         fwd_y = -rot[3]
         yaw = math.atan2(fwd_y, fwd_x)
         return pos[0], pos[1], yaw, fwd_x, fwd_y
+
+    def trigger_mode_switch(self) -> int:
+        """
+        Toggle 4WD ↔2WD (or back).  Safe to call while a transition is
+        already in progress — the profile reverses smoothly from wherever
+        the joint currently is.
+        Returns the new destination mode (0 = 4WD, 1 = 2WD).
+        """
+        lt = p.getJointState(self.body_id, self.l_triplet_joint)
+        rt = p.getJointState(self.body_id, self.r_triplet_joint)
+        new_mode = self.transition.trigger(lt[0], rt[0])
+        label = '2WD' if new_mode == 1 else '4WD'
+        print(f"  [Mode switch] → {label}  "
+              f"(θ_L={math.degrees(lt[0]):.1f}°, θ_R={math.degrees(rt[0]):.1f}°)")
+        return new_mode
 
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""
@@ -820,6 +1070,7 @@ def run_simulation():
     sim_time = 0.0
     log_interval = 0.1
     last_log_time = 0.0
+    prev_btn_a = False   # edge-detect Button A for mode-switch trigger
 
     while sim_time < CONFIG['SIM_DURATION']:
         # --- Gamepad input ---
@@ -848,6 +1099,19 @@ def run_simulation():
                 marker_world = [rx, ry]
 
             robot.controller.set_target_position(target_pos)
+
+            # --- Button A: toggle 4WD ↔2WD ---
+            # Rising-edge only (press, not hold).
+            # Suppressed while an MPC emergency flip is in flight to avoid
+            # fighting the fall-recovery controller.
+            btn_a = gp.button(CONFIG['GAMEPAD_BUTTON_A'])
+            if btn_a and not prev_btn_a:
+                _fd = (robot.controller.get_flip_diagnostics()
+                       if hasattr(robot.controller, 'get_flip_diagnostics')
+                       else {})
+                if _fd.get('phase_numeric', 0) == 0:
+                    robot.trigger_mode_switch()
+            prev_btn_a = btn_a
 
             # --- Update visual marker ---
             pt_from = [marker_world[0], marker_world[1], 0.0]
@@ -918,6 +1182,11 @@ def run_simulation():
                 "zmp_urgency":     float(_flip_diag['zmp/urgency']),
                 "zmp_eq_deg":      float(_flip_diag['zmp/eq_angle_deg']),
             } if _flip_diag else {}),
+            # Triplet mode-switch diagnostics
+            "trans_active":   float(robot.transition.active),
+            "trans_mode":     float(robot.transition.mode),
+            "trans_torque_L": float(robot.transition.torque_L),
+            "trans_torque_R": float(robot.transition.torque_R),
         })
 
         if robot.check_fallen():
