@@ -59,8 +59,8 @@ CONFIG = {
 
     # Initial conditions
     'INITIAL_PITCH': -0.03,        # rad (~1.7°) — slight initial tilt
-    'INITIAL_HEIGHT': 0.18,        # m — c_body origin above ground (2WD: triplet_R + wheel_R)
-    'INITIAL_TRIPLET_ANGLE': 1.0472,  # rad (60° = π/3) — 2WD mode: one wheel down per side
+    'INITIAL_HEIGHT': 0.118,       # m — c_body origin above ground (4WD: triplet_Z_offset + wheel_R = 0.060125 + 0.058)
+    'INITIAL_TRIPLET_ANGLE': 0.0,  # rad (0°) — 4WD mode: two wheels down per side (flat triangle base on ground)
 
     # Inner PID gains (pitch → motor torque)
     'PID_KP': 15.0,
@@ -416,12 +416,13 @@ class TribotBalanceBot:
     # ----------------------------------------------------------------
 
     def _set_initial_pose(self):
-        """Set initial triplet angles for 2WD mode (one wheel down per side)."""
+        """Set initial triplet angles (0° = 4WD, 60° = 2WD)."""
         trip_angle = self.cfg.get('INITIAL_TRIPLET_ANGLE', 0.0)
         if abs(trip_angle) > 1e-6:
             p.resetJointState(self.body_id, self.l_triplet_joint, trip_angle, 0.0)
             p.resetJointState(self.body_id, self.r_triplet_joint, trip_angle, 0.0)
-            print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° (2WD mode)")
+        mode = '2WD' if abs(trip_angle - math.pi / 3) < 0.05 else ('4WD' if abs(trip_angle) < 0.05 else 'Lean')
+        print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° ({mode} mode)")
 
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
