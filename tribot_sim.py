@@ -30,6 +30,7 @@ import pybullet_data
 
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
+from control_lqr_aug import AugmentedLQRController
 from control_mpc_hybrid import MPCHybridController
 from gamepad import Gamepad
 from plotjuggler_udp import PlotJugglerStreamer
@@ -75,7 +76,8 @@ CONFIG = {
     'POS_PID_RATE_HZ': 50,
 
     # Motor / actuator limits
-    'MAX_TORQUE': 1.0,             # Nm (stall torque per motor, one motor per side)
+    'MAX_TORQUE': 1.0,             # Nm (stall torque per wheel motor, one motor per side)
+    'MAX_TRIPLET_TORQUE': 5.0,     # Nm (for 4WD↔2WD transition controller)
 
     # === REALISM PARAMETERS ===
 
@@ -123,8 +125,8 @@ CONFIG = {
     'TRIPLET_JOINT_DAMPING': 0.05,     # Nm·s/rad
 
     # === CONTROLLER SELECTION ===
-    # 'lqr', 'pid', or 'mpc'
-    'CONTROLLER': 'lqr',
+    # 'lqr', 'lqr_aug', 'pid', or 'mpc'
+    'CONTROLLER': 'lqr_aug',
 
     # === MPC HYBRID PARAMETERS ===
     'MPC_RATE_HZ': 30,                 # MPC solve rate (Hz) — realistic for ESP32-S3
@@ -193,6 +195,21 @@ CONFIG = {
     'LQR_AGGRESSIVE_R': 1.0,                              # allow more torque
     'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
     'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
+
+    # === AUGMENTED LQR (wheel + triplet) PARAMETERS ===
+    # Uses the same plant model (LQR_BODY_MASS etc.) but outputs two torques.
+    # The triplet motor applies direct pitch torque through the grounded triplet.
+    # Q diagonal: [position, velocity, pitch, pitch_rate]
+    'ALQR_Q_DIAG': [12.0, 4.0, 55.0, 4.0],
+    # R diagonal: [R_wheels, R_triplet]
+    # Increase R_wheels to shift balance burden to triplet (saves wheels for hills)
+    # Decrease R_triplet to use triplet more aggressively
+    'ALQR_R_DIAG': [1.0, 2.0],
+    # Gain-scheduled aggressive variant
+    'ALQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 35.0, 3.0],
+    'ALQR_AGGRESSIVE_R_DIAG': [2.0, 0.3],
+    'ALQR_SWITCH_THRESHOLD': 0.20,
+    'ALQR_SWITCH_HYSTERESIS': 0.05,
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
@@ -608,6 +625,8 @@ class TribotBalanceBot:
         ctrl_type = config.get('CONTROLLER', 'lqr').lower()
         if ctrl_type == 'mpc':
             self.controller = MPCHybridController(config)
+        elif ctrl_type == 'lqr_aug':
+            self.controller = AugmentedLQRController(config)
         elif ctrl_type == 'lqr':
             self.controller = LQRBalanceController(config)
         else:
@@ -1030,6 +1049,12 @@ def run_simulation():
               f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
               f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
               f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
+    elif ctrl_type == 'LQR_AUG':
+        print(f"  Q_diag={CONFIG['ALQR_Q_DIAG']}, R_diag={CONFIG['ALQR_R_DIAG']}")
+        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
+              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
+              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
+              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
     else:
         print(f"  Q_diag={CONFIG['LQR_Q_DIAG']}, R={CONFIG['LQR_R']}")
         print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
@@ -1152,6 +1177,16 @@ def run_simulation():
             "K_pitch_rate": float(ctrl.K_contributions[3]),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
+            # Augmented LQR triplet signals (zero when not using lqr_aug)
+            "triplet_torque_cmd": float(getattr(ctrl, 'triplet_torque_cmd', 0.0)),
+            "triplet_torque_L": float(getattr(ctrl, 'triplet_torque_L', 0.0)),
+            "triplet_torque_R": float(getattr(ctrl, 'triplet_torque_R', 0.0)),
+            # Per-state triplet K contributions (only for lqr_aug)
+            **({"K_trip_pos": float(ctrl.K_contributions_trip[0]),
+                "K_trip_vel": float(ctrl.K_contributions_trip[1]),
+                "K_trip_pitch": float(ctrl.K_contributions_trip[2]),
+                "K_trip_pitch_rate": float(ctrl.K_contributions_trip[3]),
+               } if hasattr(ctrl, 'K_contributions_trip') else {}),
             # Targets
             "target_pos": float(ctrl.target_position),
             "position": float(robot.position),
