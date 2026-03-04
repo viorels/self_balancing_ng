@@ -194,13 +194,22 @@ CONFIG = {
     'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
     'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
 
+    # === TRIPLET LEAN PD CONTROLLER ===
+    # Holds the triplet hub at INITIAL_TRIPLET_ANGLE using torque control.
+    # Gravity compensation is computed analytically; for the symmetric
+    # equilateral-triangle triplet it is near-zero but included for accuracy.
+    'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
+    'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
+
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
     'GAMEPAD_DEADZONE': 0.08,
     'GAMEPAD_SPEED_AXIS': 4,        # Right stick Y
     'GAMEPAD_YAW_AXIS': 3,          # Right stick X
+    'GAMEPAD_LEAN_AXIS': 1,         # Left stick Y  (push up = lean forward)
     'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
     'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
+    'GAMEPAD_MAX_LEAN': math.radians(30), # max intentional lean angle
     'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
 }
 
@@ -311,6 +320,81 @@ class IMUSensorModel:
 
 
 # ============================================================================
+# TRIPLET LEAN CONTROLLER
+# ============================================================================
+
+class TripletController:
+    """
+    PD position controller for a triplet hub joint.
+
+    Maintains the triplet at `target_angle` (rad, relative to body) using
+    PD control plus gravity compensation for the body mass above the hub.
+
+    Gravity compensation
+    --------------------
+    The body's CoG is at height `l_cog` above the triplet hub axis.
+    When the body is pitched at angle θ (measured_pitch, world-frame),
+    the body weight creates a torque about the hub Y-axis:
+
+        τ_grav = m_body · g · l_cog · sin(θ)
+
+    This term is independent of the triplet joint angle (which only
+    changes where the wheels sit relative to the body, not where the
+    body CoG is in world frame).
+
+    Output torque is `triplet_cmd` in:
+        triplet_total = -motor_torque + triplet_cmd
+    and is therefore additive with the drive-motor reaction cancellation.
+    """
+
+    def __init__(self, config):
+        self.kp = config.get('TRIPLET_LEAN_KP', 8.0)
+        self.kd = config.get('TRIPLET_LEAN_KD', 0.4)
+        self.target_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        self.g = abs(config.get('GRAVITY', 9.81))
+
+        # Body parameters for gravity compensation
+        self._m_body = config['LQR_BODY_MASS']     # kg  (2.7167)
+        self._l_cog  = config['LQR_COG_HEIGHT']    # m   (0.247)
+
+        tau_max_grav = self._m_body * self.g * self._l_cog
+        print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
+              f"target={math.degrees(self.target_angle):.1f}\u00b0")
+        print(f"    Body grav-comp: m={self._m_body:.3f}kg, "
+              f"l_cog={self._l_cog:.3f}m → "
+              f"τ_max={tau_max_grav:.3f} Nm (at 90°)")
+
+    # ------------------------------------------------------------------
+
+    def update(self, angle, rate, body_pitch):
+        """
+        Compute triplet hub torque.
+
+        Args:
+            angle:       triplet joint angle (rad, relative to body)
+            rate:        triplet joint angular velocity (rad/s)
+            body_pitch:  current body pitch in world frame (rad)
+
+        Returns:
+            torque (Nm) to apply at the triplet hub joint
+        """
+        # PD term — drives joint toward target_angle, damps velocity
+        tau_pd = self.kp * (self.target_angle - angle) - self.kd * rate
+
+        # Gravity compensation for body mass above the hub.
+        # Body CoG is at l_cog along body Z.  When the body is pitched
+        # at angle body_pitch, its weight creates a torque about the hub:
+        # divided by 2 because the triplet shares the load with the other side.
+        tau_grav = self._m_body * self.g * self._l_cog * math.sin(body_pitch) / 2
+
+        return tau_pd + tau_grav
+
+    def set_target(self, angle_rad):
+        """Override the target triplet joint angle (rad)."""
+        self.target_angle = angle_rad
+
+
+# ============================================================================
 # URDF HELPERS
 # ============================================================================
 
@@ -395,6 +479,9 @@ class TribotBalanceBot:
 
         # Two motors (one per side)
         self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
+
+        # Triplet lean PD controller (holds hub at INITIAL_TRIPLET_ANGLE)
+        self.triplet_ctrl = TripletController(config)
 
         # IMU sensor model
         self.imu = IMUSensorModel(config)
@@ -626,9 +713,19 @@ class TribotBalanceBot:
             self.position, yaw_rate, sim_time, dt
         )
 
-        # MPC controller also outputs triplet motor torques
-        triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
-        triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
+        # Triplet hub commands:
+        #   MPC plans its own triplet torques (flip/2WD logic) → use those.
+        #   LQR / PID have no triplet plan → use the lean PD controller to
+        #   hold the hub at INITIAL_TRIPLET_ANGLE (keeps wheels on the ground
+        #   in the configured 4WD/2WD geometry regardless of body pitch).
+        if hasattr(self.controller, 'triplet_torque_L'):
+            triplet_cmd_L = self.controller.triplet_torque_L
+            triplet_cmd_R = self.controller.triplet_torque_R
+        else:
+            triplet_cmd_L = self.triplet_ctrl.update(
+                lt_state[0], lt_state[1], self.pitch_angle)
+            triplet_cmd_R = self.triplet_ctrl.update(
+                rt_state[0], rt_state[1], self.pitch_angle)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -832,6 +929,15 @@ def run_simulation():
             yaw_cmd = gp.axis(CONFIG['GAMEPAD_YAW_AXIS']) * CONFIG['GAMEPAD_MAX_YAW_RATE']
             robot.controller.set_yaw_rate(yaw_cmd)
 
+            # Left stick Y → intentional lean command
+            # Push up (negative axis) = lean forward (positive pitch offset).
+            # set_lean() adjusts the pitch reference so LQR sees
+            # (measured_pitch - requested_lean) and does not fight the lean.
+            if hasattr(robot.controller, 'set_lean'):
+                lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
+                robot.controller.set_lean(lean_cmd)
+                robot.triplet_ctrl.set_target(-lean_cmd)
+
             # Update target while stick is actively deflected;
             # when released, the last target stays fixed in world.
             # While turning (yaw active, forward idle), reset target to
@@ -877,6 +983,7 @@ def run_simulation():
             "pitch_rate_meas": float(ctrl.state_error[3]),
             "true_pitch": true_pitch,
             "true_pitch_rate": true_pitch_rate,
+            "measured_pitch": float(robot.pitch_angle),
             # Torque signals
             "torque_cmd": float(ctrl.control_torque),
             "torque_L_actual": float(robot.actual_torques[0]),
@@ -890,6 +997,7 @@ def run_simulation():
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
             "target_pos": float(ctrl.target_position),
+            "target_lean": float(getattr(ctrl, 'target_lean', 0.0)),
             "position": float(robot.position),
             # MPC diagnostics (only meaningful when controller is MPC)
             **({
