@@ -204,10 +204,10 @@ CONFIG = {
     # R diagonal: [R_wheels, R_triplet]
     # Increase R_wheels to shift balance burden to triplet (saves wheels for hills)
     # Decrease R_triplet to use triplet more aggressively
-    'ALQR_R_DIAG': [1.0, 2.0],
+    'ALQR_R_DIAG': [1.0, 4.0],
     # Gain-scheduled aggressive variant
     'ALQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 35.0, 3.0],
-    'ALQR_AGGRESSIVE_R_DIAG': [2.0, 0.3],
+    'ALQR_AGGRESSIVE_R_DIAG': [0.5, 2.0],
     'ALQR_SWITCH_THRESHOLD': 0.20,
     'ALQR_SWITCH_HYSTERESIS': 0.05,
 
