@@ -190,7 +190,7 @@ CONFIG = {
     # When |pos_error| > threshold, switch to aggressive Q/R for fast tracking.
     # Hysteresis band prevents chattering around the boundary.
     'LQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 35.0, 3.0],   # lean harder, chase faster
-    'LQR_AGGRESSIVE_R': 1.0,                              # allow more torque
+    'LQR_AGGRESSIVE_R': 1.0,    # should be half of LQR_R or less for a noticeable effect
     'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
     'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
 
@@ -983,7 +983,6 @@ def run_simulation():
             "pitch_rate_meas": float(ctrl.state_error[3]),
             "true_pitch": true_pitch,
             "true_pitch_rate": true_pitch_rate,
-            "measured_pitch": float(robot.pitch_angle),
             # Torque signals
             "torque_cmd": float(ctrl.control_torque),
             "torque_L_actual": float(robot.actual_torques[0]),
