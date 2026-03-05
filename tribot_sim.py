@@ -366,7 +366,7 @@ class TripletController:
 
     # ------------------------------------------------------------------
 
-    def update(self, angle, rate, body_pitch):
+    def update(self, angle, rate, body_pitch, compensate_gravity=False):
         """
         Compute triplet hub torque.
 
@@ -387,7 +387,10 @@ class TripletController:
         # divided by 2 because the triplet shares the load with the other side.
         tau_grav = self._m_body * self.g * self._l_cog * math.sin(body_pitch) / 2
 
-        return tau_pd + tau_grav
+        if compensate_gravity:
+            return tau_pd + tau_grav
+        else:
+            return tau_pd
 
     def set_target(self, angle_rad):
         """Override the target triplet joint angle (rad)."""
@@ -730,8 +733,11 @@ class TribotBalanceBot:
             # so the hub rotates to keep wheels on the ground during the lean.
             if hasattr(self.controller, 'desired_lean'):
                 lean_offset = self.controller.desired_lean
+                target_pitch = self.controller.target_pitch
+                # Magic constant 1.7, should not be necessary
+                # but empirically improves position tracking
                 self.triplet_ctrl.set_target(
-                    self.cfg['INITIAL_TRIPLET_ANGLE'] - lean_offset
+                    -target_pitch / 1.7 - lean_offset
                 )
             triplet_cmd_L = self.triplet_ctrl.update(
                 lt_state[0], lt_state[1], self.pitch_angle)
@@ -947,7 +953,7 @@ def run_simulation():
             if hasattr(robot.controller, 'set_lean'):
                 lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
                 robot.controller.set_lean(lean_cmd)
-                robot.triplet_ctrl.set_target(-lean_cmd)
+
 
             # Update target while stick is actively deflected;
             # when released, the last target stays fixed in world.
@@ -1003,6 +1009,7 @@ def run_simulation():
             "K_vel": float(ctrl.K_contributions[1]),
             "K_pitch": float(ctrl.K_contributions[2]),
             "K_pitch_rate": float(ctrl.K_contributions[3]),
+            "lqr_desired_lean": float(ctrl.desired_lean),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
