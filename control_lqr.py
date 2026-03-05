@@ -226,6 +226,11 @@ class LQRBalanceController:
         # intentional user lean is not treated as an error to correct.
         self.target_lean = 0.0
 
+        # --- LQR-implied desired lean (computed each control tick) ---
+        # Exposed so the triplet PD can cooperate with the lean the LQR
+        # needs for position tracking.
+        self.desired_lean = 0.0
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
@@ -301,9 +306,22 @@ class LQRBalanceController:
 
             self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
 
+            # --- LQR-implied desired lean angle ---
+            # The position+velocity terms of K·x represent a "lean demand":
+            # the pitch the LQR needs to achieve to drive position error
+            # toward zero.  At steady state (pitch_rate=0, u=0):
+            #   K_pos·e_pos + K_vel·v + K_pitch·θ_desired = 0
+            #   θ_desired = -(K_pos·e_pos + K_vel·v) / K_pitch
+            # Expose this so the triplet PD can cooperate instead of fight.
+            K = self.K[0]
+            if abs(K[2]) > 1e-9:
+                self.desired_lean = -(K[0] * x[0] + K[1] * x[1]) / K[2]
+            else:
+                self.desired_lean = 0.0
+
             # u = -K x  (total torque for both sides)
-            u = float(-self.K @ x)
-            u = np.clip(u, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+            u_raw = float(-self.K @ x)
+            u = np.clip(u_raw, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
             commanded_torque = float(u)
             self.control_torque = commanded_torque
 

@@ -718,10 +718,21 @@ class TribotBalanceBot:
         #   LQR / PID have no triplet plan → use the lean PD controller to
         #   hold the hub at INITIAL_TRIPLET_ANGLE (keeps wheels on the ground
         #   in the configured 4WD/2WD geometry regardless of body pitch).
+        #
+        #   When LQR is active, it exposes `desired_lean` — the pitch angle
+        #   it implicitly wants for position tracking.  Feed this to the
+        #   triplet PD so it cooperates with (rather than fights) the lean.
         if hasattr(self.controller, 'triplet_torque_L'):
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
+            # If LQR exposes its desired lean, offset the triplet target
+            # so the hub rotates to keep wheels on the ground during the lean.
+            if hasattr(self.controller, 'desired_lean'):
+                lean_offset = self.controller.desired_lean
+                self.triplet_ctrl.set_target(
+                    self.cfg['INITIAL_TRIPLET_ANGLE'] - lean_offset
+                )
             triplet_cmd_L = self.triplet_ctrl.update(
                 lt_state[0], lt_state[1], self.pitch_angle)
             triplet_cmd_R = self.triplet_ctrl.update(
