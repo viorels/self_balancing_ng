@@ -388,7 +388,7 @@ class TripletController:
         tau_grav = self._m_body * self.g * self._l_cog * math.sin(body_pitch) / 2
 
         if compensate_gravity:
-            return tau_pd + tau_grav
+            return tau_pd + tau_grav / 3    # empirically better stand still during lean (feed forward)
         else:
             return tau_pd
 
@@ -500,6 +500,8 @@ class TribotBalanceBot:
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
+
+        self.lean_offset_ema = 0.0
 
     # ----------------------------------------------------------------
     # Robot setup
@@ -733,11 +735,18 @@ class TribotBalanceBot:
             # so the hub rotates to keep wheels on the ground during the lean.
             if hasattr(self.controller, 'desired_lean'):
                 lean_offset = self.controller.desired_lean
+
+                # this EMA creates an empirical delay between the target lean_offset
+                # and the moment LQR makes that lean angle real
+                # alpha = 0.013   # tau = 0.15, dt = 1/500
+                # self.lean_offset_ema = alpha * lean_offset + (1 - alpha) * self.lean_offset_ema
+
                 target_pitch = self.controller.target_pitch
                 # Magic constant 1.7, should not be necessary
                 # but empirically improves position tracking
                 self.triplet_ctrl.set_target(
                     -target_pitch / 1.7 - lean_offset
+                    # -target_pitch - self.lean_offset_ema
                 )
             triplet_cmd_L = self.triplet_ctrl.update(
                 lt_state[0], lt_state[1], self.pitch_angle)
