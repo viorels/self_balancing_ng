@@ -31,6 +31,7 @@ import pybullet_data
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
 from control_lqr_aug import AugmentedLQRController
+from control_lqr_extended import ExtendedLQRController
 from control_mpc_hybrid import MPCHybridController
 from gamepad import Gamepad
 from plotjuggler_udp import PlotJugglerStreamer
@@ -49,7 +50,7 @@ CONFIG = {
     'GROUND_FRICTION': 1.0,
 
     # Terrain: 'flat', 'heightfield', or 'box_stairs'
-    'TERRAIN': 'box_stairs',
+    'TERRAIN': 'flat',
 
     # URDF model path (relative to this script)
     'URDF_PATH': 'tribot_description/urdf/tribot.urdf',
@@ -125,8 +126,8 @@ CONFIG = {
     'TRIPLET_JOINT_DAMPING': 0.05,     # Nm·s/rad
 
     # === CONTROLLER SELECTION ===
-    # 'lqr', 'lqr_aug', 'pid', or 'mpc'
-    'CONTROLLER': 'lqr_aug',
+    # 'lqr', 'lqr_aug', 'lqr_ext', 'pid', or 'mpc'
+    'CONTROLLER': 'lqr_ext',
 
     # === MPC HYBRID PARAMETERS ===
     'MPC_RATE_HZ': 30,                 # MPC solve rate (Hz) — realistic for ESP32-S3
@@ -210,6 +211,43 @@ CONFIG = {
     'ALQR_AGGRESSIVE_R_DIAG': [0.5, 2.0],
     'ALQR_SWITCH_THRESHOLD': 0.20,
     'ALQR_SWITCH_HYSTERESIS': 0.05,
+
+    # === EXTENDED LQR (6-state with triplet angle) PARAMETERS ===
+    # Both triplets rotate in the SAME direction (body lean during transition).
+    # The LQR tracks a ramped φ_ref to manage 4WD ↔ 2WD transitions.
+    # Three gain sets: normal (balance), transition (ramp), aggressive (tracking).
+
+    # Normal gains (steady-state 4WD / 2WD balance):
+    # Q diagonal: [position, velocity, pitch, pitch_rate, trip_angle, trip_rate]
+    'ELQR_Q_DIAG': [12.0, 4.0, 100.0, 4.0, 80.0, 3.0],
+    # R diagonal: [R_wheels, R_triplet]
+    'ELQR_R_DIAG': [0.5, 1.0],
+
+    # Transition gains (active during mode-switch ramp + settling):
+    # Relaxed pitch allows intentional lean; very aggressive triplet tracks ramp
+    # and overcomes ground friction in 4WD (~3.7 Nm/side from grounded wheels).
+    # Transition gains: relaxed pitch Q so the robot can lean through the flip;
+    # moderate triplet Q (50→K[1,4]≈32) so it never fully saturates on small errors.
+    # R_trip=0.10 limits the torque burst; FF provides the bulk of the open-loop push.
+    'ELQR_TRANSITION_Q_DIAG': [3.0, 1.0, 15.0, 2.0, 50.0, 4.0],
+    'ELQR_TRANSITION_R_DIAG': [0.5, 0.10],
+    # Paired friction feedforward (Nm total): constant triplet push during ramp
+    # with proportional wheel compensation to cancel pitch disturbance.
+    # Must be ≤ ~4 Nm to stay within wheel authority margin.
+    'ELQR_FRICTION_FF': 3.0,
+    # Post-ramp settling time (s) before switching back to normal gains.
+    'ELQR_TRANSITION_SETTLE': 0.5,
+    # Pitch safety limit (rad): smoothly reduce triplet torque above this
+    # to prevent unrecoverable lean during transition (~20°).
+    'ELQR_PITCH_SAFETY_LIMIT': 0.35,
+    # Mode-transition reference ramp rate (rad/s) — 60° in ~2.1s
+    'ELQR_REF_RAMP_RATE': 0.5,
+
+    # Gain-scheduled aggressive variant (position tracking when balanced)
+    'ELQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 80.0, 3.0, 80.0, 3.0],
+    'ELQR_AGGRESSIVE_R_DIAG': [0.3, 0.8],
+    'ELQR_SWITCH_THRESHOLD': 0.20,
+    'ELQR_SWITCH_HYSTERESIS': 0.05,
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
@@ -625,6 +663,8 @@ class TribotBalanceBot:
         ctrl_type = config.get('CONTROLLER', 'lqr').lower()
         if ctrl_type == 'mpc':
             self.controller = MPCHybridController(config)
+        elif ctrl_type == 'lqr_ext':
+            self.controller = ExtendedLQRController(config)
         elif ctrl_type == 'lqr_aug':
             self.controller = AugmentedLQRController(config)
         elif ctrl_type == 'lqr':
@@ -650,11 +690,15 @@ class TribotBalanceBot:
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
 
-        # Triplet mode-switch controller.  Initial joint angles are read
-        # after _set_initial_pose() so the 4WD baseline is exact.
-        _lt0 = p.getJointState(self.body_id, self.l_triplet_joint)
-        _rt0 = p.getJointState(self.body_id, self.r_triplet_joint)
-        self.transition = TripletTransitionController(config, _lt0[0], _rt0[0])
+        # Triplet mode-switch controller (legacy — used by PID, LQR, LQR_aug, MPC).
+        # Extended LQR manages transitions via its 6-state feedback, so it
+        # doesn't need (or want) the separate TripletTransitionController.
+        if hasattr(self.controller, 'toggle_mode'):
+            self.transition = None
+        else:
+            _lt0 = p.getJointState(self.body_id, self.l_triplet_joint)
+            _rt0 = p.getJointState(self.body_id, self.r_triplet_joint)
+            self.transition = TripletTransitionController(config, _lt0[0], _rt0[0])
 
     # ----------------------------------------------------------------
     # Robot setup
@@ -875,14 +919,12 @@ class TribotBalanceBot:
         triplet_cmd_L = getattr(self.controller, 'triplet_torque_L', 0.0)
         triplet_cmd_R = getattr(self.controller, 'triplet_torque_R', 0.0)
 
-        # Mode-switch transition: runs every physics step (500 Hz) for
-        # smooth torque-control tracking.  L and R are given opposite signs
-        # so their angular-momentum changes cancel on the pitch axis.
-        # Output is additive: zero when IDLE, so LQR/PID operation is unchanged.
-        _tL, _tR = self.transition.update(
-            dt, lt_state[0], lt_state[1], rt_state[0], rt_state[1])
-        triplet_cmd_L += _tL
-        triplet_cmd_R += _tR
+        # Mode-switch transition (legacy controllers only).
+        if self.transition is not None:
+            _tL, _tR = self.transition.update(
+                dt, lt_state[0], lt_state[1], rt_state[0], rt_state[1])
+            triplet_cmd_L += _tL
+            triplet_cmd_R += _tR
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -986,7 +1028,11 @@ class TribotBalanceBot:
         """
         lt = p.getJointState(self.body_id, self.l_triplet_joint)
         rt = p.getJointState(self.body_id, self.r_triplet_joint)
-        new_mode = self.transition.trigger(lt[0], rt[0])
+        if self.transition is None:
+            # Extended LQR manages transitions internally via φ_ref ramp
+            new_mode = self.controller.toggle_mode()
+        else:
+            new_mode = self.transition.trigger(lt[0], rt[0])
         label = '2WD' if new_mode == 1 else '4WD'
         print(f"  [Mode switch] → {label}  "
               f"(θ_L={math.degrees(lt[0]):.1f}°, θ_R={math.degrees(rt[0]):.1f}°)")
@@ -1051,6 +1097,16 @@ def run_simulation():
               f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
     elif ctrl_type == 'LQR_AUG':
         print(f"  Q_diag={CONFIG['ALQR_Q_DIAG']}, R_diag={CONFIG['ALQR_R_DIAG']}")
+        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
+              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
+              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
+              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
+    elif ctrl_type == 'LQR_EXT':
+        print(f"  Normal Q={CONFIG['ELQR_Q_DIAG']}, R={CONFIG['ELQR_R_DIAG']}")
+        print(f"  Trans  Q={CONFIG.get('ELQR_TRANSITION_Q_DIAG','N/A')}, "
+              f"R={CONFIG.get('ELQR_TRANSITION_R_DIAG','N/A')}")
+        print(f"  Ref ramp: {CONFIG['ELQR_REF_RAMP_RATE']} rad/s, "
+              f"FF: {CONFIG.get('ELQR_FRICTION_FF', 0)} Nm")
         print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
               f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
               f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
@@ -1217,11 +1273,23 @@ def run_simulation():
                 "zmp_urgency":     float(_flip_diag['zmp/urgency']),
                 "zmp_eq_deg":      float(_flip_diag['zmp/eq_angle_deg']),
             } if _flip_diag else {}),
-            # Triplet mode-switch diagnostics
-            "trans_active":   float(robot.transition.active),
-            "trans_mode":     float(robot.transition.mode),
-            "trans_torque_L": float(robot.transition.torque_L),
-            "trans_torque_R": float(robot.transition.torque_R),
+            # Triplet mode-switch diagnostics (legacy transition controller)
+            **({
+                "trans_active":   float(robot.transition.active),
+                "trans_mode":     float(robot.transition.mode),
+                "trans_torque_L": float(robot.transition.torque_L),
+                "trans_torque_R": float(robot.transition.torque_R),
+            } if robot.transition is not None else {}),
+            # Extended LQR (6-state) diagnostics
+            **({
+                "elqr_trip_ref":    float(ctrl._trip_ref),
+                "elqr_trip_target": float(ctrl._trip_ref_target),
+                "elqr_trip_angle":  float(ctrl._trip_angle),
+                "elqr_trip_error":  float(ctrl.state_error_full[4]),
+                "elqr_trip_rate":   float(ctrl._trip_rate),
+                "elqr_mode":        float(ctrl._mode),
+                "elqr_trans_active":float(ctrl.transition_active),
+            } if hasattr(ctrl, '_trip_ref') else {}),
         })
 
         if robot.check_fallen():
