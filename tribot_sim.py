@@ -48,7 +48,7 @@ CONFIG = {
     'GROUND_FRICTION': 1.0,
 
     # Terrain: 'flat', 'heightfield', or 'box_stairs'
-    'TERRAIN': 'box_stairs',
+    'TERRAIN': 'flat',
 
     # URDF model path (relative to this script)
     'URDF_PATH': 'tribot_description/urdf/tribot.urdf',
@@ -196,10 +196,13 @@ CONFIG = {
 
     # === TRIPLET LEAN PD CONTROLLER ===
     # Holds the triplet hub at INITIAL_TRIPLET_ANGLE using torque control.
-    # Gravity compensation is computed analytically; for the symmetric
-    # equilateral-triangle triplet it is near-zero but included for accuracy.
     'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
     'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
+
+    # Nonlinear triplet balance assist (dead-zoned quadratic, rate-gated)
+    'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
+    'TRIPLET_ASSIST_DEADZONE': 0.15,  # rad (~8.6°) — no assist below this pitch
+    'TRIPLET_ASSIST_MAX': 3.0,        # Nm — clamp (triplet motor limit is 5 Nm)
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
@@ -325,22 +328,17 @@ class IMUSensorModel:
 
 class TripletController:
     """
-    PD position controller for a triplet hub joint.
+    PD position controller for a triplet hub joint with nonlinear balance assist.
 
     Maintains the triplet at `target_angle` (rad, relative to body) using
-    PD control plus gravity compensation for the body mass above the hub.
+    PD control.  At small pitch angles, only the PD term is active — gravity
+    torque is negligible and LQR handles balance via drive motors.
 
-    Gravity compensation
-    --------------------
-    The body's CoG is at height `l_cog` above the triplet hub axis.
-    When the body is pitched at angle θ (measured_pitch, world-frame),
-    the body weight creates a torque about the hub Y-axis:
-
-        τ_grav = m_body · g · l_cog · sin(θ)
-
-    This term is independent of the triplet joint angle (which only
-    changes where the wheels sit relative to the body, not where the
-    body CoG is in world frame).
+    Nonlinear assist (dead-zoned quadratic)
+    ------------------------------------------------------
+    Beyond ASSIST_DEADZONE, when the robot is *falling* (pitch and pitch_rate
+    same sign), a quadratic torque boost activates.  This gives the triplet real 
+    authority exactly when the drive motors are saturated, without fighting LQR at working angles.
 
     Output torque is `triplet_cmd` in:
         triplet_total = -motor_torque + triplet_cmd
@@ -351,29 +349,33 @@ class TripletController:
         self.kp = config.get('TRIPLET_LEAN_KP', 8.0)
         self.kd = config.get('TRIPLET_LEAN_KD', 0.4)
         self.target_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
-        self.g = abs(config.get('GRAVITY', 9.81))
 
-        # Body parameters for gravity compensation
-        self._m_body = config['LQR_BODY_MASS']     # kg  (2.7167)
-        self._l_cog  = config['LQR_COG_HEIGHT']    # m   (0.247)
+        # Nonlinear balance assist parameters
+        self.assist_gain = config.get('TRIPLET_ASSIST_GAIN', 2.0)        # Nm/rad²
+        self.assist_deadzone = config.get('TRIPLET_ASSIST_DEADZONE', 0.15)  # rad (~8.6°)
+        self.assist_max = config.get('TRIPLET_ASSIST_MAX', 3.0)           # Nm clamp
+        self.last_tau_assist = 0.0  # for telemetry
 
-        tau_max_grav = self._m_body * self.g * self._l_cog
         print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
               f"target={math.degrees(self.target_angle):.1f}\u00b0")
-        print(f"    Body grav-comp: m={self._m_body:.3f}kg, "
-              f"l_cog={self._l_cog:.3f}m → "
-              f"τ_max={tau_max_grav:.3f} Nm (at 90°)")
+        print(f"    Nonlinear assist: gain={self.assist_gain}, "
+              f"deadzone={math.degrees(self.assist_deadzone):.1f}°, "
+              f"max={self.assist_max} Nm")
 
     # ------------------------------------------------------------------
 
-    def update(self, angle, rate, body_pitch, compensate_gravity=False):
+    def update(self, angle, rate, body_pitch, body_pitch_rate=0.0):
         """
-        Compute triplet hub torque.
+        Compute triplet hub torque with nonlinear balance assist.
+
+        PD holds the hub at target_angle.  Beyond ASSIST_DEADZONE, when
+        the robot is falling, a quadratic boost activates.
 
         Args:
-            angle:       triplet joint angle (rad, relative to body)
-            rate:        triplet joint angular velocity (rad/s)
-            body_pitch:  current body pitch in world frame (rad)
+            angle:            triplet joint angle (rad, relative to body)
+            rate:             triplet joint angular velocity (rad/s)
+            body_pitch:       current body pitch in world frame (rad)
+            body_pitch_rate:  current body pitch rate (rad/s)
 
         Returns:
             torque (Nm) to apply at the triplet hub joint
@@ -381,16 +383,28 @@ class TripletController:
         # PD term — drives joint toward target_angle, damps velocity
         tau_pd = self.kp * (self.target_angle - angle) - self.kd * rate
 
-        # Gravity compensation for body mass above the hub.
-        # Body CoG is at l_cog along body Z.  When the body is pitched
-        # at angle body_pitch, its weight creates a torque about the hub:
-        # divided by 2 because the triplet shares the load with the other side.
-        tau_grav = self._m_body * self.g * self._l_cog * math.sin(body_pitch) / 2
+        tau_base = tau_pd
 
-        if compensate_gravity:
-            return tau_pd + tau_grav / 3    # empirically better stand still during lean (feed forward)
-        else:
-            return tau_pd
+        # --- Nonlinear assist: dead-zoned quadratic, rate-gated ---
+        # At small pitch the PD alone holds the hub.
+        # Beyond the deadzone, when the robot is *falling*, the quadratic
+        # boost activates to provide emergency authority.
+        #
+        # Only fires when:
+        #   1. |pitch| exceeds the deadzone (LQR handles small angles fine)
+        #   2. The robot is *falling* (pitch and pitch_rate same sign)
+        #   3. pitch_rate is above noise floor (0.1 rad/s)
+        tau_assist = 0.0
+        excess = abs(body_pitch) - self.assist_deadzone
+        if excess > 0 and abs(body_pitch_rate) > 0.1:
+            # Only assist when falling (pitch and pitch_rate same sign)
+            if body_pitch * body_pitch_rate > 0:
+                # Quadratic nonlinear term
+                tau_assist = self.assist_gain * excess * excess * math.copysign(1.0, body_pitch)
+                tau_assist = max(-self.assist_max, min(self.assist_max, tau_assist))
+
+        self.last_tau_assist = tau_assist
+        return tau_base + tau_assist
 
     def set_target(self, angle_rad):
         """Override the target triplet joint angle (rad)."""
@@ -749,9 +763,11 @@ class TribotBalanceBot:
                     # -target_pitch - self.lean_offset_ema
                 )
             triplet_cmd_L = self.triplet_ctrl.update(
-                lt_state[0], lt_state[1], self.pitch_angle)
+                lt_state[0], lt_state[1], self.pitch_angle,
+                body_pitch_rate=self.pitch_rate)
             triplet_cmd_R = self.triplet_ctrl.update(
-                rt_state[0], rt_state[1], self.pitch_angle)
+                rt_state[0], rt_state[1], self.pitch_angle,
+                body_pitch_rate=self.pitch_rate)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -1019,6 +1035,8 @@ def run_simulation():
             "K_pitch": float(ctrl.K_contributions[2]),
             "K_pitch_rate": float(ctrl.K_contributions[3]),
             "lqr_desired_lean": float(ctrl.desired_lean),
+            # Nonlinear triplet assist torque (for tuning visibility)
+            "triplet_assist": float(robot.triplet_ctrl.last_tau_assist),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
