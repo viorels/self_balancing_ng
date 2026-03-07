@@ -28,14 +28,24 @@ Physical model (3-DOF linearised inverted pendulum with triplet):
     θ — body pitch angle (positive = lean forward, destabilising)
     φ — triplet angle relative to body (both sides, same direction)
 
-  Mass matrix:
-      [M_tot     -m_b·l       0     ] [ẍ ]      [   0       ]
-  M = [-m_b·l   I_eff+I_t   I_t    ] [θ̈ ] , G = [m_b·g·l·θ ]
-      [  0       I_t         I_t    ] [φ̈ ]      [   0       ]
+  Ground-coupled mass matrix (includes belt-coupled wheel rolling):
 
-  where I_t    = 2 × single-side triplet inertia (both sides move together),
+           [M_tot+β          −(m_b·l+β·R)       −β·R          ]
+      M =  [−(m_b·l+β·R)     I_eff+I_h+β·R²     I_h+β·R²     ]
+           [−β·R              I_h+β·R²            I_h+β·R²     ]
+
+      G = [0,  m_b·g·l·θ + g_trip·(θ+φ),  g_trip·(θ+φ)]'
+
+  where β      = I_spin_total / r² ≈ 3·m_wheel (belt-coupled rolling inertia),
+        I_h    = 2 × single-side triplet inertia (both sides move together),
         I_eff  = I_b + m_b·l²  (parallel-axis theorem),
-        M_tot  = m_b + m_w.
+        M_tot  = m_b + m_w,
+        R      = triplet radius (hub to wheel centre),
+        g_trip = triplet gravity coupling (0 for 4WD, m_trip·g·R for 2WD).
+
+  Unlike a reaction wheel (M_xφ=0, M_φφ=I_t), the grounded triplet
+  couples to horizontal motion through the rolling constraint, and its
+  effective φ inertia is I_h + β·R² ≫ I_h alone.
 
   Generalised forces:
     τ_w: Q = [1/r, +1,  0]'   (ground reaction + motor-stator reaction on body)
@@ -73,77 +83,138 @@ from control_lqr import compute_lqr_gain
 def build_extended_state_space(config):
     """
     Build the continuous-time A (6×6), B (6×2) matrices for the linearised
-    inverted-pendulum with explicit triplet dynamics.
+    inverted-pendulum with explicit triplet dynamics and GROUND CONTACT
+    coupling.
 
     State:  x = [position, velocity, pitch, pitch_rate, φ_trip, φ̇_trip]
     Input:  u = [τ_wheels, τ_triplet]
 
-    Both triplets rotate in the same direction, so I_trip is the combined
-    inertia of both sides (2 × single-side MPC_TRIPLET_INERTIA).
+    GROUND-COUPLED MODEL
+    --------------------
+    The triplet wheels sit on the ground — they are NOT free-spinning
+    reaction wheels.  When the triplet rotates, grounded wheel(s) push
+    against the ground, creating horizontal forces and moments on the
+    robot body.
 
-    Mass-matrix inverse (analytical, used for A and B):
+    The kinetic energy includes the rolling constraint of belt-coupled
+    wheels: when any ground wheel rolls, all 3 per side spin due to the
+    belt, contributing an effective rolling inertia  β = I_spin_total / r².
 
-           [I_eff/Δ          m_b·l/Δ         -m_b·l/Δ            ]
-    M⁻¹ = [m_b·l/Δ          M_tot/Δ         -M_tot/Δ            ]
-           [-m_b·l/Δ        -M_tot/Δ    (Δ+M·I_t)/(I_t·Δ)       ]
+    Linearised ground-wheel contact position:
+        x_gw ≈ x − R·(θ + φ)
 
-    where Δ = M_tot·I_eff − (m_b·l)² (same determinant as 2-DOF model).
-    Note: the first two rows are independent of I_trip — the x and θ
-    accelerations decouple from the triplet inertia at the linear level.
+    Rolling KE:  T_roll = ½ β (ẋ − R(θ̇ + φ̇))²
+
+    Full mass matrix (derived from Lagrangian KE with rolling):
+
+           [M_tot+β         −(m_b·l + β·R)      −β·R          ]
+      M =  [−(m_b·l + β·R)   I_eff + I_h + β·R²  I_h + β·R²  ]
+           [−β·R              I_h + β·R²           I_h + β·R²  ]
+
+    Key differences from the old reaction-wheel model (M_xφ=0, M_φφ=I_t):
+      • M_xφ = −β·R ≠ 0 : triplet rotation creates horizontal acceleration
+      • M_φφ = I_h + β·R² ≫ I_h : ground rolling greatly increases effective
+        triplet inertia → LQR computes appropriately larger gains
+      • M_θφ = I_h + β·R² : pitch–triplet coupling increases
+
+    Generalised forces (unchanged, matched to sim torque application):
+      τ_w: Q = [1/r, +1,  0]'   (ground reaction + motor-stator reaction)
+      τ_t: Q = [ 0,  −1, +1]'   (body reaction + triplet drive)
+
+    Optional parameters:
+      ELQR_ROLLING_BETA     – effective rolling mass β (kg).
+                              Default ≈ 6 × ½ × m_wheel ≈ 0.081 kg.
+      ELQR_TRIPLET_GRAVITY  – effective gravity coupling on φ (Nm/rad).
+                              0 = 4WD (bilateral ground support, stable).
+                              Positive = destabilising (2WD single contact).
+                              Typical 2WD value: m_trip·g·R ≈ 0.39 Nm/rad.
     """
     m_b = config['LQR_BODY_MASS']
-    m_w = config['LQR_WHEEL_MASS']
+    m_h = config['LQR_WHEEL_MASS']       # total hub + wheel mass (both sides)
     l   = config['LQR_COG_HEIGHT']
     I_b = config['LQR_BODY_INERTIA']
     r   = config['WHEEL_RADIUS']
     g   = abs(config['GRAVITY'])
+    R   = config.get('TRIPLET_RADIUS', 0.12)
 
-    # Combined inertia of both triplet assemblies (same-direction)
-    I_trip = 2.0 * config.get('MPC_TRIPLET_INERTIA', 0.00238)
+    # Combined hub inertia of both triplet assemblies about hub axis
+    I_h = 2.0 * config.get('MPC_TRIPLET_INERTIA', 0.00238)
     # Combined joint damping (both sides)
     d_trip = 2.0 * config.get('TRIPLET_JOINT_DAMPING', 0.05)
 
-    I_eff = I_b + m_b * l**2       # body inertia about wheel axis
-    M_tot = m_b + m_w              # total translational mass
-    Delta = M_tot * I_eff - (m_b * l)**2
+    # --- Ground-contact rolling inertia β = I_spin_total / r² ---
+    # When any ground wheel rolls, belt coupling spins all 3 per side.
+    # For solid-cylinder wheels: I_spin = ½ m_w r²
+    # 6 wheels total:  β = 6 × ½ × m_per_wheel = 3 × m_per_wheel
+    # With m_per_wheel ≈ 0.027 kg (from URDF):  β ≈ 0.081 kg
+    beta = config.get('ELQR_ROLLING_BETA', 3.0 * 0.027)
 
-    # --- 3×3 mass-matrix inverse (analytical) ---
-    Mi = np.array([
-        [ I_eff / Delta,
-          (m_b * l) / Delta,
-         -(m_b * l) / Delta],
-        [ (m_b * l) / Delta,
-          M_tot / Delta,
-         -M_tot / Delta],
-        [-(m_b * l) / Delta,
-         -M_tot / Delta,
-          (Delta + M_tot * I_trip) / (I_trip * Delta)],
+    I_eff = I_b + m_b * l**2       # body inertia about wheel axis
+
+    # --- 3×3 ground-coupled mass matrix ---
+    #
+    # Derived from Lagrangian KE (linearised around θ=0, φ=0):
+    #   T = ½ m_b (ẋ − l·θ̇)² + ½ I_b θ̇²          (body)
+    #     + ½ m_h ẋ²                                 (hub + wheels at axle)
+    #     + ½ I_h (θ̇ + φ̇)²                          (hub rotation)
+    #     + ½ β (ẋ − R(θ̇ + φ̇))²                     (wheel rolling)
+    #
+    M = np.array([
+        [ m_b + m_h + beta,
+         -(m_b * l + beta * R),
+         -beta * R],
+        [-(m_b * l + beta * R),
+          I_eff + I_h + beta * R**2,
+          I_h + beta * R**2],
+        [-beta * R,
+          I_h + beta * R**2,
+          I_h + beta * R**2],
     ])
 
-    # --- Gravity: f_grav = [0, m_b·g·l, 0]' (destabilising on θ) ---
-    grav = np.array([0.0, m_b * g * l, 0.0])
-    grav_accel = Mi @ grav   # accelerations per unit θ
+    Mi = np.linalg.inv(M)
 
-    # --- Damping: f_damp = [0, 0, -d_trip]' × φ̇ ---
+    # --- Gravity coupling ---
+    # From Euler–Lagrange:
+    #   G_x = 0
+    #   G_θ = m_b·g·l·sin(θ) ≈ m_b·g·l · θ   (body inverted pendulum)
+    #   G_φ = g_trip·sin(θ+φ) ≈ g_trip·(θ+φ)  (triplet ground-contact effect)
+    #
+    # g_trip = 0 for 4WD (bilateral ground support prevents triplet toppling).
+    # g_trip ≈ m_trip·g·R for 2WD (single contact, inverted-pendulum-like).
+    g_trip = config.get('ELQR_TRIPLET_GRAVITY', 0.0)
+
+    # Acceleration contributions from θ and φ displacements:
+    grav_per_theta = np.array([0.0, m_b * g * l + g_trip, g_trip])
+    grav_per_phi   = np.array([0.0, g_trip,                g_trip])
+
+    accel_from_theta = Mi @ grav_per_theta   # [ẍ, θ̈, φ̈] per unit θ
+    accel_from_phi   = Mi @ grav_per_phi     # [ẍ, θ̈, φ̈] per unit φ
+
+    # --- Damping: joint friction ∝ −d_trip · φ̇ ---
     damp_force = np.array([0.0, 0.0, -d_trip])
-    damp_accel = Mi @ damp_force   # accelerations per unit φ̇
+    accel_from_phidot = Mi @ damp_force
 
     # --- A matrix (6×6): ẋ = A·x ---
     A = np.zeros((6, 6))
-    A[0, 1] = 1.0                      # ẋ = v
-    A[1, 2] = grav_accel[0]            # v̇ ← θ  (gravity coupling)
-    A[1, 5] = damp_accel[0]            # v̇ ← φ̇  (triplet damping → x)
-    A[2, 3] = 1.0                      # θ̇ = ω
-    A[3, 2] = grav_accel[1]            # ω̇ ← θ  (gravity, unstable pole)
-    A[3, 5] = damp_accel[1]            # ω̇ ← φ̇  (triplet damping → pitch)
-    A[4, 5] = 1.0                      # φ̇ = φ_rate
-    A[5, 2] = grav_accel[2]            # φ̈ ← θ  (gravity coupling on triplet)
-    A[5, 5] = damp_accel[2]            # φ̈ ← φ̇  (main damping)
+    A[0, 1] = 1.0                          # ẋ = v
+    A[1, 2] = accel_from_theta[0]          # v̇ ← θ  (gravity coupling)
+    A[1, 4] = accel_from_phi[0]            # v̇ ← φ  (gravity + ground contact)
+    A[1, 5] = accel_from_phidot[0]         # v̇ ← φ̇  (triplet damping → x)
+    A[2, 3] = 1.0                          # θ̇ = ω
+    A[3, 2] = accel_from_theta[1]          # ω̇ ← θ  (gravity, unstable pole)
+    A[3, 4] = accel_from_phi[1]            # ω̇ ← φ  (gravity + ground contact)
+    A[3, 5] = accel_from_phidot[1]         # ω̇ ← φ̇  (triplet damping → pitch)
+    A[4, 5] = 1.0                          # φ̇ = φ_rate
+    A[5, 2] = accel_from_theta[2]          # φ̈ ← θ  (gravity coupling)
+    A[5, 4] = accel_from_phi[2]            # φ̈ ← φ  (gravity + ground contact)
+    A[5, 5] = accel_from_phidot[2]         # φ̈ ← φ̇  (damping)
 
     # --- B matrix (6×2): B_accel = M⁻¹ · B_gf ---
-    # Generalised-force input matrix:
-    #   τ_w → [1/r, +1, 0]'   (ground + motor reaction)
+    # Generalised-force input matrix (matched to sim torque application):
+    #   τ_w → [1/r, +1, 0]'   (ground force + motor-body reaction)
     #   τ_t → [0,   -1, +1]'  (body reaction + triplet drive)
+    # Note: B_gf is independent of the mass matrix.  The grounded-contact
+    # physics enter through M (inertial coupling), not through Q (forces).
     B_gf = np.array([
         [1.0 / r,  0.0],
         [1.0,     -1.0],
@@ -205,7 +276,14 @@ class ExtendedLQRController:
         R = np.diag(config['ELQR_R_DIAG'])
         self.K_normal = compute_lqr_gain(A, B, Q, R)
 
-        print("  Extended LQR (6-state, 2-input):")
+        print("  Extended LQR (6-state, 2-input, ground-coupled):")
+        _beta = config.get('ELQR_ROLLING_BETA', 3.0 * 0.027)
+        _R = config.get('TRIPLET_RADIUS', 0.12)
+        _Ih = 2.0 * config.get('MPC_TRIPLET_INERTIA', 0.00238)
+        _g_trip = config.get('ELQR_TRIPLET_GRAVITY', 0.0)
+        print(f"    Ground coupling: β={_beta:.4f} kg, βR²={_beta*_R**2:.6f}, "
+              f"I_hub={_Ih:.6f}, I_eff_trip={_Ih+_beta*_R**2:.6f}")
+        print(f"    Triplet gravity: g_trip={_g_trip:.3f} Nm/rad")
         print(f"    K_wheels  = [{', '.join(f'{k:.4f}' for k in self.K_normal[0])}]")
         print(f"    K_triplet = [{', '.join(f'{k:.4f}' for k in self.K_normal[1])}]")
         print(f"    Q_diag = {config['ELQR_Q_DIAG']}")

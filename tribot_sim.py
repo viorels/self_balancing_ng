@@ -243,6 +243,15 @@ CONFIG = {
     # Mode-transition reference ramp rate (rad/s) — 60° in ~2.1s
     'ELQR_REF_RAMP_RATE': 0.5,
 
+    # Ground-coupled plant model parameters:
+    # Rolling inertia β (kg) — effective mass from belt-coupled wheel spin.
+    # Default: 6 × ½ × m_per_wheel ≈ 0.081 kg.  Set lower if belt slips
+    # or only some wheels are truly grounded.
+    'ELQR_ROLLING_BETA': 3.0 * 0.027,
+    # Triplet gravity coupling (Nm/rad).  0 = 4WD bilateral support (stable).
+    # For 2WD single-contact modelling: m_trip·g·R ≈ 0.335*9.81*0.12 ≈ 0.39.
+    'ELQR_TRIPLET_GRAVITY': 0.0,
+
     # Gain-scheduled aggressive variant (position tracking when balanced)
     'ELQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 80.0, 3.0, 80.0, 3.0],
     'ELQR_AGGRESSIVE_R_DIAG': [0.3, 0.8],
