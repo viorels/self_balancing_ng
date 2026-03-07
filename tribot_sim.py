@@ -219,17 +219,17 @@ CONFIG = {
 
     # Normal gains (steady-state 4WD / 2WD balance):
     # Q diagonal: [position, velocity, pitch, pitch_rate, trip_angle, trip_rate]
-    'ELQR_Q_DIAG': [12.0, 4.0, 100.0, 4.0, 80.0, 3.0],
+    # R_wheels raised to 2.0: with 1 Nm MAX_TORQUE the old R=0.5 caused
+    # K_pitch=26, K_rate=5.1 → saturation above 2.2° / 11°/s respectively.
+    # Target K_pitch < 12 (sat at ~5°), K_rate < 2 (sat at ~29°/s).
+    'ELQR_Q_DIAG': [12.0, 4.0, 50.0, 2.0, 80.0, 3.0],
     # R diagonal: [R_wheels, R_triplet]
-    'ELQR_R_DIAG': [0.5, 1.0],
+    'ELQR_R_DIAG': [2.0, 1.0],
 
     # Transition gains (active during mode-switch ramp + settling):
-    # Relaxed pitch allows intentional lean; very aggressive triplet tracks ramp
-    # and overcomes ground friction in 4WD (~3.7 Nm/side from grounded wheels).
-    # Transition gains: relaxed pitch Q so the robot can lean through the flip;
-    # moderate triplet Q (50→K[1,4]≈32) so it never fully saturates on small errors.
-    # R_trip=0.10 limits the torque burst; FF provides the bulk of the open-loop push.
-    'ELQR_TRANSITION_Q_DIAG': [3.0, 1.0, 15.0, 2.0, 50.0, 4.0],
+    # Relaxed pitch Q allows intentional lean; high triplet Q tracks the ramp.
+    # R_wheels stays at 0.5 (needs more wheel authority to stay upright through lean).
+    'ELQR_TRANSITION_Q_DIAG': [3.0, 1.0, 8.0, 1.0, 50.0, 4.0],
     'ELQR_TRANSITION_R_DIAG': [0.5, 0.10],
     # Paired friction feedforward (Nm total): constant triplet push during ramp
     # with proportional wheel compensation to cancel pitch disturbance.
@@ -253,8 +253,8 @@ CONFIG = {
     'ELQR_TRIPLET_GRAVITY': 0.0,
 
     # Gain-scheduled aggressive variant (position tracking when balanced)
-    'ELQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 80.0, 3.0, 80.0, 3.0],
-    'ELQR_AGGRESSIVE_R_DIAG': [0.3, 0.8],
+    'ELQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 50.0, 2.0, 80.0, 3.0],
+    'ELQR_AGGRESSIVE_R_DIAG': [1.0, 1.0],
     'ELQR_SWITCH_THRESHOLD': 0.20,
     'ELQR_SWITCH_HYSTERESIS': 0.05,
 

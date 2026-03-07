@@ -52,12 +52,10 @@ def run():
     sim_time     = 0.0
     last_log     = -1.0
 
-    print(f"{'t':>6}  {'pitch':>7}  {'trip_L':>7}  {'trip_R':>7}  "
-          f"{'trip_ref':>9}  {'trip_err':>9}  "
-          f"{'u_whl':>7}  {'u_trip':>7}  "
-          f"{'ff_act':>6}  {'K_used':>8}  "
-          f"{'trans':>5}")
-    print("-" * 110)
+    print(f"{'t':>6}  {'pitch':>7}  {'vel':>7}  "
+          f"{'u_whl':>7}  {'Kpos':>6}  {'Kvel':>6}  {'Kpitch':>7}  {'Krate':>6}  {'Ktrip':>6}  "
+          f"{'u_trip':>7}  {'trip_ref':>8}  {'K':>5}  T")
+    print("-" * 115)
 
     while sim_time < CONFIG['SIM_DURATION']:
         # Auto-trigger mode switch
@@ -93,25 +91,31 @@ def run():
 
             u_whl   = ctrl.control_torque
             u_trip  = ctrl.triplet_torque_cmd
-            ff_trip = 0.0  # can't read directly, but 'trans' active implies FF
+
+            # Per-state K contributions to wheel torque: -K[0,:] * x
+            kc      = getattr(ctrl, 'K_contributions_full', np.zeros(6))
+            vel     = getattr(ctrl, 'velocity', 0.0)
 
             rec = dict(t=sim_time, pitch=pitch_deg,
+                       vel=vel,
                        ta_L=math.degrees(ta[0]), ta_R=math.degrees(ta[1]),
                        tv_L=tv[0], tv_R=tv[1],
                        trip_ref=math.degrees(trip_ref),
                        trip_err=math.degrees(trip_err),
                        u_whl=u_whl, u_trip=u_trip,
                        trans=int(trans), K=K_name,
-                       act_L=robot.actual_torques[0], act_R=robot.actual_torques[1])
+                       act_L=robot.actual_torques[0], act_R=robot.actual_torques[1],
+                       kc_pos=kc[0], kc_vel=kc[1], kc_pitch=kc[2],
+                       kc_rate=kc[3], kc_trip=kc[4])
             log_buf.append(rec)
 
-            state_err_full = getattr(ctrl, 'state_error_full', np.zeros(6))
-            print(f"{sim_time:6.2f}  {pitch_deg:7.2f}  "
-                  f"{math.degrees(ta[0]):7.2f}  {math.degrees(ta[1]):7.2f}  "
-                  f"{math.degrees(trip_ref):9.3f}  {math.degrees(trip_err):9.3f}  "
-                  f"{u_whl:7.3f}  {u_trip:7.3f}  "
-                  f"{'Y' if trans else 'N':>6}  {K_name:>8}  "
-                  f"{'TRANS' if trans else '     '}")
+            # flag saturation
+            sat = '*' if abs(u_whl) >= ctrl.max_wheel_torque * 0.99 else ' '
+            print(f"{sim_time:6.2f}  {pitch_deg:7.2f}  {vel:7.3f}  "
+                  f"{u_whl:7.3f}{sat} "
+                  f"{kc[0]:6.3f}  {kc[1]:6.3f}  {kc[2]:7.3f}  {kc[3]:6.3f}  {kc[4]:6.3f}  "
+                  f"{u_trip:7.3f}  {math.degrees(trip_ref):8.2f}  "
+                  f"{K_name:>5}  {'T' if trans else ' '}")
 
         if robot.check_fallen():
             print(f"\n!!! ROBOT FELL at t={sim_time:.3f}s  pitch={pitch_deg:.1f}° !!!\n")
@@ -234,14 +238,66 @@ def run():
           f"(positive = triplet torque drives triplet — correct)")
     print(f"  Wheel FF comp ratio = {-B[3,1]/B[3,0]:.4f}")
 
-    print("\n--- FULL LOG (last 20 samples) ---")
-    print(f"{'t':>6}  {'pitch':>7}  {'ta_L':>7}  {'ta_R':>7}  "
-          f"{'ref':>7}  {'err':>7}  {'u_whl':>7}  {'u_trip':>7}  "
-          f"{'K':>5}  {'T':>1}")
-    for r in log_buf[-20:]:
-        print(f"{r['t']:6.2f}  {r['pitch']:7.2f}  {r['ta_L']:7.2f}  {r['ta_R']:7.2f}  "
-              f"{r['trip_ref']:7.2f}  {r['trip_err']:7.2f}  {r['u_whl']:7.3f}  {r['u_trip']:7.3f}  "
-              f"{r['K']:>5}  {r['trans']:>1}")
+    # -----------------------------------------------------------------------
+    # Per-state saturation analysis
+    # -----------------------------------------------------------------------
+    print("\n--- PER-STATE K CONTRIBUTION ANALYSIS (wheel channel) ---")
+    K = ctrl.K_normal
+    print(f"  K_wheels: pos={K[0,0]:.4f}  vel={K[0,1]:.4f}  "
+          f"pitch={K[0,2]:.4f}  rate={K[0,3]:.4f}  "
+          f"trip={K[0,4]:.4f}  trip_v={K[0,5]:.4f}")
+
+    all_pre = pre if pre else log_buf
+    if all_pre and 'kc_pos' in all_pre[0]:
+        labels  = ['pos', 'vel', 'pitch', 'rate', 'trip']
+        keys    = ['kc_pos', 'kc_vel', 'kc_pitch', 'kc_rate', 'kc_trip']
+        # Saturation threshold
+        thresh  = ctrl.max_wheel_torque * 0.95
+        sat_smp = [r for r in all_pre if abs(r['u_whl']) >= thresh]
+        print(f"\n  Pre-switch: {len(sat_smp)}/{len(all_pre)} samples saturated "
+              f"(|u_whl| ≥ {thresh:.2f} Nm)")
+
+        for lbl, key in zip(labels, keys):
+            vals = [abs(r[key]) for r in all_pre]
+            sat_vals = [abs(r[key]) for r in sat_smp]
+            print(f"    {lbl:>6}: mean_all={np.mean(vals):.4f}  "
+                  f"mean_sat={np.mean(sat_vals):.4f}  "
+                  f"max={max(vals):.4f} Nm")
+
+        # Which state is the largest contributor during saturation?
+        if sat_smp:
+            dom_counts = {lbl: 0 for lbl in labels}
+            for r in sat_smp:
+                largest_lbl = max(zip(labels, keys), key=lambda x: abs(r[x[1]]))[0]
+                dom_counts[largest_lbl] += 1
+            print(f"\n  Dominant term when saturated: "
+                  f"{', '.join(f'{k}={v}' for k, v in sorted(dom_counts.items(), key=lambda x: -x[1]))}")
+
+        # Saturation check: what pitch would alone saturate the wheel?
+        if abs(K[0,2]) > 1e-4:
+            sat_pitch = ctrl.max_wheel_torque / abs(K[0,2])
+            print(f"\n  Pitch alone saturates at: {math.degrees(sat_pitch):.1f}°  "
+                  f"(K_pitch={K[0,2]:.3f}, limit={ctrl.max_wheel_torque:.1f} Nm)")
+        if abs(K[0,1]) > 1e-4:
+            sat_vel = ctrl.max_wheel_torque / abs(K[0,1])
+            print(f"  Velocity alone saturates at: {sat_vel:.3f} m/s  "
+                  f"(K_vel={K[0,1]:.3f})")
+        if abs(K[0,3]) > 1e-4:
+            sat_rate = ctrl.max_wheel_torque / abs(K[0,3])
+            print(f"  Pitch-rate alone saturates at: {math.degrees(sat_rate):.1f}°/s  "
+                  f"(K_rate={K[0,3]:.3f})")
+
+    print("\n--- FULL LOG (last 30 samples) ---")
+    print(f"{'t':>6}  {'pitch':>7}  {'vel':>7}  "
+          f"{'u_whl':>7}  {'Kpos':>6}  {'Kvel':>6}  {'Kpitch':>7}  {'Krate':>6}  "
+          f"{'u_trip':>7}  {'K':>5}  T")
+    for r in log_buf[-30:]:
+        sat = '*' if abs(r['u_whl']) >= ctrl.max_wheel_torque * 0.99 else ' '
+        print(f"{r['t']:6.2f}  {r['pitch']:7.2f}  {r['vel']:7.3f}  "
+              f"{r['u_whl']:7.3f}{sat} "
+              f"{r.get('kc_pos',0):6.3f}  {r.get('kc_vel',0):6.3f}  "
+              f"{r.get('kc_pitch',0):7.3f}  {r.get('kc_rate',0):6.3f}  "
+              f"{r['u_trip']:7.3f}  {r['K']:>5}  {r['trans']:>1}")
 
     p.disconnect()
     print("\nDone.")
