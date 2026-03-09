@@ -203,6 +203,7 @@ CONFIG = {
     'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
     'TRIPLET_ASSIST_DEADZONE': 0.15,  # rad (~8.6°) — no assist below this pitch
     'TRIPLET_ASSIST_MAX': 3.0,        # Nm — clamp (triplet motor limit is 5 Nm)
+    'TRIPLET_ASSIST_TAU': 0.04,       # s — EMA time constant for assist smoothing (~25 Hz cutoff)
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
@@ -354,28 +355,32 @@ class TripletController:
         self.assist_gain = config.get('TRIPLET_ASSIST_GAIN', 2.0)        # Nm/rad²
         self.assist_deadzone = config.get('TRIPLET_ASSIST_DEADZONE', 0.15)  # rad (~8.6°)
         self.assist_max = config.get('TRIPLET_ASSIST_MAX', 3.0)           # Nm clamp
-        self.last_tau_assist = 0.0  # for telemetry
+        self.assist_tau = config.get('TRIPLET_ASSIST_TAU', 0.04)           # s EMA smoothing
+        self.last_assist_force = 0.0  # filtered output (for telemetry and actuation)
 
         print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
               f"target={math.degrees(self.target_angle):.1f}\u00b0")
         print(f"    Nonlinear assist: gain={self.assist_gain}, "
               f"deadzone={math.degrees(self.assist_deadzone):.1f}°, "
-              f"max={self.assist_max} Nm")
+              f"max={self.assist_max} Nm, "
+              f"tau={self.assist_tau*1000:.0f}ms")
 
     # ------------------------------------------------------------------
 
-    def update(self, angle, rate, body_pitch, body_pitch_rate=0.0):
+    def update(self, angle, rate, body_pitch, body_pitch_rate=0.0, dt=0.002):
         """
         Compute triplet hub torque with nonlinear balance assist.
 
         PD holds the hub at target_angle.  Beyond ASSIST_DEADZONE, when
-        the robot is falling, a quadratic boost activates.
+        the robot is falling, a quadratic boost activates.  The raw assist
+        is EMA-filtered to prevent on/off chattering at the physics rate.
 
         Args:
             angle:            triplet joint angle (rad, relative to body)
             rate:             triplet joint angular velocity (rad/s)
             body_pitch:       current body pitch in world frame (rad)
             body_pitch_rate:  current body pitch rate (rad/s)
+            dt:               timestep (s) for EMA filter
 
         Returns:
             torque (Nm) to apply at the triplet hub joint
@@ -383,7 +388,7 @@ class TripletController:
         # PD term — drives joint toward target_angle, damps velocity
         tau_pd = self.kp * (self.target_angle - angle) - self.kd * rate
 
-        tau_base = tau_pd
+        base_force = tau_pd
 
         # --- Nonlinear assist: dead-zoned quadratic, rate-gated ---
         # At small pitch the PD alone holds the hub.
@@ -394,17 +399,22 @@ class TripletController:
         #   1. |pitch| exceeds the deadzone (LQR handles small angles fine)
         #   2. The robot is *falling* (pitch and pitch_rate same sign)
         #   3. pitch_rate is above noise floor (0.1 rad/s)
-        tau_assist = 0.0
+        assist_force_raw = 0.0
         excess = abs(body_pitch) - self.assist_deadzone
         if excess > 0 and abs(body_pitch_rate) > 0.1:
             # Only assist when falling (pitch and pitch_rate same sign)
             if body_pitch * body_pitch_rate > 0:
                 # Quadratic nonlinear term
-                tau_assist = self.assist_gain * excess * excess * math.copysign(1.0, body_pitch)
-                tau_assist = max(-self.assist_max, min(self.assist_max, tau_assist))
+                assist_force_raw = self.assist_gain * excess * excess * math.copysign(1.0, body_pitch)
+                assist_force_raw = max(-self.assist_max, min(self.assist_max, assist_force_raw))
 
-        self.last_tau_assist = tau_assist
-        return tau_base + tau_assist
+        # EMA filter: smooth the assist to prevent on/off chattering.
+        # When the rate gate flickers, the filter holds the assist value
+        # instead of snapping to zero every other timestep.
+        alpha = min(1.0, dt / self.assist_tau) if self.assist_tau > 0 else 1.0
+        self.last_assist_force += alpha * (assist_force_raw - self.last_assist_force)
+
+        return base_force + self.last_assist_force
 
     def set_target(self, angle_rad):
         """Override the target triplet joint angle (rad)."""
@@ -764,10 +774,10 @@ class TribotBalanceBot:
                 )
             triplet_cmd_L = self.triplet_ctrl.update(
                 lt_state[0], lt_state[1], self.pitch_angle,
-                body_pitch_rate=self.pitch_rate)
+                body_pitch_rate=self.pitch_rate, dt=dt)
             triplet_cmd_R = self.triplet_ctrl.update(
                 rt_state[0], rt_state[1], self.pitch_angle,
-                body_pitch_rate=self.pitch_rate)
+                body_pitch_rate=self.pitch_rate, dt=dt)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -1036,7 +1046,7 @@ def run_simulation():
             "K_pitch_rate": float(ctrl.K_contributions[3]),
             "lqr_desired_lean": float(ctrl.desired_lean),
             # Nonlinear triplet assist torque (for tuning visibility)
-            "triplet_assist": float(robot.triplet_ctrl.last_tau_assist),
+            "triplet_assist": float(robot.triplet_ctrl.last_assist_force),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
