@@ -203,7 +203,7 @@ CONFIG = {
     'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
     'TRIPLET_ASSIST_DEADZONE': 0.15,  # rad (~8.6°) — no assist below this pitch
     'TRIPLET_ASSIST_MAX': 3.0,        # Nm — clamp (triplet motor limit is 5 Nm)
-    'TRIPLET_ASSIST_TAU': 0.04,       # s — EMA time constant for assist smoothing (~25 Hz cutoff)
+    'TRIPLET_ASSIST_TAU': 0.1,        # s — EMA time constant for assist smoothing (~25 Hz cutoff)
 
     # === GAMEPAD ===
     'GAMEPAD_DEVICE': '/dev/input/js0',
@@ -408,11 +408,15 @@ class TripletController:
                 assist_force_raw = self.assist_gain * excess * excess * math.copysign(1.0, body_pitch)
                 assist_force_raw = max(-self.assist_max, min(self.assist_max, assist_force_raw))
 
-        # EMA filter: smooth the assist to prevent on/off chattering.
-        # When the rate gate flickers, the filter holds the assist value
-        # instead of snapping to zero every other timestep.
-        alpha = min(1.0, dt / self.assist_tau) if self.assist_tau > 0 else 1.0
-        self.last_assist_force += alpha * (assist_force_raw - self.last_assist_force)
+        # Asymmetric filter: instant attack, smooth decay.
+        # When |raw| >= |filtered|, snap immediately (no delay on initial reaction).
+        # When |raw| < |filtered| (gate closed or torque dropping), EMA-decay
+        # to prevent on/off chattering at the physics rate.
+        if abs(assist_force_raw) >= abs(self.last_assist_force):
+            self.last_assist_force = assist_force_raw
+        else:
+            alpha = min(1.0, dt / self.assist_tau) if self.assist_tau > 0 else 1.0
+            self.last_assist_force += alpha * (assist_force_raw - self.last_assist_force)
 
         return base_force + self.last_assist_force
 
