@@ -214,7 +214,11 @@ CONFIG = {
     'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
     'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
     'GAMEPAD_MAX_LEAN': math.radians(30), # max intentional lean angle
+    'GAMEPAD_2WD_BUTTON': 4,         # LB (left bumper) on F710 (XInput)
     'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
+
+    # === MODE SWITCH (4WD ↔ 2WD) ===
+    'TRIPLET_2WD_ANGLE': math.pi / 3,  # 60° target for 2WD mode
 }
 
 
@@ -511,8 +515,13 @@ class TribotBalanceBot:
         # Two motors (one per side)
         self.motors = [BrushlessMotorModel(config), BrushlessMotorModel(config)]
 
-        # Triplet lean PD controller (holds hub at INITIAL_TRIPLET_ANGLE)
-        self.triplet_ctrl = TripletController(config)
+        # Triplet lean PD controllers (one per side, holds hub at target angle)
+        self.triplet_ctrl_L = TripletController(config)
+        self.triplet_ctrl_R = TripletController(config)
+
+        # Drive mode: '4wd' (two wheels/side) or '2wd' (one wheel/side)
+        self.drive_mode = '4wd'
+        self.triplet_base_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
 
         # IMU sensor model
         self.imu = IMUSensorModel(config)
@@ -759,27 +768,21 @@ class TribotBalanceBot:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
-            # If LQR exposes its desired lean, offset the triplet target
-            # so the hub rotates to keep wheels on the ground during the lean.
+            # Compute lean compensation on top of the mode-dependent base angle.
+            # In 4WD the base is 0°; in 2WD the base is TRIPLET_2WD_ANGLE (60°).
+            lean_comp = 0.0
             if hasattr(self.controller, 'desired_lean'):
                 lean_offset = self.controller.desired_lean
-
-                # this EMA creates an empirical delay between the target lean_offset
-                # and the moment LQR makes that lean angle real
-                # alpha = 0.013   # tau = 0.15, dt = 1/500
-                # self.lean_offset_ema = alpha * lean_offset + (1 - alpha) * self.lean_offset_ema
-
                 target_pitch = self.controller.target_pitch
-                # Magic constant 1.7, should not be necessary
-                # but empirically improves position tracking
-                self.triplet_ctrl.set_target(
-                    -target_pitch / 1.7 - lean_offset
-                    # -target_pitch - self.lean_offset_ema
-                )
-            triplet_cmd_L = self.triplet_ctrl.update(
+                lean_comp = -target_pitch / 1.7 - lean_offset
+
+            self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
+            self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
+
+            triplet_cmd_L = self.triplet_ctrl_L.update(
                 lt_state[0], lt_state[1], self.pitch_angle,
                 body_pitch_rate=self.pitch_rate, dt=dt)
-            triplet_cmd_R = self.triplet_ctrl.update(
+            triplet_cmd_R = self.triplet_ctrl_R.update(
                 rt_state[0], rt_state[1], self.pitch_angle,
                 body_pitch_rate=self.pitch_rate, dt=dt)
 
@@ -876,6 +879,24 @@ class TribotBalanceBot:
         yaw = math.atan2(fwd_y, fwd_x)
         return pos[0], pos[1], yaw, fwd_x, fwd_y
 
+    def toggle_drive_mode(self):
+        """Toggle between 4WD and 2WD drive modes.
+
+        In 4WD (triplet angle ≈ 0°), two wheels per side touch the ground.
+        In 2WD (triplet angle ≈ 60°), one wheel per side — active balance.
+        Call this while the back wheels are unloaded (robot leaning forward)
+        so the triplet can rotate with minimal ground friction.
+        """
+        angle_2wd = self.cfg.get('TRIPLET_2WD_ANGLE', math.pi / 3)
+        if self.drive_mode == '4wd':
+            self.drive_mode = '2wd'
+            self.triplet_base_angle = angle_2wd
+            print(f"  [MODE] 4WD → 2WD  (triplet target {math.degrees(angle_2wd):.0f}°)")
+        else:
+            self.drive_mode = '4wd'
+            self.triplet_base_angle = 0.0
+            print(f"  [MODE] 2WD → 4WD  (triplet target 0°)")
+
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""
         true_pitch, _ = self._get_true_state()
@@ -960,6 +981,9 @@ def run_simulation():
     pj = PlotJugglerStreamer()   # UDP → 127.0.0.1:9870
     print("PlotJuggler UDP streamer active on 127.0.0.1:9870")
 
+    # LT trigger state for rising-edge detection (4WD ↔ 2WD toggle)
+    lt_was_pressed = False
+
     # Visual target marker (vertical debug line)
     marker_id = -1
     marker_color = [0.0, 1.0, 0.0]   # green
@@ -993,6 +1017,11 @@ def run_simulation():
                 lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
                 robot.controller.set_lean(lean_cmd)
 
+            # LB (left bumper) → toggle 4WD ↔ 2WD on rising edge
+            lb_pressed = gp.button(CONFIG['GAMEPAD_2WD_BUTTON'])
+            if lb_pressed and not lt_was_pressed:
+                robot.toggle_drive_mode()
+            lt_was_pressed = lb_pressed
 
             # Update target while stick is actively deflected;
             # when released, the last target stays fixed in world.
@@ -1050,7 +1079,10 @@ def run_simulation():
             "K_pitch_rate": float(ctrl.K_contributions[3]),
             "lqr_desired_lean": float(ctrl.desired_lean),
             # Nonlinear triplet assist torque (for tuning visibility)
-            "triplet_assist": float(robot.triplet_ctrl.last_assist_force),
+            "triplet_assist_L": float(robot.triplet_ctrl_L.last_assist_force),
+            "triplet_assist_R": float(robot.triplet_ctrl_R.last_assist_force),
+            # Drive mode (0=4WD, 1=2WD)
+            "drive_mode": float(robot.drive_mode == '2wd'),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
