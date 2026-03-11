@@ -24,9 +24,15 @@ import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
+from enum import Enum
 import numpy as np
 import pybullet as p
 import pybullet_data
+
+
+class DriveMode(Enum):
+    FOUR_WD = '4wd'
+    TWO_WD = '2wd'
 
 from control_pid import BalanceController
 from control_lqr import LQRBalanceController
@@ -199,6 +205,13 @@ CONFIG = {
     'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
     'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
 
+    # Lean compensation scale: how many radians the triplet counter-rotates
+    # per radian of body lean command.
+    # 4WD: contact wheels are near hub height → small correction (~1/1.7).
+    # 2WD: wheel_1 is R=0.12 m above hub → larger moment arm → ~2× correction.
+    'TRIPLET_4WD_LEAN_SCALE': 1.0 / 1.7,  # ≈ 0.59
+    'TRIPLET_2WD_LEAN_SCALE': 2.3,
+
     # Nonlinear triplet balance assist (dead-zoned quadratic, rate-gated)
     'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
     'TRIPLET_ASSIST_DEADZONE': 0.15,  # rad (~8.6°) — no assist below this pitch
@@ -361,6 +374,7 @@ class TripletController:
         self.assist_max = config.get('TRIPLET_ASSIST_MAX', 3.0)           # Nm clamp
         self.assist_tau = config.get('TRIPLET_ASSIST_TAU', 0.04)           # s EMA smoothing
         self.last_assist_force = 0.0  # filtered output (for telemetry and actuation)
+        self.drive_mode = DriveMode.FOUR_WD  # assist disabled in 2WD (fights the triplet hold)
 
         print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
               f"target={math.degrees(self.target_angle):.1f}\u00b0")
@@ -395,6 +409,12 @@ class TripletController:
         base_force = tau_pd
 
         # --- Nonlinear assist: dead-zoned quadratic, rate-gated ---
+        # Only active in 4WD.  In 2WD the triplet is holding a specific
+        # angle for balance; the assist torque would fight that hold.
+        if self.drive_mode == DriveMode.TWO_WD:
+            self.last_assist_force = 0.0
+            return base_force
+
         # At small pitch the PD alone holds the hub.
         # Beyond the deadzone, when the robot is *falling*, the quadratic
         # boost activates to provide emergency authority.
@@ -520,7 +540,7 @@ class TribotBalanceBot:
         self.triplet_ctrl_R = TripletController(config)
 
         # Drive mode: '4wd' (two wheels/side) or '2wd' (one wheel/side)
-        self.drive_mode = '4wd'
+        self.drive_mode = DriveMode.FOUR_WD
         self.triplet_base_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
 
         # IMU sensor model
@@ -770,11 +790,18 @@ class TribotBalanceBot:
         else:
             # Compute lean compensation on top of the mode-dependent base angle.
             # In 4WD the base is 0°; in 2WD the base is TRIPLET_2WD_ANGLE (60°).
+            # In 2WD the contact wheel (w1) sits R=0.12 m above the hub, so a
+            # forward body lean requires a larger triplet counter-rotation to
+            # keep the wheel under the CoG (~2× vs the 4WD correction).
             lean_comp = 0.0
             if hasattr(self.controller, 'desired_lean'):
                 lean_offset = self.controller.desired_lean
                 target_pitch = self.controller.target_pitch
-                lean_comp = -target_pitch / 1.7 - lean_offset
+                if self.drive_mode == DriveMode.TWO_WD:
+                    lean_scale = self.cfg.get('TRIPLET_2WD_LEAN_SCALE', 2.0)
+                else:
+                    lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
+                lean_comp = -target_pitch * lean_scale - lean_offset
 
             self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
             self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
@@ -883,19 +910,30 @@ class TribotBalanceBot:
         """Toggle between 4WD and 2WD drive modes.
 
         In 4WD (triplet angle ≈ 0°), two wheels per side touch the ground.
-        In 2WD (triplet angle ≈ 60°), one wheel per side — active balance.
-        Call this while the back wheels are unloaded (robot leaning forward)
-        so the triplet can rotate with minimal ground friction.
+        In 2WD (triplet angle ≈ ±60°), one wheel per side — active balance.
+
+        Due to triplet 3-fold symmetry, both +60° and −60° are valid 2WD
+        configurations.  We pick whichever is closer to the current triplet
+        angle so the transition is always a short (~35°) rotation rather
+        than a violent 120° flip.
         """
         angle_2wd = self.cfg.get('TRIPLET_2WD_ANGLE', math.pi / 3)
-        if self.drive_mode == '4wd':
-            self.drive_mode = '2wd'
-            self.triplet_base_angle = angle_2wd
-            print(f"  [MODE] 4WD → 2WD  (triplet target {math.degrees(angle_2wd):.0f}°)")
+        if self.drive_mode == DriveMode.FOUR_WD:
+            self.drive_mode = DriveMode.TWO_WD
+            # Pick sign of 60° closest to current triplet angle
+            cur_angle = p.getJointState(self.body_id, self.l_triplet_joint)[0]
+            if cur_angle >= 0:
+                self.triplet_base_angle = -angle_2wd
+            else:
+                self.triplet_base_angle = angle_2wd
+            print(f"  [MODE] 4WD → 2WD  (triplet target "
+                  f"{math.degrees(self.triplet_base_angle):+.0f}°)")
         else:
-            self.drive_mode = '4wd'
+            self.drive_mode = DriveMode.FOUR_WD
             self.triplet_base_angle = 0.0
             print(f"  [MODE] 2WD → 4WD  (triplet target 0°)")
+        self.triplet_ctrl_L.drive_mode = self.drive_mode
+        self.triplet_ctrl_R.drive_mode = self.drive_mode
 
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""
@@ -1082,7 +1120,7 @@ def run_simulation():
             "triplet_assist_L": float(robot.triplet_ctrl_L.last_assist_force),
             "triplet_assist_R": float(robot.triplet_ctrl_R.last_assist_force),
             # Drive mode (0=4WD, 1=2WD)
-            "drive_mode": float(robot.drive_mode == '2wd'),
+            "drive_mode": float(robot.drive_mode == DriveMode.TWO_WD),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
             "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
             # Targets
