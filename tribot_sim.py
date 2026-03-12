@@ -200,10 +200,20 @@ CONFIG = {
     'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
     'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
 
-    # === TRIPLET LEAN PD CONTROLLER ===
+    # === TRIPLET LEAN PID CONTROLLER ===
     # Holds the triplet hub at INITIAL_TRIPLET_ANGLE using torque control.
     'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
     'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
+    # Gravity compensation feedforward (per side):
+    #   τ_ff = K · sin(body_pitch + triplet_angle)
+    # 4WD: K ≈ (m_total/2)·g·z_contact = 1.70·9.81·0.118 ≈ 1.97 Nm
+    #   Two grounded wheels create asymmetric normal forces when body pitches;
+    #   the net torque about the hub grows with sin(θ).  "Bilateral support"
+    #   cancels the cos(θ) component, leaving the sin(θ) term.
+    # 2WD: K ≈ m_trip·g·R = 0.335·9.81·0.12 ≈ 0.39 Nm
+    #   Single grounded wheel, restoring torque from contact offset.
+    'TRIPLET_GRAV_COMP_4WD': 2.0,  # Nm — gravity comp gain (per-side, 4WD)
+    'TRIPLET_GRAV_COMP_2WD': 2.0,  # Nm — gravity comp gain (per-side, 2WD)
 
     # Lean compensation geometry (sine theorem):
     #   β = α + arcsin((h/l) sin α)  where
@@ -213,7 +223,7 @@ CONFIG = {
     # Valid for |α| < arcsin(l/h) ≈ 29°.
     # 4WD uses a simpler linear scale (small lean corrections).
     'TRIPLET_4WD_LEAN_SCALE': 1.0 / 1.7,  # ≈ 0.59 (linear approx, 4WD only)
-    'TRIPLET_2WD_COG_DIST': 0.155,        # m — h: hub-to-CoG (whole robot, lower than c_body alone)
+    'TRIPLET_2WD_COG_DIST': 0.19,        # m — h: hub-to-CoG (whole robot, lower than c_body alone)
     'TRIPLET_2WD_FOOT_LENGTH': 0.12,      # m — l: hub-to-wheel distance
 
     # Nonlinear triplet balance assist (dead-zoned quadratic, rate-gated)
@@ -397,16 +407,27 @@ def compute_pitch_from_triplet(beta, h, l=0.12):
 
 class TripletController:
     """
-    PD position controller for a triplet hub joint with nonlinear balance assist.
+    PD position controller for a triplet hub joint with gravity compensation
+    and nonlinear balance assist.
 
     Maintains the triplet at `target_angle` (rad, relative to body) using
-    PD control.  At small pitch angles, only the PD term is active — gravity
-    torque is negligible and LQR handles balance via drive motors.
+    PD control plus a sin()-based gravity feedforward.  At small pitch angles
+    the feedforward is near-zero and the PD alone holds the hub; at high pitch
+    the feedforward cancels the dominant gravity disturbance.
+
+    Gravity compensation
+    --------------------
+    When the body pitches by θ, asymmetric ground-contact normal forces
+    create a net torque on the hub that pulls the triplet *with* the lean:
+        τ_grav ≈ +K · sin(θ + φ − φ₀)
+    where K depends on the drive mode (4WD ≈ 2 Nm, 2WD ≈ 0.4 Nm), φ is
+    the triplet angle relative to body, and φ₀ is the equilibrium base angle.
+    The feedforward adds −K·sin(θ + φ − φ₀) to cancel this disturbance.
 
     Nonlinear assist (dead-zoned quadratic)
     ------------------------------------------------------
     Beyond ASSIST_DEADZONE, when the robot is *falling* (pitch and pitch_rate
-    same sign), a quadratic torque boost activates.  This gives the triplet real 
+    same sign), a quadratic torque boost activates.  This gives the triplet real
     authority exactly when the drive motors are saturated, without fighting LQR at working angles.
 
     Output torque is `triplet_cmd` in:
@@ -418,6 +439,11 @@ class TripletController:
         self.kp = config.get('TRIPLET_LEAN_KP', 8.0)
         self.kd = config.get('TRIPLET_LEAN_KD', 0.4)
         self.target_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        self.base_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)  # equilibrium angle (set by sim loop)
+
+        # Gravity compensation gains (mode-dependent)
+        self.grav_comp_4wd = config.get('TRIPLET_GRAV_COMP_4WD', 2.0)
+        self.grav_comp_2wd = config.get('TRIPLET_GRAV_COMP_2WD', 0.4)
 
         # Nonlinear balance assist parameters
         self.assist_gain = config.get('TRIPLET_ASSIST_GAIN', 2.0)        # Nm/rad²
@@ -427,8 +453,13 @@ class TripletController:
         self.last_assist_force = 0.0  # filtered output (for telemetry and actuation)
         self.drive_mode = DriveMode.FOUR_WD  # assist disabled in 2WD (fights the triplet hold)
 
+        # Telemetry (populated each update, read by sim loop)
+        self.last_grav_comp = 0.0
+
         print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
               f"target={math.degrees(self.target_angle):.1f}\u00b0")
+        print(f"    Gravity comp: 4WD={self.grav_comp_4wd:.2f} Nm, "
+              f"2WD={self.grav_comp_2wd:.2f} Nm")
         print(f"    Nonlinear assist: gain={self.assist_gain}, "
               f"deadzone={math.degrees(self.assist_deadzone):.1f}°, "
               f"max={self.assist_max} Nm, "
@@ -438,11 +469,14 @@ class TripletController:
 
     def update(self, angle, rate, body_pitch, body_pitch_rate=0.0, dt=0.002):
         """
-        Compute triplet hub torque with nonlinear balance assist.
+        Compute triplet hub torque with gravity compensation and nonlinear
+        balance assist.
 
-        PD holds the hub at target_angle.  Beyond ASSIST_DEADZONE, when
-        the robot is falling, a quadratic boost activates.  The raw assist
-        is EMA-filtered to prevent on/off chattering at the physics rate.
+        Torque = PD + gravity_feedforward + nonlinear_assist
+
+        The gravity feedforward cancels the dominant disturbance (asymmetric
+        ground-contact forces when the body pitches).  The nonlinear assist
+        provides emergency authority at extreme pitch.
 
         Args:
             angle:            triplet joint angle (rad, relative to body)
@@ -454,8 +488,25 @@ class TripletController:
         Returns:
             torque (Nm) to apply at the triplet hub joint
         """
-        # PD term — drives joint toward target_angle, damps velocity
-        tau_pd = self.kp * (self.target_angle - angle) - self.kd * rate
+        error = self.target_angle - angle
+
+        # --- PD term — drives joint toward target_angle, damps velocity ---
+        tau_pd = self.kp * error - self.kd * rate
+
+        # --- Gravity compensation feedforward ---
+        # The gravity disturbance *pulls* the triplet with the lean:
+        #   τ_disturb ≈ +K · sin(body_pitch + angle − base_angle)
+        # The feedforward cancels it with the opposite sign.
+        # At equilibrium (body_pitch=0, angle=base_angle) the term is zero;
+        # no spurious offset in 2WD where base_angle=±60°.
+        grav_gain = (self.grav_comp_2wd if self.drive_mode == DriveMode.TWO_WD
+                     else self.grav_comp_4wd)
+        tau_grav = -grav_gain * math.sin(body_pitch + angle - self.base_angle)
+        self.last_grav_comp = tau_grav
+
+        print(f"  TripletController: target_angle={math.degrees(self.target_angle):.1f}\u00b0, "
+              f"angle={math.degrees(angle):.1f}\u00b0, body_pitch={math.degrees(body_pitch):.1f}\u00b0, error={math.degrees(error):.1f}\u00b0, "
+              f"tau_pd={tau_pd:.2f} Nm, tau_grav={tau_grav:.2f} Nm")
 
         base_force = tau_pd
 
@@ -464,7 +515,7 @@ class TripletController:
         # angle for balance; the assist torque would fight that hold.
         if self.drive_mode == DriveMode.TWO_WD:
             self.last_assist_force = 0.0
-            return base_force
+            return base_force + tau_grav
 
         # At small pitch the PD alone holds the hub.
         # Beyond the deadzone, when the robot is *falling*, the quadratic
@@ -498,6 +549,10 @@ class TripletController:
     def set_target(self, angle_rad):
         """Override the target triplet joint angle (rad)."""
         self.target_angle = angle_rad
+
+    def set_base_angle(self, angle_rad):
+        """Set the equilibrium angle for gravity compensation (rad)."""
+        self.base_angle = angle_rad
 
 
 # ============================================================================
@@ -854,6 +909,8 @@ class TribotBalanceBot:
                     lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
                     lean_comp = -alpha * lean_scale - lean_offset
 
+            self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
+            self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
             self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
             self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
 
@@ -1167,9 +1224,11 @@ def run_simulation():
             "K_pitch": float(ctrl.K_contributions[2]),
             "K_pitch_rate": float(ctrl.K_contributions[3]),
             "lqr_desired_lean": float(ctrl.desired_lean),
-            # Nonlinear triplet assist torque (for tuning visibility)
+            # Triplet controller breakdown (for tuning visibility)
             "triplet_assist_L": float(robot.triplet_ctrl_L.last_assist_force),
             "triplet_assist_R": float(robot.triplet_ctrl_R.last_assist_force),
+            "triplet_grav_comp_L": float(robot.triplet_ctrl_L.last_grav_comp),
+            "triplet_grav_comp_R": float(robot.triplet_ctrl_R.last_grav_comp),
             # Drive mode (0=4WD, 1=2WD)
             "drive_mode": float(robot.drive_mode == DriveMode.TWO_WD),
             # Gain-scheduled LQR mode (1=aggressive, 0=normal)
