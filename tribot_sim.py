@@ -205,12 +205,16 @@ CONFIG = {
     'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
     'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
 
-    # Lean compensation scale: how many radians the triplet counter-rotates
-    # per radian of body lean command.
-    # 4WD: contact wheels are near hub height → small correction (~1/1.7).
-    # 2WD: wheel_1 is R=0.12 m above hub → larger moment arm → ~2× correction.
-    'TRIPLET_4WD_LEAN_SCALE': 1.0 / 1.7,  # ≈ 0.59
-    'TRIPLET_2WD_LEAN_SCALE': 2.3,
+    # Lean compensation geometry (sine theorem):
+    #   β = α + arcsin((h/l) sin α)  where
+    #     α = body lean angle (rad, from vertical)
+    #     h = distance from triplet hub to body CoG (m)
+    #     l = triplet foot length (hub to wheel contact, m)
+    # Valid for |α| < arcsin(l/h) ≈ 29°.
+    # 4WD uses a simpler linear scale (small lean corrections).
+    'TRIPLET_4WD_LEAN_SCALE': 1.0 / 1.7,  # ≈ 0.59 (linear approx, 4WD only)
+    'TRIPLET_2WD_COG_DIST': 0.155,        # m — h: hub-to-CoG (whole robot, lower than c_body alone)
+    'TRIPLET_2WD_FOOT_LENGTH': 0.12,      # m — l: hub-to-wheel distance
 
     # Nonlinear triplet balance assist (dead-zoned quadratic, rate-gated)
     'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
@@ -338,6 +342,45 @@ class IMUSensorModel:
         self.fused_pitch = (1.0 - alpha) * gyro_angle + alpha * accel_pitch
 
         return self.fused_pitch, gyro_reading
+
+
+# ============================================================================
+# TRIPLET GEOMETRY — sine-theorem lean compensation
+# ============================================================================
+
+def compute_triplet_from_pitch(alpha, h, l=0.12):
+    """
+    Compute triplet-to-body angle β for a given body lean α using the
+    sine theorem on the CoG–hub–contact triangle.
+
+    Triangle vertices:
+        A = CoG (directly above contact point when balanced)
+        B = triplet hub
+        C = ground contact (wheel), directly below A
+
+    Angles:
+        A = α          (body lean from vertical)
+        B = π − β      (supplement of triplet-to-body angle)
+        C = β − α      (wheel-to-vertical, foot angle)
+
+    Sine rule on side BC = l, opposite angle A = α:
+        l / sin α = h / sin(β − α)
+        ⟹  β = α + arcsin((h/l) · sin α)
+
+    Valid for |α| < arcsin(l/h).  Clamped to ±π/2 for safety.
+
+    Args:
+        alpha:  body lean angle (rad, positive = forward)
+        h:      hub-to-CoG distance (m)
+        l:      hub-to-wheel contact distance (m), default 0.12
+
+    Returns:
+        beta:   required triplet-to-body angle (rad)
+    """
+    ratio = h / l
+    sin_arg = ratio * math.sin(alpha)
+    sin_arg = max(-1.0, min(1.0, sin_arg))  # clamp for safety
+    return alpha + math.asin(sin_arg)
 
 
 # ============================================================================
@@ -789,19 +832,19 @@ class TribotBalanceBot:
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
             # Compute lean compensation on top of the mode-dependent base angle.
-            # In 4WD the base is 0°; in 2WD the base is TRIPLET_2WD_ANGLE (60°).
-            # In 2WD the contact wheel (w1) sits R=0.12 m above the hub, so a
-            # forward body lean requires a larger triplet counter-rotation to
-            # keep the wheel under the CoG (~2× vs the 4WD correction).
+            # In 4WD the base is 0°; lean_comp uses a linear scale.
+            # In 2WD the base is ±60°; lean_comp uses the exact sine-theorem
+            # formula via compute_triplet_from_pitch().
             lean_comp = 0.0
             if hasattr(self.controller, 'desired_lean'):
                 lean_offset = self.controller.desired_lean
-                target_pitch = self.controller.target_pitch
+                alpha = self.controller.target_pitch   # body lean from vertical
                 if self.drive_mode == DriveMode.TWO_WD:
-                    lean_scale = self.cfg.get('TRIPLET_2WD_LEAN_SCALE', 2.0)
+                    beta = compute_triplet_from_pitch(alpha, h=self.cfg.get('TRIPLET_2WD_COG_DIST'))
+                    lean_comp = -beta # + lean_offset/2 # feed in some of the desired lean as an offset
                 else:
                     lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
-                lean_comp = -target_pitch * lean_scale - lean_offset
+                    lean_comp = -alpha * lean_scale - lean_offset
 
             self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
             self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
