@@ -382,6 +382,14 @@ def compute_triplet_from_pitch(alpha, h, l=0.12):
     sin_arg = max(-1.0, min(1.0, sin_arg))  # clamp for safety
     return alpha + math.asin(sin_arg)
 
+def compute_pitch_from_triplet(beta, h, l=0.12):
+    """
+    Inverse of compute_triplet_from_pitch: compute body lean α from triplet angle β.
+    Rearranging the sine theorem gives:
+    α = arctan((l sin β) / (h + l cos β))
+    """
+    alpha = math.atan2(l * math.sin(beta), h + l * math.cos(beta))
+    return alpha
 
 # ============================================================================
 # TRIPLET LEAN CONTROLLER
