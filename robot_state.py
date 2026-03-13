@@ -86,9 +86,13 @@ class ControlOutput:
     triplet_torque_L: float = 0.0
     triplet_torque_R: float = 0.0
 
-    # Informational (for telemetry / triplet PD cooperation)
-    target_pitch: float = 0.0
-    desired_lean: float = 0.0
+    # The pitch angle demanded by the outer position controller (rad).
+    # Positive = lean forward to accelerate.
+    position_pitch_demand: float = 0.0
+
+    # Final pitch reference sent to the inner balance loop (rad).
+    # = position_pitch_demand + ControlGoals.pitch_bias + any other offsets.
+    pitch_setpoint: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +107,12 @@ class ControlGoals:
     """
     target_position: float = 0.0
     yaw_rate: float = 0.0
-    lean_offset: float = 0.0                     # intentional lean (rad)
+
+    # Operator-commanded pitch bias (rad): tilts the robot intentionally,
+    # added on top of position_pitch_demand inside the controller.
+    # Positive = lean forward.
+    pitch_bias: float = 0.0
+
     request_drive_mode: DriveMode | None = None   # None = no change
 
 
