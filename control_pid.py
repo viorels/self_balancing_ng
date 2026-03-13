@@ -11,8 +11,10 @@ Outputs: per-side commanded torques (left, right)
 
 import numpy as np
 
+from controllers.base import BalanceControllerBase
 
-class BalanceController:
+
+class BalanceController(BalanceControllerBase):
     """
     Cascaded PID controller with sensor-to-actuator delay pipeline.
 
@@ -54,6 +56,13 @@ class BalanceController:
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
 
+        # --- Compatibility fields (base class properties read these) ---
+        self.state_error = [0.0, 0.0, 0.0, 0.0]
+
+    # ----------------------------------------------------------------
+    # BalanceControllerBase interface
+    # ----------------------------------------------------------------
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
@@ -61,6 +70,14 @@ class BalanceController:
     def set_yaw_rate(self, yaw_rate):
         """Set desired yaw rate (rad/s). 0 = drive straight."""
         self.yaw_rate_setpoint = yaw_rate
+
+    def get_telemetry(self) -> dict:
+        """Return PID-specific diagnostic signals."""
+        return {
+            "torque_cmd":    float(self.control_torque),
+            "target_pitch":  float(self.target_pitch),
+            "target_pos":    float(self.target_position),
+        }
 
     def update(self, measured_pitch, measured_pitch_rate,
                position, yaw_rate, sim_time, dt):

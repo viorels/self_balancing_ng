@@ -21,6 +21,8 @@ Outputs: per-side commanded torques (left, right)
 import math
 import numpy as np
 
+from controllers.base import BalanceControllerBase
+
 
 # ============================================================================
 # Algebraic Riccati solver (no scipy dependency)
@@ -146,7 +148,7 @@ def build_state_space(config):
 # LQR Balance Controller
 # ============================================================================
 
-class LQRBalanceController:
+class LQRBalanceController(BalanceControllerBase):
     """
     Full-state-feedback LQR controller for a self-balancing robot.
 
@@ -229,7 +231,11 @@ class LQRBalanceController:
         # --- LQR-implied desired lean (computed each control tick) ---
         # Exposed so the triplet PD can cooperate with the lean the LQR
         # needs for position tracking.
-        self.desired_lean = 0.0
+        self._desired_lean = 0.0
+
+    # ----------------------------------------------------------------
+    # BalanceControllerBase interface
+    # ----------------------------------------------------------------
 
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
@@ -247,6 +253,29 @@ class LQRBalanceController:
         """
         self.target_lean = lean_rad
         self.target_pitch = lean_rad   # keep log field in sync
+
+    @property
+    def desired_lean(self) -> float:
+        return self._desired_lean
+
+    def get_telemetry(self) -> dict:
+        """Return LQR-specific diagnostic signals."""
+        return {
+            "state_err_pos":    float(self.state_error[0]),
+            "state_err_vel":    float(self.state_error[1]),
+            "state_err_pitch":  float(self.state_error[2]),
+            "state_err_prate":  float(self.state_error[3]),
+            "torque_cmd":       float(self.control_torque),
+            "K_pos":            float(self.K_contributions[0]),
+            "K_vel":            float(self.K_contributions[1]),
+            "K_pitch":          float(self.K_contributions[2]),
+            "K_pitch_rate":     float(self.K_contributions[3]),
+            "desired_lean":     float(self._desired_lean),
+            "target_pos":       float(self.target_position),
+            "target_lean":      float(self.target_lean),
+            "target_pitch":     float(self.target_pitch),
+            "aggressive":       float(self.aggressive_active),
+        }
 
     def update(self, measured_pitch, measured_pitch_rate,
                position, yaw_rate, sim_time, dt):
@@ -315,9 +344,9 @@ class LQRBalanceController:
             # Expose this so the triplet PD can cooperate instead of fight.
             K = self.K[0]
             if abs(K[2]) > 1e-9:
-                self.desired_lean = -(K[0] * x[0] + K[1] * x[1]) / K[2]
+                self._desired_lean = -(K[0] * x[0] + K[1] * x[1]) / K[2]
             else:
-                self.desired_lean = 0.0
+                self._desired_lean = 0.0
 
             # u = -K x  (total torque for both sides)
             u_raw = float(-self.K @ x)

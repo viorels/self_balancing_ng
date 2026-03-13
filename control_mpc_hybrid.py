@@ -41,6 +41,8 @@ import time as _time
 import numpy as np
 from scipy import linalg as la
 
+from controllers.base import BalanceControllerBase
+
 
 # ============================================================================
 # Dense QP Solver  (no OSQP dependency — suitable for small problems)
@@ -807,7 +809,7 @@ class ZMPFlipTrigger:
 # Hybrid MPC + PD Controller
 # ============================================================================
 
-class MPCHybridController:
+class MPCHybridController(BalanceControllerBase):
     """
     Two-rate MPC + PD balance controller for the tribot.
 
@@ -1025,8 +1027,8 @@ class MPCHybridController:
         self.delay_depth = delay_steps + 1
 
         # ---- Triplet torque outputs (for tribot_sim to apply) ----
-        self.triplet_torque_L = 0.0
-        self.triplet_torque_R = 0.0
+        self._triplet_torque_L = 0.0
+        self._triplet_torque_R = 0.0
 
         # ---- Logging (compatible with tribot_sim PlotJuggler) ----
         self.control_torque = 0.0
@@ -1054,6 +1056,52 @@ class MPCHybridController:
         # used to apply a small pitch bias during SETTLING.
         self._flip_dir_settled = 0.0
         # (ZMP trigger prints its own derived-parameter summary in __init__)
+
+    # ----------------------------------------------------------------
+    # BalanceControllerBase interface
+    # ----------------------------------------------------------------
+
+    @property
+    def plans_triplet_torque(self) -> bool:
+        return True
+
+    @property
+    def triplet_torque_L(self) -> float:
+        return self._triplet_torque_L
+
+    @property
+    def triplet_torque_R(self) -> float:
+        return self._triplet_torque_R
+
+    def get_telemetry(self) -> dict:
+        """Return MPC-specific diagnostic signals."""
+        d = {
+            "state_err_pos":      float(self.state_error[0]),
+            "state_err_vel":      float(self.state_error[1]),
+            "state_err_pitch":    float(self.state_error[2]),
+            "state_err_prate":    float(self.state_error[3]),
+            "torque_cmd":         float(self.control_torque),
+            "target_pitch":       float(self.target_pitch),
+            "target_pos":         float(self.target_position),
+            "mpc_solve_count":    int(self.mpc_solve_count),
+            "mpc_last_wall_ms":   float(self.mpc_last_wall_ms),
+            "mpc_max_wall_ms":    float(self.mpc_max_wall_ms),
+            "mpc_ff_drive_L":     float(self.K_contributions[0]),
+            "mpc_ff_drive_R":     float(self.K_contributions[1]),
+            "mpc_pd_drive_L":     float(self.K_contributions[2]),
+            "mpc_pd_drive_R":     float(self.K_contributions[3]),
+            "triplet_torque_L":   float(self._triplet_torque_L),
+            "triplet_torque_R":   float(self._triplet_torque_R),
+            "triplet_angle_L":    float(self._triplet_angle_L),
+            "triplet_angle_R":    float(self._triplet_angle_R),
+            "triplet_dev_L":      float(self.x_est[self.IDX_TRIP_L]),
+            "triplet_dev_R":      float(self.x_est[self.IDX_TRIP_R]),
+        }
+        # Merge flip diagnostics
+        flip_diag = self.get_flip_diagnostics()
+        if flip_diag:
+            d.update(flip_diag)
+        return d
 
     # ----------------------------------------------------------------
     # Public setters (same API as PID / LQR controllers)
@@ -1482,7 +1530,7 @@ class MPCHybridController:
         right_torque = delayed_R + delayed_yaw
 
         # Expose triplet torques for tribot_sim to apply
-        self.triplet_torque_L = delayed_trip_L
-        self.triplet_torque_R = delayed_trip_R
+        self._triplet_torque_L = delayed_trip_L
+        self._triplet_torque_R = delayed_trip_R
 
         return left_torque, right_torque

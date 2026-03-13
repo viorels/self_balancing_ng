@@ -573,11 +573,10 @@ class TribotBalanceBot:
         # --- Triplet encoders → controller (for MPC) ---
         lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
         rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
-        if hasattr(self.controller, 'set_triplet_state'):
-            self.controller.set_triplet_state(
-                lt_state[0], rt_state[0],   # angles
-                lt_state[1], rt_state[1],   # rates
-            )
+        self.controller.set_triplet_state(
+            lt_state[0], rt_state[0],   # angles
+            lt_state[1], rt_state[1],   # rates
+        )
 
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
@@ -594,7 +593,7 @@ class TribotBalanceBot:
         #   When LQR is active, it exposes `desired_lean` — the pitch angle
         #   it implicitly wants for position tracking.  Feed this to the
         #   triplet PD so it cooperates with (rather than fights) the lean.
-        if hasattr(self.controller, 'triplet_torque_L'):
+        if self.controller.plans_triplet_torque:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
@@ -603,15 +602,14 @@ class TribotBalanceBot:
             # In 2WD the base is ±60°; lean_comp uses the exact sine-theorem
             # formula via compute_triplet_from_pitch().
             lean_comp = 0.0
-            if hasattr(self.controller, 'desired_lean'):
-                lean_offset = self.controller.desired_lean
-                alpha = self.controller.target_pitch   # body lean from vertical
-                if self.drive_mode == DriveMode.TWO_WD:
-                    beta = compute_triplet_from_pitch(alpha, h=self.cfg.get('TRIPLET_2WD_COG_DIST'))
-                    lean_comp = -beta # + lean_offset/2 # feed in some of the desired lean as an offset
-                else:
-                    lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
-                    lean_comp = -alpha * lean_scale - lean_offset
+            lean_offset = self.controller.desired_lean
+            alpha = self.controller.target_pitch   # body lean from vertical
+            if self.drive_mode == DriveMode.TWO_WD:
+                beta = compute_triplet_from_pitch(alpha, h=self.cfg.get('TRIPLET_2WD_COG_DIST'))
+                lean_comp = -beta # + lean_offset/2 # feed in some of the desired lean as an offset
+            else:
+                lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
+                lean_comp = -alpha * lean_scale - lean_offset
 
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
             self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
@@ -863,9 +861,8 @@ def run_simulation():
             # Push up (negative axis) = lean forward (positive pitch offset).
             # set_lean() adjusts the pitch reference so LQR sees
             # (measured_pitch - requested_lean) and does not fight the lean.
-            if hasattr(robot.controller, 'set_lean'):
-                lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
-                robot.controller.set_lean(lean_cmd)
+            lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
+            robot.controller.set_lean(lean_cmd)
 
             # LB (left bumper) → toggle 4WD ↔ 2WD on rising edge
             lb_pressed = gp.button(CONFIG['GAMEPAD_2WD_BUTTON'])
@@ -908,26 +905,15 @@ def run_simulation():
         # --- Stream signals to PlotJuggler ---
         ctrl = robot.controller
         true_pitch, true_pitch_rate = robot._get_true_state()
-        _flip_diag = ctrl.get_flip_diagnostics() if hasattr(ctrl, 'get_flip_diagnostics') else {}
+        ctrl_telem = ctrl.get_telemetry()
         pj.send({
             "timestamp": sim_time,
-            # State signals
-            "pos_err": float(ctrl.state_error[0]),
-            "vel_est": float(ctrl.state_error[1]),
-            "pitch_meas": float(ctrl.state_error[2]),
-            "pitch_rate_meas": float(ctrl.state_error[3]),
+            # True state (not from controller — for reference only)
             "true_pitch": true_pitch,
             "true_pitch_rate": true_pitch_rate,
-            # Torque signals
-            "torque_cmd": float(ctrl.control_torque),
+            # Actuator outputs
             "torque_L_actual": float(robot.actual_torques[0]),
             "torque_R_actual": float(robot.actual_torques[1]),
-            # Per-state LQR contributions (K_i * x_i)
-            "K_pos": float(ctrl.K_contributions[0]),
-            "K_vel": float(ctrl.K_contributions[1]),
-            "K_pitch": float(ctrl.K_contributions[2]),
-            "K_pitch_rate": float(ctrl.K_contributions[3]),
-            "lqr_desired_lean": float(ctrl.desired_lean),
             # Triplet controller breakdown (for tuning visibility)
             "triplet_assist_L": float(robot.triplet_ctrl_L.last_assist_force),
             "triplet_assist_R": float(robot.triplet_ctrl_R.last_assist_force),
@@ -935,39 +921,10 @@ def run_simulation():
             "triplet_grav_comp_R": float(robot.triplet_ctrl_R.last_grav_comp),
             # Drive mode (0=4WD, 1=2WD)
             "drive_mode": float(robot.drive_mode == DriveMode.TWO_WD),
-            # Gain-scheduled LQR mode (1=aggressive, 0=normal)
-            "lqr_aggressive": float(getattr(ctrl, 'aggressive_active', False)),
-            # Targets
-            "target_pos": float(ctrl.target_position),
-            "target_lean": float(getattr(ctrl, 'target_lean', 0.0)),
+            # Robot state
             "position": float(robot.position),
-            # MPC diagnostics (only meaningful when controller is MPC)
-            **({
-                "mpc_solve_count": int(ctrl.mpc_solve_count),
-                "mpc_last_wall_ms": float(ctrl.mpc_last_wall_ms),
-                "mpc_max_wall_ms": float(ctrl.mpc_max_wall_ms),
-                "mpc_target_pitch": float(ctrl.target_pitch),
-                "mpc_ff_drive_L": float(ctrl.K_contributions[0]),
-                "mpc_ff_drive_R": float(ctrl.K_contributions[1]),
-                "mpc_pd_drive_L": float(ctrl.K_contributions[2]),
-                "mpc_pd_drive_R": float(ctrl.K_contributions[3]),
-                "mpc_triplet_torque_L": float(ctrl.triplet_torque_L),
-                "mpc_triplet_torque_R": float(ctrl.triplet_torque_R),
-                "mpc_triplet_angle_L": float(ctrl._triplet_angle_L),
-                "mpc_triplet_angle_R": float(ctrl._triplet_angle_R),
-                "mpc_triplet_dev_L": float(ctrl.x_est[ctrl.IDX_TRIP_L]),
-                "mpc_triplet_dev_R": float(ctrl.x_est[ctrl.IDX_TRIP_R]),
-            } if hasattr(ctrl, 'mpc_solve_count') else {}),
-            # ZMP / DCM flip diagnostics (only when MPC controller is active)
-            **({
-                "zmp_phase":       int(_flip_diag['zmp/phase']),
-                "zmp_dcm":         float(_flip_diag['zmp/dcm']),
-                "zmp_dcm_max":     float(_flip_diag['zmp/dcm_max']),
-                "zmp_dcm_trigger": float(_flip_diag['zmp/dcm_trigger']),
-                "zmp_t_capture":   float(_flip_diag['zmp/t_capture']),
-                "zmp_urgency":     float(_flip_diag['zmp/urgency']),
-                "zmp_eq_deg":      float(_flip_diag['zmp/eq_angle_deg']),
-            } if _flip_diag else {}),
+            # All controller-specific signals (prefixed by controller type)
+            **{f"ctrl/{k}": v for k, v in ctrl_telem.items()},
         })
 
         if robot.check_fallen():
