@@ -31,9 +31,9 @@ import pybullet_data
 
 from robot_state import DriveMode, RobotState, ControlOutput, ControlGoals, Telemetry
 
-from control_pid import BalanceController
-from control_lqr import LQRBalanceController
-from control_mpc_hybrid import MPCHybridController
+from controllers.control_pid import BalanceController
+from controllers.control_lqr import LQRBalanceController
+from controllers.control_mpc_hybrid import MPCHybridController
 from gamepad import Gamepad
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain

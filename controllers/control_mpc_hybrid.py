@@ -41,7 +41,7 @@ import time as _time
 import numpy as np
 from scipy import linalg as la
 
-from controllers.base import BalanceControllerBase
+from .base import BalanceControllerBase
 
 
 # ============================================================================

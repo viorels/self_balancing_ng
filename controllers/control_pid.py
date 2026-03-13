@@ -11,7 +11,7 @@ Outputs: per-side commanded torques (left, right)
 
 import numpy as np
 
-from controllers.base import BalanceControllerBase
+from .base import BalanceControllerBase
 
 
 class BalanceController(BalanceControllerBase):

@@ -6,5 +6,13 @@ loop can treat them uniformly — no hasattr() branching.
 """
 
 from controllers.base import BalanceControllerBase
+from controllers.control_pid import BalanceController
+from controllers.control_lqr import LQRBalanceController
+from controllers.control_mpc_hybrid import MPCHybridController
 
-__all__ = ['BalanceControllerBase']
+__all__ = [
+    'BalanceControllerBase',
+    'BalanceController',
+    'LQRBalanceController',
+    'MPCHybridController',
+]
