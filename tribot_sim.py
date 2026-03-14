@@ -34,7 +34,8 @@ from robot_state import DriveMode, RobotState, ControlOutput, ControlGoals, Tele
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
 from controllers.control_mpc_hybrid import MPCHybridController
-from gamepad import Gamepad
+from input.gamepad import Gamepad
+from input.input_manager import InputManager
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain
 
@@ -869,8 +870,9 @@ def run_simulation():
           f"height: {CONFIG['INITIAL_HEIGHT']:.3f}m")
     print("-" * 70)
 
-    # Gamepad
+    # Gamepad + InputManager
     gp = Gamepad(CONFIG['GAMEPAD_DEVICE'], deadzone=CONFIG['GAMEPAD_DEADZONE'])
+    inp = InputManager(gp, CONFIG)
     if gp.connected:
         print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = distance, "
               f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
@@ -879,67 +881,30 @@ def run_simulation():
     pj = PlotJugglerStreamer()   # UDP → 127.0.0.1:9870
     print("PlotJuggler UDP streamer active on 127.0.0.1:9870")
 
-    # LT trigger state for rising-edge detection (4WD ↔ 2WD toggle)
-    lt_was_pressed = False
-
     # Visual target marker (vertical debug line)
     marker_id = -1
     marker_color = [0.0, 1.0, 0.0]   # green
     marker_h = CONFIG['TARGET_MARKER_HEIGHT']
-
-    # Target position (1-D, robot forward axis). Latched when stick is idle.
-    target_pos = 0.0
-    # World-frame marker position (latched alongside target_pos)
-    marker_world = [0.0, 0.0]
 
     sim_time = 0.0
     log_interval = 0.1
     last_log_time = 0.0
 
     while sim_time < CONFIG['SIM_DURATION']:
-        # --- Gamepad input ---
-        gp.poll()
-        if gp.connected:
-            # Right stick Y → forward distance offset (push up = negative axis = in front)
-            forward_offset = -gp.axis(CONFIG['GAMEPAD_SPEED_AXIS']) * CONFIG['GAMEPAD_MAX_DISTANCE']
+        # --- Input ---
+        goals, mode_toggle, marker = inp.update(
+            robot.position, robot.get_world_pose_2d()
+        )
+        robot.controller.set_target_position(goals.target_position)
+        robot.controller.set_yaw_rate(goals.yaw_rate)
+        robot.controller.set_lean(goals.pitch_bias)
+        if mode_toggle:
+            robot.toggle_drive_mode()
 
-            # Right stick X → yaw rate command
-            yaw_cmd = gp.axis(CONFIG['GAMEPAD_YAW_AXIS']) * CONFIG['GAMEPAD_MAX_YAW_RATE']
-            robot.controller.set_yaw_rate(yaw_cmd)
-
-            # Left stick Y → intentional lean command
-            # Push up (negative axis) = lean forward (positive pitch offset).
-            # set_lean() adjusts the pitch reference so LQR sees
-            # (measured_pitch - requested_lean) and does not fight the lean.
-            lean_cmd = gp.axis(CONFIG['GAMEPAD_LEAN_AXIS']) * CONFIG['GAMEPAD_MAX_LEAN']
-            robot.controller.set_lean(lean_cmd)
-
-            # LB (left bumper) → toggle 4WD ↔ 2WD on rising edge
-            lb_pressed = gp.button(CONFIG['GAMEPAD_2WD_BUTTON'])
-            if lb_pressed and not lt_was_pressed:
-                robot.toggle_drive_mode()
-            lt_was_pressed = lb_pressed
-
-            # Update target while stick is actively deflected;
-            # when released, the last target stays fixed in world.
-            # While turning (yaw active, forward idle), reset target to
-            # current position so the robot doesn't chase a stale target.
-            if abs(forward_offset) > 1e-4:
-                target_pos = robot.position + forward_offset
-                # Compute world-frame marker position
-                rx, ry, _, fwd_x, fwd_y = robot.get_world_pose_2d()
-                marker_world = [rx + forward_offset * fwd_x,
-                                ry + forward_offset * fwd_y]
-            elif abs(yaw_cmd) > 1e-4:
-                target_pos = robot.position
-                rx, ry, _, _, _ = robot.get_world_pose_2d()
-                marker_world = [rx, ry]
-
-            robot.controller.set_target_position(target_pos)
-
-            # --- Update visual marker ---
-            pt_from = [marker_world[0], marker_world[1], 0.0]
-            pt_to   = [marker_world[0], marker_world[1], marker_h]
+        # --- Update visual marker ---
+        if inp.connected:
+            pt_from = [marker.x, marker.y, 0.0]
+            pt_to   = [marker.x, marker.y, marker_h]
             if marker_id >= 0:
                 marker_id = p.addUserDebugLine(
                     pt_from, pt_to, marker_color, lineWidth=3,
