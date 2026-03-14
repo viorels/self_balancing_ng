@@ -24,12 +24,11 @@ import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
-from enum import Enum
-import numpy as np
 import pybullet as p
 import pybullet_data
 
 from robot_state import DriveMode, RobotState, ControlOutput, ControlGoals, Telemetry
+from config import load_config
 
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
@@ -38,226 +37,20 @@ from input.gamepad import Gamepad
 from input.input_manager import InputManager
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain
-
-
-# ============================================================================
-# CONFIGURATION - All parameters are easily tunable here
-# ============================================================================
-
-CONFIG = {
-    # Simulation parameters
-    'GRAVITY': -9.81,
-    'TIMESTEP': 1.0 / 500.0,      # 500 Hz physics (required for 2WD triplet stability)
-    'SIM_DURATION': 60.0,
-    'GROUND_FRICTION': 1.0,
-
-    # Terrain: 'flat', 'heightfield', or 'box_stairs'
-    'TERRAIN': 'flat',
-
-    # URDF model path (relative to this script)
-    'URDF_PATH': 'tribot_description/urdf/tribot.urdf',
-
-    # Robot geometry (must match the URDF/STL)
-    'WHEEL_RADIUS': 0.058,         # Small drive wheel radius (m) — measured from STL AABB
-    'TRIPLET_RADIUS': 0.12,        # Circumradius of the wheel triangle (m)
-
-    # Initial conditions
-    'INITIAL_PITCH': -0.03,        # rad (~1.7°) — slight initial tilt
-    'INITIAL_HEIGHT': 0.118,       # m — c_body origin above ground (4WD: triplet_Z_offset + wheel_R = 0.060125 + 0.058)
-    'INITIAL_TRIPLET_ANGLE': 0.0,  # rad (0°) — 4WD mode: two wheels down per side (flat triangle base on ground)
-
-    # Inner PID gains (pitch → motor torque)
-    'PID_KP': 15.0,
-    'PID_KD': 0.8,
-    'PID_KI': 3.0,
-
-    # Outer PID gains (position → target pitch angle)
-    'POS_PID_KP': 0.15,
-    'POS_PID_KD': 0.03,
-    'POS_PID_KI': 0.01,
-    'POS_PID_MAX_PITCH': 0.15,     # rad (~8.6°) max lean angle from outer loop
-    'POS_PID_RATE_HZ': 50,
-
-    # Motor / actuator limits
-    'MAX_TORQUE': 1.0,             # Nm (stall torque per motor, one motor per side)
-
-    # === REALISM PARAMETERS ===
-
-    # Motor model
-    'MOTOR_TAU': 0.003,            # Electrical time constant (s)
-    'MOTOR_BACK_EMF_K': 0.005,     # Back-EMF constant (Nm per rad/s)
-    'MOTOR_COGGING_AMPLITUDE': 0.005,  # Nm
-    'MOTOR_COGGING_POLES': 14,
-    'MOTOR_DEADBAND': 0.01,        # Nm
-    'MOTOR_TORQUE_NOISE_STD': 0.005,   # Nm
-
-    # Control loop
-    'CONTROL_RATE_HZ': 200,        # PD tracking loop rate (Hz) — independent of physics
-    'CONTROL_JITTER_STD': 0.0005,  # Timing jitter std dev (s)
-    'SENSOR_TO_ACTUATOR_DELAY_STEPS': 0,
-
-    # IMU sensor model
-    'ADD_SENSOR_NOISE': True,
-    'IMU_ANGLE_NOISE_STD': 0.003,
-    'IMU_GYRO_NOISE_STD': 0.01,
-    'IMU_GYRO_DRIFT_RATE': 0.001,
-    'IMU_ACCEL_VIB_NOISE_STD': 0.15,
-    'IMU_SAMPLE_RATE_HZ': 500,
-    'IMU_QUANTIZATION_BITS': 16,
-    'IMU_ACCEL_RANGE_G': 2,
-    'IMU_GYRO_RANGE_DPS': 500,
-
-    # Complementary filter
-    'COMP_FILTER_ALPHA': 0.02,
-
-    # Mechanical imperfections
-    'WHEEL_IMBALANCE_TORQUE': 0.002,   # Nm, periodic torque from wheel imbalance
-
-    # Yaw damping gain (differential torque to oppose yaw rotation)
-    'YAW_DAMPING_K': 0.5,
-
-    # Wheel contact properties
-    'WHEEL_FRICTION': 1.2,
-    'TRIPLET_FRICTION': 0.3,           # Low friction on triplet hubs (shouldn't contact ground much)
-
-    # Virtual belt stiffness (gear constraint max force)
-    'BELT_MAX_FORCE': 100.0,
-
-    # Triplet hub joint damping (simulates motor back-EMF / bearing friction)
-    'TRIPLET_JOINT_DAMPING': 0.05,     # Nm·s/rad
-
-    # === CONTROLLER SELECTION ===
-    # 'lqr', 'pid', or 'mpc'
-    'CONTROLLER': 'lqr',
-
-    # === MPC HYBRID PARAMETERS ===
-    'MPC_RATE_HZ': 30,                 # MPC solve rate (Hz) — realistic for ESP32-S3
-    'MPC_HORIZON': 10,                 # Prediction horizon N (DARE terminal cost handles the rest)
-    'MPC_SIMULATED_SOLVE_MS': 20.0,    # Artificial delay per solve (ms) — realistic for ESP32-S3 SIMD
-    # Q weights: [pitch, pitch_rate, tripL, tripR, tripL_rate, tripR_rate, fwd_pos, fwd_vel]
-    'MPC_Q_DIAG': [50.0, 5.0, 40.0, 40.0, 5.0, 5.0, 12.0, 5.0],
-    # R weights: [tau_tripL, tau_tripR, tau_driveL, tau_driveR]
-    'MPC_R_DIAG': [1.0, 1.0, 8.0, 8.0],
-    'MPC_Q_TERMINAL_SCALE': 3.0,
-    'MPC_TRIPLET_TORQUE_MAX': 5.0,     # Nm — larger triplet motor for 2WD balance
-    'MPC_TRIPLET_INERTIA': 0.00238,    # kg·m² (0.5 * 0.33 * 0.12²)
-    # PD tracking gains: [trip_L, trip_R, drive_L, drive_R]
-    'MPC_PD_KP': [10.0, 10.0, 3.0, 3.0],
-    'MPC_PD_KD': [1.0, 1.0, 0.3, 0.3],
-    'MPC_PITCH_PD_CROSS_DRIVE': 8.0,
-    'MPC_PITCH_RATE_PD_CROSS_DRIVE': 0.5,
-
-    # === ZMP / DCM TRIPLET FLIP TRIGGER (physics-based) ===
-    # Flip timing
-    'ZMP_T_FLIP_NOMINAL': 0.18,    # s  — observed 120° rotation time (physics min ~63 ms)
-    'ZMP_T_FLIP_MARGIN':  0.05,    # s  — extra margin for motor lag, belt compliance
-    'ZMP_T_SETTLE':       0.40,    # s  — post-flip settling window
-    'ZMP_TRIP_TOL':       0.15,    # rad — "arrived at new angle" tolerance (~8.6°)
-    # MPC cost reshaping during flip
-    'ZMP_FLIP_Q_TRIP':  120.0,
-    'ZMP_FLIP_Q_PITCH': 120.0,
-    'ZMP_FLIP_R_TRIP':    0.05,
-    # Control-authority model — fraction η of max drive torque the controller
-    # can muster during a fall.  Lower = more conservative (fires earlier).
-    # 0.0 = free-fall (old behaviour), 1.0 = full authority (fires very late).
-    # Empirical: MPC delivers ~50-70 % during impact, but 20 % is conservative
-    # because motor lag & battery sag eat into the usable authority.
-    'ZMP_CTRL_AUTHORITY': 0.3,
-    # Mechanical crash limit (rad).  Beyond this angle, recovery is impossible
-    # regardless of torque.  45° is a good default for an inverted pendulum.
-    'ZMP_THETA_CRASH': 0.785,       # rad (≈45°)
-    # Stair-step height (m).  If 0, flat-ground assumptions are used.
-    # Non-zero reduces the required triplet rotation and landing ω₀.
-    'ZMP_STAIR_HEIGHT': 0.1,
-    # Secondary pitch-rate gate — filters out slow balance sway.
-    'ZMP_MIN_FALL_RATE_DEG_S': 15.0,
-    # Post-flip cooldown (s) — block re-arming after a flip completes.
-    'ZMP_FLIP_COOLDOWN': 0.8,
-    # Early-landing exit from FLIPPING
-    'ZMP_PITCH_RECOVER_THRESHOLD': 0.12,   # rad (~7°)
-    'ZMP_FLIP_MIN_ROTATION':       0.698,  # rad (40°)
-
-    # === LQR PARAMETERS ===
-    # Linearised plant physical constants (derived from URDF via PyBullet)
-    'LQR_BODY_MASS': 2.7167,       # kg — c_body (from URDF mesh + mass)
-    'LQR_WHEEL_MASS': 0.6698,      # kg — 2 triplets + 6 wheels
-    'LQR_COG_HEIGHT': 0.247,       # m  — c_body CoG z above wheel axis
-    'LQR_BODY_INERTIA': 0.056436,  # kg·m² — c_body Iyy (PyBullet-computed)
-
-    # Q diagonal: [position, velocity, pitch, pitch_rate]
-    'LQR_Q_DIAG': [12.0, 4.0, 55.0, 4.0],
-    # R: torque cost (scalar) — higher = less aggressive, more robust to
-    # unmodeled motor dynamics (lag, deadband, back-EMF)
-    'LQR_R': 2.0,
-
-    # === GAIN-SCHEDULED LQR (aggressive mode while far from target) ===
-    # When |pos_error| > threshold, switch to aggressive Q/R for fast tracking.
-    # Hysteresis band prevents chattering around the boundary.
-    'LQR_AGGRESSIVE_Q_DIAG': [40.0, 8.0, 35.0, 3.0],   # lean harder, chase faster
-    'LQR_AGGRESSIVE_R': 1.0,    # should be half of LQR_R or less for a noticeable effect
-    'LQR_SWITCH_THRESHOLD': 0.20,     # m — switch to aggressive when |error| > this
-    'LQR_SWITCH_HYSTERESIS': 0.05,    # m — switch back when |error| < threshold - hyst
-
-    # === TRIPLET LEAN PID CONTROLLER ===
-    # Holds the triplet hub at INITIAL_TRIPLET_ANGLE using torque control.
-    'TRIPLET_LEAN_KP': 8.0,     # Nm/rad  — proportional gain
-    'TRIPLET_LEAN_KD': 0.4,     # Nm·s/rad — derivative (damping) gain
-    # Gravity compensation feedforward (per side):
-    #   τ_ff = K · sin(body_pitch + triplet_angle)
-    # 4WD: K ≈ (m_total/2)·g·z_contact = 1.70·9.81·0.118 ≈ 1.97 Nm
-    #   Two grounded wheels create asymmetric normal forces when body pitches;
-    #   the net torque about the hub grows with sin(θ).  "Bilateral support"
-    #   cancels the cos(θ) component, leaving the sin(θ) term.
-    # 2WD: K ≈ m_trip·g·R = 0.335·9.81·0.12 ≈ 0.39 Nm
-    #   Single grounded wheel, restoring torque from contact offset.
-    'TRIPLET_GRAV_COMP_4WD': 2.0,  # Nm — gravity comp gain (per-side, 4WD)
-    'TRIPLET_GRAV_COMP_2WD': 2.0,  # Nm — gravity comp gain (per-side, 2WD)
-
-    # Lean compensation geometry (sine theorem):
-    #   β = α + arcsin((h/l) sin α)  where
-    #     α = body lean angle (rad, from vertical)
-    #     h = distance from triplet hub to body CoG (m)
-    #     l = triplet foot length (hub to wheel contact, m)
-    # Valid for |α| < arcsin(l/h) ≈ 29°.
-    # 4WD uses a simpler linear scale (small lean corrections).
-    'TRIPLET_4WD_LEAN_SCALE': 1.0 / 1.7,  # ≈ 0.59 (linear approx, 4WD only)
-    'TRIPLET_2WD_COG_DIST': 0.19,        # m — h: hub-to-CoG (whole robot, lower than c_body alone)
-    'TRIPLET_2WD_FOOT_LENGTH': 0.12,      # m — l: hub-to-wheel distance
-
-    # Nonlinear triplet balance assist (dead-zoned quadratic, rate-gated)
-    'TRIPLET_ASSIST_GAIN': 4.0,       # Nm/rad² — quadratic gain beyond deadzone
-    'TRIPLET_ASSIST_DEADZONE': 0.15,  # rad (~8.6°) — no assist below this pitch
-    'TRIPLET_ASSIST_MAX': 3.0,        # Nm — clamp (triplet motor limit is 5 Nm)
-    'TRIPLET_ASSIST_TAU': 0.1,        # s — EMA time constant for assist smoothing (~25 Hz cutoff)
-
-    # === GAMEPAD ===
-    'GAMEPAD_DEVICE': '/dev/input/js0',
-    'GAMEPAD_DEADZONE': 0.08,
-    'GAMEPAD_SPEED_AXIS': 4,        # Right stick Y
-    'GAMEPAD_YAW_AXIS': 3,          # Right stick X
-    'GAMEPAD_LEAN_AXIS': 1,         # Left stick Y  (push up = lean forward)
-    'GAMEPAD_MAX_DISTANCE': 1.0,    # m max target distance in front of robot
-    'GAMEPAD_MAX_YAW_RATE': 2.0,    # rad/s max yaw rate
-    'GAMEPAD_MAX_LEAN': math.radians(30), # max intentional lean angle
-    'GAMEPAD_2WD_BUTTON': 4,         # LB (left bumper) on F710 (XInput)
-    'TARGET_MARKER_HEIGHT': 0.3,    # m height of the visual target marker
-
-    # === MODE SWITCH (4WD ↔ 2WD) ===
-    'TRIPLET_2WD_ANGLE': math.pi / 3,  # 60° target for 2WD mode
-}
-
-
-# ============================================================================
-# Extracted modules (Step 2 — same classes, moved to own files)
-# ============================================================================
-
-from motor_model import BrushlessMotorModel              # noqa: E402
-from imu_model import IMUSensorModel                     # noqa: E402
-from triplet_controller import (                         # noqa: E402
+from motor_model import BrushlessMotorModel
+from imu_model import IMUSensorModel
+from triplet_controller import (
     TripletController,
     compute_triplet_from_pitch,
     compute_pitch_from_triplet,
 )
+
+
+# ============================================================================
+# CONFIGURATION — typed dataclass, dict-like backward compat via shim
+# ============================================================================
+
+CONFIG = load_config()
 
 
 # ============================================================================
