@@ -370,6 +370,10 @@ class TribotBalanceBot:
 
         self.lean_offset_ema = 0.0
 
+        # Sensor state (populated by read_sensors() on each tick)
+        self.state = RobotState(drive_mode=self.drive_mode,
+                                triplet_base_angle=self.triplet_base_angle)
+
     # ----------------------------------------------------------------
     # Robot setup
     # ----------------------------------------------------------------
@@ -539,19 +543,25 @@ class TribotBalanceBot:
         return -pos[0]
 
     # ----------------------------------------------------------------
-    # Control update
+    # Sensor pipeline
     # ----------------------------------------------------------------
 
-    def update(self, sim_time, dt):
+    def read_sensors(self, sim_time, dt):
         """
-        Update sensor reading, PID control, and motor output.
-        Called every physics timestep; PID only runs at CONTROL_RATE_HZ.
+        Read all sensors and return a populated RobotState.
+
+        This method is the single source of truth for measured / estimated
+        quantities. Controllers and the telemetry loop consume the returned
+        RobotState rather than reaching into PyBullet directly.
         """
-        # --- Read true state and pass through IMU model ---
+        # --- Ground truth from physics ---
         true_pitch, true_pitch_rate = self._get_true_state()
+
+        # --- IMU-fused measurements ---
         measured_pitch, measured_pitch_rate = self.imu.read(
             true_pitch, true_pitch_rate, sim_time, dt
         )
+        # Keep legacy attributes in sync (used by triplet PD, logging)
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
@@ -570,18 +580,60 @@ class TribotBalanceBot:
         fwd_vel = lin_vel[0] * body_fwd_x + lin_vel[1] * body_fwd_y
         self.position += fwd_vel * dt
 
-        # --- Triplet encoders → controller (for MPC) ---
+        # --- Triplet encoders ---
         lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
         rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
+
+        # --- Wheel velocities (one representative per side, belt-coupled) ---
+        wheel_vel_L = p.getJointState(self.body_id, self.l_wheel_joints[0])[1]
+        wheel_vel_R = p.getJointState(self.body_id, self.r_wheel_joints[0])[1]
+
+        state = RobotState(
+            sim_time=sim_time,
+            dt=dt,
+            pitch=measured_pitch,
+            pitch_rate=measured_pitch_rate,
+            yaw_rate=yaw_rate,
+            true_pitch=true_pitch,
+            true_pitch_rate=true_pitch_rate,
+            position=self.position,
+            forward_velocity=fwd_vel,
+            triplet_angle_L=lt_state[0],
+            triplet_angle_R=rt_state[0],
+            triplet_rate_L=lt_state[1],
+            triplet_rate_R=rt_state[1],
+            wheel_velocity_L=wheel_vel_L,
+            wheel_velocity_R=wheel_vel_R,
+            drive_mode=self.drive_mode,
+            triplet_base_angle=self.triplet_base_angle,
+        )
+        self.state = state
+        return state
+
+    # ----------------------------------------------------------------
+    # Control update
+    # ----------------------------------------------------------------
+
+    def update(self, sim_time, dt):
+        """
+        Run one control + actuation cycle.
+
+        Reads sensors via read_sensors(), feeds the controller, computes
+        triplet commands, and applies motor torques.
+        Called every physics timestep; controller only runs at CONTROL_RATE_HZ.
+        """
+        s = self.read_sensors(sim_time, dt)
+
+        # --- Feed triplet state to controller (for MPC) ---
         self.controller.set_triplet_state(
-            lt_state[0], rt_state[0],   # angles
-            lt_state[1], rt_state[1],   # rates
+            s.triplet_angle_L, s.triplet_angle_R,
+            s.triplet_rate_L, s.triplet_rate_R,
         )
 
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
-            measured_pitch, measured_pitch_rate,
-            self.position, yaw_rate, sim_time, dt
+            s.pitch, s.pitch_rate,
+            s.position, s.yaw_rate, sim_time, dt
         )
 
         # Triplet hub commands:
@@ -617,11 +669,11 @@ class TribotBalanceBot:
             self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
 
             triplet_cmd_L = self.triplet_ctrl_L.update(
-                lt_state[0], lt_state[1], self.pitch_angle,
-                body_pitch_rate=self.pitch_rate, dt=dt)
+                s.triplet_angle_L, s.triplet_rate_L, s.pitch,
+                body_pitch_rate=s.pitch_rate, dt=dt)
             triplet_cmd_R = self.triplet_ctrl_R.update(
-                rt_state[0], rt_state[1], self.pitch_angle,
-                body_pitch_rate=self.pitch_rate, dt=dt)
+                s.triplet_angle_R, s.triplet_rate_R, s.pitch,
+                body_pitch_rate=s.pitch_rate, dt=dt)
 
         # --- Apply motor torque through motor models ---
         # The motor stator is mounted on the BODY, driving the wheel shaft
@@ -633,13 +685,11 @@ class TribotBalanceBot:
         #
         # Left motor (+yaw_correction), Right motor (−yaw_correction)
         side_configs = [
-            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L),
-            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R),
+            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L, s.wheel_velocity_L),
+            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R, s.wheel_velocity_R),
         ]
 
-        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd in side_configs:
-            # Representative wheel velocity (belt-coupled, all same)
-            wheel_vel = p.getJointState(self.body_id, wheel_joints[0])[1]
+        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd, wheel_vel in side_configs:
 
             # Motor produces total torque for this side
             motor_torque = self.motors[motor_idx].update(
@@ -904,13 +954,13 @@ def run_simulation():
 
         # --- Stream signals to PlotJuggler ---
         ctrl = robot.controller
-        true_pitch, true_pitch_rate = robot._get_true_state()
+        s = robot.state
         ctrl_telem = ctrl.get_telemetry()
         pj.send({
             "timestamp": sim_time,
             # True state (not from controller — for reference only)
-            "true_pitch": true_pitch,
-            "true_pitch_rate": true_pitch_rate,
+            "true_pitch": s.true_pitch,
+            "true_pitch_rate": s.true_pitch_rate,
             # Actuator outputs
             "torque_L_actual": float(robot.actual_torques[0]),
             "torque_R_actual": float(robot.actual_torques[1]),
@@ -920,9 +970,17 @@ def run_simulation():
             "triplet_grav_comp_L": float(robot.triplet_ctrl_L.last_grav_comp),
             "triplet_grav_comp_R": float(robot.triplet_ctrl_R.last_grav_comp),
             # Drive mode (0=4WD, 1=2WD)
-            "drive_mode": float(robot.drive_mode == DriveMode.TWO_WD),
-            # Robot state
-            "position": float(robot.position),
+            "drive_mode": float(s.drive_mode == DriveMode.TWO_WD),
+            # Robot state from sensor pipeline
+            "position": s.position,
+            "forward_velocity": s.forward_velocity,
+            "pitch": s.pitch,
+            "pitch_rate": s.pitch_rate,
+            "yaw_rate": s.yaw_rate,
+            "triplet_angle_L": s.triplet_angle_L,
+            "triplet_angle_R": s.triplet_angle_R,
+            "wheel_velocity_L": s.wheel_velocity_L,
+            "wheel_velocity_R": s.wheel_velocity_R,
             # All controller-specific signals (prefixed by controller type)
             **{f"ctrl/{k}": v for k, v in ctrl_telem.items()},
         })
