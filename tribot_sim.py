@@ -128,7 +128,7 @@ class TribotBalanceBot:
         self._setup_belt_constraints()
 
         # Balance controller
-        ctrl_type = config.get('CONTROLLER', 'lqr').lower()
+        ctrl_type = config.sim.controller.lower()
         if ctrl_type == 'mpc':
             self.controller = MPCHybridController(config)
         elif ctrl_type == 'lqr':
@@ -145,13 +145,13 @@ class TribotBalanceBot:
 
         # Drive mode: '4wd' (two wheels/side) or '2wd' (one wheel/side)
         self.drive_mode = DriveMode.FOUR_WD
-        self.triplet_base_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        self.triplet_base_angle = config.sim.initial_triplet_angle
 
         # IMU sensor model
         self.imu = IMUSensorModel(config)
 
         # Estimated wheel radius (may be overridden from AABB after loading)
-        self.wheel_radius = config['WHEEL_RADIUS']
+        self.wheel_radius = config.robot.wheel_radius
 
         # Current state for logging
         # NOTE: position is accumulated by integrating forward velocity
@@ -174,7 +174,7 @@ class TribotBalanceBot:
 
     def _set_initial_pose(self):
         """Set initial triplet angles (0° = 4WD, 60° = 2WD)."""
-        trip_angle = self.cfg.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        trip_angle = self.cfg.sim.initial_triplet_angle
         if abs(trip_angle) > 1e-6:
             p.resetJointState(self.body_id, self.l_triplet_joint, trip_angle, 0.0)
             p.resetJointState(self.body_id, self.r_triplet_joint, trip_angle, 0.0)
@@ -184,15 +184,15 @@ class TribotBalanceBot:
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        urdf_path = os.path.join(script_dir, self.cfg['URDF_PATH'])
+        urdf_path = os.path.join(script_dir, self.cfg.sim.urdf_path)
 
         temp_urdf = preprocess_urdf(urdf_path)
         try:
             self.body_id = p.loadURDF(
                 temp_urdf,
-                basePosition=[0, 0, self.cfg['INITIAL_HEIGHT']],
+                basePosition=[0, 0, self.cfg.sim.initial_height],
                 baseOrientation=p.getQuaternionFromEuler(
-                    [0, self.cfg['INITIAL_PITCH'], 0]
+                    [0, self.cfg.sim.initial_pitch, 0]
                 ),
                 useFixedBase=False,
                 # Do NOT use URDF_USE_INERTIA_FROM_FILE — the CAD-exported
@@ -259,10 +259,10 @@ class TribotBalanceBot:
                          angularDamping=0.05)
 
         # Triplet hubs: low friction + joint damping (simulates motor back-EMF)
-        trip_damping = self.cfg.get('TRIPLET_JOINT_DAMPING', 0.05)
+        trip_damping = self.cfg.robot.triplet_joint_damping
         for tj in [self.l_triplet_joint, self.r_triplet_joint]:
             p.changeDynamics(self.body_id, tj,
-                             lateralFriction=self.cfg['TRIPLET_FRICTION'],
+                             lateralFriction=self.cfg.robot.triplet_friction,
                              linearDamping=0.0,
                              angularDamping=0.0,
                              jointDamping=trip_damping)
@@ -270,7 +270,7 @@ class TribotBalanceBot:
         # Drive wheels: high friction for traction
         for wj in self.l_wheel_joints + self.r_wheel_joints:
             p.changeDynamics(self.body_id, wj,
-                             lateralFriction=self.cfg['WHEEL_FRICTION'],
+                             lateralFriction=self.cfg.robot.wheel_friction,
                              spinningFriction=0.01,
                              rollingFriction=0.001,
                              linearDamping=0.0,
@@ -296,7 +296,7 @@ class TribotBalanceBot:
                 # gearRatio=-1 → same direction rotation (child = -ratio * parent,
                 # and the constraint eq is ratio*q_parent + q_child = 0)
                 p.changeConstraint(c, gearRatio=-1,
-                                   maxForce=self.cfg['BELT_MAX_FORCE'])
+                                   maxForce=self.cfg.robot.belt_max_force)
                 self.belt_constraints.append(c)
 
         print(f"  Belt constraints: {len(self.belt_constraints)} "
@@ -451,10 +451,10 @@ class TribotBalanceBot:
             lean_offset = self.controller.desired_lean
             alpha = self.controller.target_pitch   # body lean from vertical
             if self.drive_mode == DriveMode.TWO_WD:
-                beta = compute_triplet_from_pitch(alpha, h=self.cfg.get('TRIPLET_2WD_COG_DIST'))
+                beta = compute_triplet_from_pitch(alpha, h=self.cfg.triplet.cog_dist_2wd)
                 lean_comp = -beta # + lean_offset/2 # feed in some of the desired lean as an offset
             else:
-                lean_scale = self.cfg.get('TRIPLET_4WD_LEAN_SCALE', 1.0 / 1.7)
+                lean_scale = self.cfg.triplet.lean_scale_4wd
                 lean_comp = -alpha * lean_scale - lean_offset
 
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
@@ -512,7 +512,7 @@ class TribotBalanceBot:
             for wj in wheel_joints:
                 # Add wheel imbalance (per-wheel periodic disturbance)
                 wheel_pos = p.getJointState(self.body_id, wj)[0]
-                imbalance = self.cfg['WHEEL_IMBALANCE_TORQUE'] * math.sin(wheel_pos)
+                imbalance = self.cfg.robot.wheel_imbalance_torque * math.sin(wheel_pos)
 
                 p.setJointMotorControl2(
                     self.body_id, wj,
@@ -571,7 +571,7 @@ class TribotBalanceBot:
         angle so the transition is always a short (~35°) rotation rather
         than a violent 120° flip.
         """
-        angle_2wd = self.cfg.get('TRIPLET_2WD_ANGLE', math.pi / 3)
+        angle_2wd = self.cfg.robot.triplet_2wd_angle
         if self.drive_mode == DriveMode.FOUR_WD:
             self.drive_mode = DriveMode.TWO_WD
             # Pick sign of 60° closest to current triplet angle
@@ -609,8 +609,8 @@ def run_simulation():
     physics_client = p.connect(p.GUI, options="--width=1920 --height=1080 --maximized")
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-    p.setGravity(0, 0, CONFIG['GRAVITY'])
-    p.setPhysicsEngineParameter(fixedTimeStep=CONFIG['TIMESTEP'], numSubSteps=1)
+    p.setGravity(0, 0, CONFIG.sim.gravity)
+    p.setPhysicsEngineParameter(fixedTimeStep=CONFIG.sim.timestep, numSubSteps=1)
 
     # Terrain
     ground_ids = create_terrain(CONFIG)
@@ -628,47 +628,47 @@ def run_simulation():
     # Print configuration summary
     total_mass = sum(p.getDynamicsInfo(robot.body_id, i)[0]
                      for i in range(-1, p.getNumJoints(robot.body_id)))
-    ctrl_type = CONFIG.get('CONTROLLER', 'lqr').upper()
+    ctrl_type = CONFIG.sim.controller.upper()
     print(f"\nRobot total mass: {total_mass:.3f} kg")
     print(f"Controller: {ctrl_type}")
     if ctrl_type == 'PID':
-        print(f"  Inner PID (pitch\u2192torque): Kp={CONFIG['PID_KP']}, "
-              f"Ki={CONFIG['PID_KI']}, Kd={CONFIG['PID_KD']}")
-        print(f"  Outer PID (pos\u2192pitch):   Kp={CONFIG['POS_PID_KP']}, "
-              f"Ki={CONFIG['POS_PID_KI']}, Kd={CONFIG['POS_PID_KD']}, "
-              f"max_pitch={math.degrees(CONFIG['POS_PID_MAX_PITCH']):.1f}\u00b0")
+        print(f"  Inner PID (pitch\u2192torque): Kp={CONFIG.pid.kp}, "
+              f"Ki={CONFIG.pid.ki}, Kd={CONFIG.pid.kd}")
+        print(f"  Outer PID (pos\u2192pitch):   Kp={CONFIG.pid.pos_kp}, "
+              f"Ki={CONFIG.pid.pos_ki}, Kd={CONFIG.pid.pos_kd}, "
+              f"max_pitch={math.degrees(CONFIG.pid.pos_max_pitch):.1f}\u00b0")
     elif ctrl_type == 'MPC':
-        print(f"  MPC rate: {CONFIG['MPC_RATE_HZ']}Hz, N={CONFIG['MPC_HORIZON']}, "
-              f"sim_solve={CONFIG['MPC_SIMULATED_SOLVE_MS']}ms")
-        print(f"  MPC Q_diag={CONFIG['MPC_Q_DIAG']}")
-        print(f"  MPC R_diag={CONFIG['MPC_R_DIAG']}")
-        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
-              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
-              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
-              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
+        print(f"  MPC rate: {CONFIG.mpc.rate_hz}Hz, N={CONFIG.mpc.horizon}, "
+              f"sim_solve={CONFIG.mpc.simulated_solve_ms}ms")
+        print(f"  MPC Q_diag={CONFIG.mpc.q_diag}")
+        print(f"  MPC R_diag={CONFIG.mpc.r_diag}")
+        print(f"  Plant: m_body={CONFIG.plant.body_mass}kg, "
+              f"m_wheel={CONFIG.plant.wheel_mass}kg, "
+              f"l_cog={CONFIG.plant.cog_height}m, "
+              f"I_body={CONFIG.plant.body_inertia}kg\u00b7m\u00b2")
     else:
-        print(f"  Q_diag={CONFIG['LQR_Q_DIAG']}, R={CONFIG['LQR_R']}")
-        print(f"  Plant: m_body={CONFIG['LQR_BODY_MASS']}kg, "
-              f"m_wheel={CONFIG['LQR_WHEEL_MASS']}kg, "
-              f"l_cog={CONFIG['LQR_COG_HEIGHT']}m, "
-              f"I_body={CONFIG['LQR_BODY_INERTIA']}kg\u00b7m\u00b2")
-    print(f"Motor: τ={CONFIG['MOTOR_TAU']*1000:.0f}ms lag, "
-          f"back-EMF K={CONFIG['MOTOR_BACK_EMF_K']}, "
-          f"deadband={CONFIG['MOTOR_DEADBAND']}Nm")
-    print(f"IMU: complementary filter α={CONFIG['COMP_FILTER_ALPHA']}, "
-          f"gyro drift={CONFIG['IMU_GYRO_DRIFT_RATE']} rad/s²")
-    print(f"Control: {CONFIG['CONTROL_RATE_HZ']}Hz, "
-          f"{CONFIG['SENSOR_TO_ACTUATOR_DELAY_STEPS']} step pipeline delay")
-    print(f"Initial pitch: {math.degrees(CONFIG['INITIAL_PITCH']):.1f}°  "
-          f"height: {CONFIG['INITIAL_HEIGHT']:.3f}m")
+        print(f"  Q_diag={CONFIG.lqr.q_diag}, R={CONFIG.lqr.r}")
+        print(f"  Plant: m_body={CONFIG.plant.body_mass}kg, "
+              f"m_wheel={CONFIG.plant.wheel_mass}kg, "
+              f"l_cog={CONFIG.plant.cog_height}m, "
+              f"I_body={CONFIG.plant.body_inertia}kg\u00b7m\u00b2")
+    print(f"Motor: τ={CONFIG.motor.tau*1000:.0f}ms lag, "
+          f"back-EMF K={CONFIG.motor.back_emf_k}, "
+          f"deadband={CONFIG.motor.deadband}Nm")
+    print(f"IMU: complementary filter α={CONFIG.imu.comp_filter_alpha}, "
+          f"gyro drift={CONFIG.imu.gyro_drift_rate} rad/s²")
+    print(f"Control: {CONFIG.control.control_rate_hz}Hz, "
+          f"{CONFIG.control.sensor_to_actuator_delay_steps} step pipeline delay")
+    print(f"Initial pitch: {math.degrees(CONFIG.sim.initial_pitch):.1f}°  "
+          f"height: {CONFIG.sim.initial_height:.3f}m")
     print("-" * 70)
 
     # Gamepad + InputManager
-    gp = Gamepad(CONFIG['GAMEPAD_DEVICE'], deadzone=CONFIG['GAMEPAD_DEADZONE'])
+    gp = Gamepad(CONFIG.gamepad.device, deadzone=CONFIG.gamepad.deadzone)
     inp = InputManager(gp, CONFIG)
     if gp.connected:
-        print(f"Gamepad: right stick Y (axis {CONFIG['GAMEPAD_SPEED_AXIS']}) = distance, "
-              f"X (axis {CONFIG['GAMEPAD_YAW_AXIS']}) = yaw")
+        print(f"Gamepad: right stick Y (axis {CONFIG.gamepad.speed_axis}) = distance, "
+              f"X (axis {CONFIG.gamepad.yaw_axis}) = yaw")
 
     # PlotJuggler real-time streaming
     pj = PlotJugglerStreamer()   # UDP → 127.0.0.1:9870
@@ -677,13 +677,13 @@ def run_simulation():
     # Visual target marker (vertical debug line)
     marker_id = -1
     marker_color = [0.0, 1.0, 0.0]   # green
-    marker_h = CONFIG['TARGET_MARKER_HEIGHT']
+    marker_h = CONFIG.gamepad.target_marker_height
 
     sim_time = 0.0
     log_interval = 0.1
     last_log_time = 0.0
 
-    while sim_time < CONFIG['SIM_DURATION']:
+    while sim_time < CONFIG.sim.sim_duration:
         # --- Input ---
         goals, mode_toggle, marker = inp.update(
             robot.position, robot.get_world_pose_2d()
@@ -706,9 +706,9 @@ def run_simulation():
                 marker_id = p.addUserDebugLine(
                     pt_from, pt_to, marker_color, lineWidth=3)
 
-        robot.update(sim_time, CONFIG['TIMESTEP'])
+        robot.update(sim_time, CONFIG.sim.timestep)
         p.stepSimulation()
-        sim_time += CONFIG['TIMESTEP']
+        sim_time += CONFIG.sim.timestep
 
         # --- Stream signals to PlotJuggler ---
         ctrl = robot.controller
@@ -766,7 +766,7 @@ def run_simulation():
             )
             last_log_time = sim_time
 
-        time.sleep(CONFIG['TIMESTEP'])
+        time.sleep(CONFIG.sim.timestep)
 
     # Final report
     print("-" * 70)

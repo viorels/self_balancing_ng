@@ -39,20 +39,20 @@ class InputManager:
         goals, toggle, marker = inp.update(robot_position, world_pose_2d)
     """
 
-    def __init__(self, gamepad, config: dict):
+    def __init__(self, gamepad, config):
         self.gp = gamepad
         self.cfg = config
 
         # Axis / button indices
-        self._speed_axis = config['GAMEPAD_SPEED_AXIS']
-        self._yaw_axis = config['GAMEPAD_YAW_AXIS']
-        self._lean_axis = config['GAMEPAD_LEAN_AXIS']
-        self._mode_button = config['GAMEPAD_2WD_BUTTON']
+        self._speed_axis = config.gamepad.speed_axis
+        self._yaw_axis = config.gamepad.yaw_axis
+        self._lean_axis = config.gamepad.lean_axis
+        self._mode_button = config.gamepad.mode_button
 
         # Scaling
-        self._max_distance = config['GAMEPAD_MAX_DISTANCE']
-        self._max_yaw_rate = config['GAMEPAD_MAX_YAW_RATE']
-        self._max_lean = config['GAMEPAD_MAX_LEAN']
+        self._max_distance = config.gamepad.max_distance
+        self._max_yaw_rate = config.gamepad.max_yaw_rate
+        self._max_lean = config.gamepad.max_lean
 
         # Rising-edge state for mode toggle
         self._mode_was_pressed = False

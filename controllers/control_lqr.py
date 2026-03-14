@@ -95,12 +95,12 @@ def build_state_space(config):
         BODY_INERTIA    – body pitch inertia about its CoG (kg·m²)
         WHEEL_RADIUS    – effective wheel radius (m)
     """
-    m_b = config['LQR_BODY_MASS']
-    m_w = config['LQR_WHEEL_MASS']
-    l   = config['LQR_COG_HEIGHT']
-    I_b = config['LQR_BODY_INERTIA']
-    r   = config['WHEEL_RADIUS']
-    g   = abs(config['GRAVITY'])
+    m_b = config.plant.body_mass
+    m_w = config.plant.wheel_mass
+    l   = config.plant.cog_height
+    I_b = config.plant.body_inertia
+    r   = config.robot.wheel_radius
+    g   = abs(config.sim.gravity)
 
     # Effective rotational inertia about the wheel contact point
     I_eff = I_b + m_b * l**2       # parallel-axis theorem
@@ -168,28 +168,23 @@ class LQRBalanceController(BalanceControllerBase):
 
         # Build linearised model and compute gain
         A, B = build_state_space(config)
-        Q = np.diag(config['LQR_Q_DIAG'])
-        R = np.array([[config['LQR_R']]])
+        Q = np.diag(config.lqr.q_diag)
+        R = np.array([[config.lqr.r]])
         self.K_normal = compute_lqr_gain(A, B, Q, R)
 
         print(f"  LQR gain K_normal    = [{', '.join(f'{k:.4f}' for k in self.K_normal[0])}]")
-        print(f"  LQR Q_diag = {config['LQR_Q_DIAG']},  R = {config['LQR_R']}")
+        print(f"  LQR Q_diag = {config.lqr.q_diag},  R = {config.lqr.r}")
 
         # --- Gain-scheduled aggressive mode ---
-        if 'LQR_AGGRESSIVE_Q_DIAG' in config:
-            Q_agg = np.diag(config['LQR_AGGRESSIVE_Q_DIAG'])
-            R_agg = np.array([[config['LQR_AGGRESSIVE_R']]])
-            self.K_aggressive = compute_lqr_gain(A, B, Q_agg, R_agg)
-            self.switch_threshold = config.get('LQR_SWITCH_THRESHOLD', 0.20)
-            self.switch_hysteresis = config.get('LQR_SWITCH_HYSTERESIS', 0.05)
-            print(f"  LQR gain K_aggressive= [{', '.join(f'{k:.4f}' for k in self.K_aggressive[0])}]")
-            print(f"  LQR Q_agg = {config['LQR_AGGRESSIVE_Q_DIAG']},  R_agg = {config['LQR_AGGRESSIVE_R']}")
-            print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
-                  f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
-        else:
-            self.K_aggressive = None
-            self.switch_threshold = 0.0
-            self.switch_hysteresis = 0.0
+        Q_agg = np.diag(config.lqr.aggressive_q_diag)
+        R_agg = np.array([[config.lqr.aggressive_r]])
+        self.K_aggressive = compute_lqr_gain(A, B, Q_agg, R_agg)
+        self.switch_threshold = config.lqr.switch_threshold
+        self.switch_hysteresis = config.lqr.switch_hysteresis
+        print(f"  LQR gain K_aggressive= [{', '.join(f'{k:.4f}' for k in self.K_aggressive[0])}]")
+        print(f"  LQR Q_agg = {config.lqr.aggressive_q_diag},  R_agg = {config.lqr.aggressive_r}")
+        print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
+              f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
 
         # Active gain (start in normal mode)
         self.K = self.K_normal
@@ -205,11 +200,11 @@ class LQRBalanceController(BalanceControllerBase):
         self.vel_filter_alpha = 0.1   # low-pass on velocity estimate
 
         # --- Control loop timing ---
-        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
+        self.control_period = 1.0 / config.control.control_rate_hz
         self.next_control_time = 0.0
 
         # --- Sensor-to-actuator delay buffer ---
-        delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
+        delay_steps = config.control.sensor_to_actuator_delay_steps
         self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
 
         # --- Exposed for logging ---
@@ -298,8 +293,8 @@ class LQRBalanceController(BalanceControllerBase):
         # Instead, update velocity only when the control loop fires.
 
         # --- LQR update at CONTROL_RATE_HZ ---
-        jitter = (np.random.normal(0, self.cfg['CONTROL_JITTER_STD'])
-                  if self.cfg.get('ADD_SENSOR_NOISE', False) else 0)
+        jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
+                  if self.cfg.imu.add_sensor_noise else 0)
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
@@ -350,17 +345,17 @@ class LQRBalanceController(BalanceControllerBase):
 
             # u = -K x  (total torque for both sides)
             u_raw = float(-self.K @ x)
-            u = np.clip(u_raw, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+            u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque
 
             # Yaw damping relative to setpoint
-            yaw_correction = self.cfg['YAW_DAMPING_K'] * (yaw_rate - self.yaw_rate_setpoint)
+            yaw_correction = self.cfg.control.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
             self.torque_delay_buffer.append((commanded_torque, yaw_correction))
 
         # === Pop delayed torque command ===
-        delay_depth = self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1
+        delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
         if len(self.torque_delay_buffer) > delay_depth:
             delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
         else:

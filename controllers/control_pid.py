@@ -40,14 +40,14 @@ class BalanceController(BalanceControllerBase):
         self.integral_pos_error = 0.0
 
         # --- Control loop timing ---
-        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
+        self.control_period = 1.0 / config.control.control_rate_hz
         self.next_control_time = 0.0
 
-        self.pos_control_period = 1.0 / config['POS_PID_RATE_HZ']
+        self.pos_control_period = 1.0 / config.pid.pos_rate_hz
         self.next_pos_control_time = 0.0
 
         # --- Sensor-to-actuator delay buffer ---
-        delay_steps = config['SENSOR_TO_ACTUATOR_DELAY_STEPS']
+        delay_steps = config.control.sensor_to_actuator_delay_steps
         self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
 
         # --- Last commanded torque (for logging) ---
@@ -105,49 +105,49 @@ class BalanceController(BalanceControllerBase):
             velocity = (position - self.prev_position) / self.pos_control_period
             self.prev_position = position
 
-            pos_p = self.cfg['POS_PID_KP'] * pos_error
-            pos_d = -self.cfg['POS_PID_KD'] * velocity
+            pos_p = self.cfg.pid.pos_kp * pos_error
+            pos_d = -self.cfg.pid.pos_kd * velocity
             self.integral_pos_error += pos_error * self.pos_control_period
             self.integral_pos_error = float(np.clip(
                 self.integral_pos_error, -1.0, 1.0))
-            pos_i = self.cfg['POS_PID_KI'] * self.integral_pos_error
+            pos_i = self.cfg.pid.pos_ki * self.integral_pos_error
 
             self.target_pitch = float(np.clip(
                 pos_p + pos_d + pos_i,
-                -self.cfg['POS_PID_MAX_PITCH'],
-                 self.cfg['POS_PID_MAX_PITCH']
+                -self.cfg.pid.pos_max_pitch,
+                 self.cfg.pid.pos_max_pitch
             ))
 
         # === Inner PID loop: pitch → torque (at CONTROL_RATE_HZ) ===
-        jitter = (np.random.normal(0, self.cfg['CONTROL_JITTER_STD'])
-                  if self.cfg.get('ADD_SENSOR_NOISE', False) else 0)
+        jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
+                  if self.cfg.imu.add_sensor_noise else 0)
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
 
             pitch_error = self.target_pitch - measured_pitch
-            p_term = self.cfg['PID_KP'] * pitch_error
-            d_term = self.cfg['PID_KD'] * (0.0 - measured_pitch_rate)
+            p_term = self.cfg.pid.kp * pitch_error
+            d_term = self.cfg.pid.kd * (0.0 - measured_pitch_rate)
             self.integral_pitch_error += pitch_error * self.control_period
             self.integral_pitch_error = float(np.clip(
                 self.integral_pitch_error, -0.5, 0.5))
-            i_term = self.cfg['PID_KI'] * self.integral_pitch_error
+            i_term = self.cfg.pid.ki * self.integral_pitch_error
 
             commanded_torque = p_term + d_term + i_term
             commanded_torque = float(np.clip(
                 commanded_torque,
-                -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE']
+                -self.cfg.motor.max_torque, self.cfg.motor.max_torque
             ))
             self.control_torque = commanded_torque
 
             # Yaw damping: oppose yaw rate relative to setpoint
-            yaw_correction = self.cfg['YAW_DAMPING_K'] * (yaw_rate - self.yaw_rate_setpoint)
+            yaw_correction = self.cfg.control.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
             # Push into delay buffer
             self.torque_delay_buffer.append((commanded_torque, yaw_correction))
 
         # === Pop delayed torque command ===
-        delay_depth = self.cfg['SENSOR_TO_ACTUATOR_DELAY_STEPS'] + 1
+        delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
         if len(self.torque_delay_buffer) > delay_depth:
             delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
         else:

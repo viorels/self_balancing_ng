@@ -97,20 +97,20 @@ class TripletController:
     """
 
     def __init__(self, config):
-        self.kp = config.get('TRIPLET_LEAN_KP', 8.0)
-        self.kd = config.get('TRIPLET_LEAN_KD', 0.4)
-        self.target_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
-        self.base_angle = config.get('INITIAL_TRIPLET_ANGLE', 0.0)  # equilibrium angle (set by sim loop)
+        self.kp = config.triplet.lean_kp
+        self.kd = config.triplet.lean_kd
+        self.target_angle = config.sim.initial_triplet_angle
+        self.base_angle = config.sim.initial_triplet_angle  # equilibrium angle (set by sim loop)
 
         # Gravity compensation gains (mode-dependent)
-        self.grav_comp_4wd = config.get('TRIPLET_GRAV_COMP_4WD', 2.0)
-        self.grav_comp_2wd = config.get('TRIPLET_GRAV_COMP_2WD', 0.4)
+        self.grav_comp_4wd = config.triplet.grav_comp_4wd
+        self.grav_comp_2wd = config.triplet.grav_comp_2wd
 
         # Nonlinear balance assist parameters
-        self.assist_gain = config.get('TRIPLET_ASSIST_GAIN', 2.0)        # Nm/rad²
-        self.assist_deadzone = config.get('TRIPLET_ASSIST_DEADZONE', 0.15)  # rad (~8.6°)
-        self.assist_max = config.get('TRIPLET_ASSIST_MAX', 3.0)           # Nm clamp
-        self.assist_tau = config.get('TRIPLET_ASSIST_TAU', 0.04)           # s EMA smoothing
+        self.assist_gain = config.triplet.assist_gain        # Nm/rad²
+        self.assist_deadzone = config.triplet.assist_deadzone  # rad (~8.6°)
+        self.assist_max = config.triplet.assist_max           # Nm clamp
+        self.assist_tau = config.triplet.assist_tau           # s EMA smoothing
         self.last_assist_force = 0.0  # filtered output (for telemetry and actuation)
         self.drive_mode = DriveMode.FOUR_WD  # assist disabled in 2WD (fights the triplet hold)
 

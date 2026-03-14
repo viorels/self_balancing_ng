@@ -24,7 +24,7 @@ class BrushlessMotorModel:
     def __init__(self, config):
         self.cfg = config
         self.actual_torque = 0.0
-        self.tau = config['MOTOR_TAU']
+        self.tau = config.motor.tau
 
     def update(self, commanded_torque, wheel_velocity, dt):
         """
@@ -40,24 +40,24 @@ class BrushlessMotorModel:
         torque = self.actual_torque
 
         # 2. Back-EMF
-        back_emf_loss = self.cfg['MOTOR_BACK_EMF_K'] * abs(wheel_velocity)
-        max_available = max(0.0, self.cfg['MAX_TORQUE'] - back_emf_loss)
+        back_emf_loss = self.cfg.motor.back_emf_k * abs(wheel_velocity)
+        max_available = max(0.0, self.cfg.motor.max_torque - back_emf_loss)
         torque = np.clip(torque, -max_available, max_available)
 
         # 3. Cogging torque
-        cogging = self.cfg['MOTOR_COGGING_AMPLITUDE'] * math.sin(
-            self.cfg['MOTOR_COGGING_POLES'] * wheel_velocity * dt * 100
+        cogging = self.cfg.motor.cogging_amplitude * math.sin(
+            self.cfg.motor.cogging_poles * wheel_velocity * dt * 100
         )
         torque += cogging
 
         # 4. Deadband
-        if abs(torque) < self.cfg['MOTOR_DEADBAND']:
+        if abs(torque) < self.cfg.motor.deadband:
             torque = 0.0
 
         # 5. Torque noise
-        torque += np.random.normal(0, self.cfg['MOTOR_TORQUE_NOISE_STD'])
+        torque += np.random.normal(0, self.cfg.motor.torque_noise_std)
 
         # Final clamp
-        torque = np.clip(torque, -self.cfg['MAX_TORQUE'], self.cfg['MAX_TORQUE'])
+        torque = np.clip(torque, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
 
         return float(torque)

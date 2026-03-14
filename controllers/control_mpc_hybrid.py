@@ -148,12 +148,12 @@ def build_mpc_state_space(cfg):
     model as control_lqr.py.  Triplet dynamics are modelled as decoupled
     second-order rotational systems with inertia + gravity coupling.
     """
-    m_b = cfg['LQR_BODY_MASS']          # body mass (kg)
-    m_w = cfg['LQR_WHEEL_MASS']         # total wheel/triplet mass (kg)
-    l   = cfg['LQR_COG_HEIGHT']         # CoG height above wheel axis (m)
-    I_b = cfg['LQR_BODY_INERTIA']       # body pitch inertia (kg·m²)
-    r   = cfg['WHEEL_RADIUS']           # effective wheel radius (m)
-    g   = abs(cfg['GRAVITY'])
+    m_b = cfg.plant.body_mass          # body mass (kg)
+    m_w = cfg.plant.wheel_mass         # total wheel/triplet mass (kg)
+    l   = cfg.plant.cog_height         # CoG height above wheel axis (m)
+    I_b = cfg.plant.body_inertia       # body pitch inertia (kg·m²)
+    r   = cfg.robot.wheel_radius           # effective wheel radius (m)
+    g   = abs(cfg.sim.gravity)
 
     # --- Sagittal dynamics (same derivation as control_lqr) ---
     I_eff = I_b + m_b * l**2
@@ -175,9 +175,8 @@ def build_mpc_state_space(cfg):
     # modelled as a simple rotational inertia.
     # Inertia = 0.5 * m_trip * R_trip² (thin cylinder approx)
     m_trip = m_w / 2.0                   # mass per triplet assembly
-    R_trip = cfg.get('TRIPLET_RADIUS', 0.12)
-    I_trip = cfg.get('MPC_TRIPLET_INERTIA',
-                     0.5 * m_trip * R_trip**2)
+    R_trip = cfg.robot.triplet_radius
+    I_trip = cfg.mpc.triplet_inertia
 
     # Gravity coupling on triplet: when triplet angle ≠ 0 and body is
     # pitched, gravity creates a restoring torque.  For small angles
@@ -574,18 +573,18 @@ class ZMPFlipTrigger:
     """
 
     def __init__(self, config):
-        g = abs(config.get('GRAVITY', -9.81))
+        g = abs(config.sim.gravity)
 
         # ---- Robot physical parameters ----
-        m_b    = config['LQR_BODY_MASS']
-        m_w    = config['LQR_WHEEL_MASS']
-        L      = config['LQR_COG_HEIGHT']
-        I_b    = config['LQR_BODY_INERTIA']
-        r_w    = config['WHEEL_RADIUS']
-        R_t    = config.get('TRIPLET_RADIUS', 0.12)
-        I_t    = config.get('MPC_TRIPLET_INERTIA', 0.00238)
-        tau_d  = config.get('MAX_TORQUE', 1.0)         # per-motor drive torque (Nm)
-        tau_t  = config.get('MPC_TRIPLET_TORQUE_MAX', 5.0)
+        m_b    = config.plant.body_mass
+        m_w    = config.plant.wheel_mass
+        L      = config.plant.cog_height
+        I_b    = config.plant.body_inertia
+        r_w    = config.robot.wheel_radius
+        R_t    = config.robot.triplet_radius
+        I_t    = config.mpc.triplet_inertia
+        tau_d  = config.motor.max_torque         # per-motor drive torque (Nm)
+        tau_t  = config.mpc.triplet_torque_max
 
         self.L  = L
         self.R_t = R_t
@@ -602,18 +601,18 @@ class ZMPFlipTrigger:
         b_pd  = (m_b * L) / (det * r_w) + M_tot / det  # B[1,2]=B[1,3]
 
         # ---- Drive torque authority during the fall ----
-        eta = config.get('ZMP_CTRL_AUTHORITY', 0.20)
+        eta = config.mpc.zmp_ctrl_authority
         # Effective pitch deceleration from both motors at η of max:
         a_ctrl       = b_pd * 2 * eta * tau_d    # rad/s²
         theta_eq     = a_ctrl / a_pp             # equilibrium shift (rad)
         self.dcm_shift = L * theta_eq            # metres: the "safe zone"
 
         # ---- Crash / target thresholds ----
-        theta_crash  = config.get('ZMP_THETA_CRASH', math.pi / 4)  # 45° default
+        theta_crash  = config.mpc.zmp_theta_crash  # 45° default
         self.dcm_crash = L * theta_crash         # metres
 
         # ---- Stair height adjustment ----
-        h_stair = config.get('ZMP_STAIR_HEIGHT', 0.0)
+        h_stair = config.mpc.zmp_stair_height
         self.stair_height = h_stair
         if h_stair > 0 and h_stair < R_t:
             # Effective pendulum height is shorter when landing on a step
@@ -636,25 +635,23 @@ class ZMPFlipTrigger:
             alpha_land = delta_alpha
             T_bb_stair = T_bb
 
-        self.t_flip   = config.get('ZMP_T_FLIP_NOMINAL', 0.18)
-        self.t_margin = config.get('ZMP_T_FLIP_MARGIN',  0.05)
+        self.t_flip   = config.mpc.zmp_t_flip_nominal
+        self.t_margin = config.mpc.zmp_t_flip_margin
         self.t_budget = self.t_flip + self.t_margin
 
-        self.t_settle = config.get('ZMP_T_SETTLE',       0.40)
-        self.trip_tol = config.get('ZMP_TRIP_TOL',       0.15)   # rad
+        self.t_settle = config.mpc.zmp_t_settle
+        self.trip_tol = config.mpc.zmp_trip_tol   # rad
 
         # ---- Fall-rate gate (secondary safety) ----
         self.min_fall_rate = math.radians(
-            config.get('ZMP_MIN_FALL_RATE_DEG_S', 15.0))
+            config.mpc.zmp_min_fall_rate_deg_s)
 
         # ---- Early-landing exit from FLIPPING ----
-        self.pitch_recover_threshold = config.get(
-            'ZMP_PITCH_RECOVER_THRESHOLD', 0.12)  # rad (~7°)
-        self.flip_min_rotation = config.get(
-            'ZMP_FLIP_MIN_ROTATION', math.radians(40))  # rad
+        self.pitch_recover_threshold = config.mpc.zmp_pitch_recover_threshold  # rad (~7°)
+        self.flip_min_rotation = config.mpc.zmp_flip_min_rotation  # rad
 
         # ---- Post-flip cooldown ----
-        self.t_cooldown   = config.get('ZMP_FLIP_COOLDOWN', 0.8)
+        self.t_cooldown   = config.mpc.zmp_flip_cooldown
         self.cooldown_until = 0.0
 
         # ---- State ----
@@ -876,48 +873,34 @@ class MPCHybridController(BalanceControllerBase):
         self.nu = 4
 
         # ---- MPC parameters ----
-        self.mpc_rate = config.get('MPC_RATE_HZ', 40)
+        self.mpc_rate = config.mpc.rate_hz
         self.mpc_period = 1.0 / self.mpc_rate
-        self.N = config.get('MPC_HORIZON', 10)
+        self.N = config.mpc.horizon
 
         # Artificial solve-time budget (simulates ESP32-S3 wall-clock)
-        self.simulated_solve_ms = config.get('MPC_SIMULATED_SOLVE_MS', 25.0)
+        self.simulated_solve_ms = config.mpc.simulated_solve_ms
 
         # Cost weights
-        q_diag = config.get('MPC_Q_DIAG', [
-            80.0,   # pitch
-            5.0,    # pitch rate
-            2.0,    # triplet angle L
-            2.0,    # triplet angle R
-            0.5,    # triplet rate L
-            0.5,    # triplet rate R
-            1.0,    # forward position
-            0.5,    # forward velocity
-        ])
-        r_diag = config.get('MPC_R_DIAG', [
-            5.0,    # tau_triplet_L
-            5.0,    # tau_triplet_R
-            10.0,   # tau_drive_L
-            10.0,   # tau_drive_R
-        ])
-        q_term_scale = config.get('MPC_Q_TERMINAL_SCALE', 3.0)
+        q_diag = config.mpc.q_diag
+        r_diag = config.mpc.r_diag
+        q_term_scale = config.mpc.q_terminal_scale
 
         self.Q = np.diag(q_diag)
         self.R = np.diag(r_diag)
         self.Q_terminal = self.Q * q_term_scale
 
         # Input bounds
-        tau_max = config['MAX_TORQUE']
-        trip_tau_max = config.get('MPC_TRIPLET_TORQUE_MAX', tau_max)
+        tau_max = config.motor.max_torque
+        trip_tau_max = config.mpc.triplet_torque_max
         self.u_min = np.array([-trip_tau_max, -trip_tau_max, -tau_max, -tau_max])
         self.u_max = np.array([ trip_tau_max,  trip_tau_max,  tau_max,  tau_max])
 
         # ---- Flip-mode cost weights (override normal Q/R during 120° rotation) ----
         # Higher Q on pitch + triplet = tighter tracking during the manoeuvre.
         # Lower R on triplet = allow the motor to rotate faster.
-        zmp_q_trip  = config.get('ZMP_FLIP_Q_TRIP',  120.0)
-        zmp_q_pitch = config.get('ZMP_FLIP_Q_PITCH', 120.0)
-        zmp_r_trip  = config.get('ZMP_FLIP_R_TRIP',    0.3)
+        zmp_q_trip  = config.mpc.zmp_flip_q_trip
+        zmp_q_pitch = config.mpc.zmp_flip_q_pitch
+        zmp_r_trip  = config.mpc.zmp_flip_r_trip
         q_flip_diag = list(q_diag)          # copy
         q_flip_diag[0] = zmp_q_pitch        # pitch
         q_flip_diag[1] = zmp_q_pitch * 0.3  # pitch rate
@@ -963,12 +946,12 @@ class MPCHybridController(BalanceControllerBase):
         # ---- PD tracking gains ----
         # These are applied per-output-channel in the fast loop.
         # Order: [trip_L, trip_R, drive_L, drive_R]
-        self.Kp_pd = np.array(config.get('MPC_PD_KP', [2.0, 2.0, 12.0, 12.0]))
-        self.Kd_pd = np.array(config.get('MPC_PD_KD', [0.3, 0.3, 0.8, 0.8]))
+        self.Kp_pd = np.array(config.mpc.pd_kp)
+        self.Kd_pd = np.array(config.mpc.pd_kd)
 
         # Cross-coupling: pitch error → additional drive torque
-        self.Kp_pitch_cross = config.get('MPC_PITCH_PD_CROSS_DRIVE', 8.0)
-        self.Kd_pitch_cross = config.get('MPC_PITCH_RATE_PD_CROSS_DRIVE', 0.5)
+        self.Kp_pitch_cross = config.mpc.pitch_pd_cross_drive
+        self.Kd_pitch_cross = config.mpc.pitch_rate_pd_cross_drive
 
         print(f"    PD Kp = {self.Kp_pd.tolist()}")
         print(f"    PD Kd = {self.Kd_pd.tolist()}")
@@ -976,7 +959,7 @@ class MPCHybridController(BalanceControllerBase):
               f"Kd={self.Kd_pitch_cross}")
 
         # ---- Fast-loop timing ----
-        self.control_period = 1.0 / config['CONTROL_RATE_HZ']
+        self.control_period = 1.0 / config.control.control_rate_hz
         self.next_control_time = 0.0
 
         # ---- MPC timing ----
@@ -994,7 +977,7 @@ class MPCHybridController(BalanceControllerBase):
 
         # ---- Triplet equilibrium angle (2WD operating point) ----
         # State-vector triplet angles are deviations from this equilibrium.
-        self.triplet_equilibrium = config.get('INITIAL_TRIPLET_ANGLE', 0.0)
+        self.triplet_equilibrium = config.sim.initial_triplet_angle
 
         # Triplet encoder readings (set by set_triplet_state before each update)
         self._triplet_angle_L = self.triplet_equilibrium
@@ -1019,10 +1002,10 @@ class MPCHybridController(BalanceControllerBase):
 
         # ---- Yaw control (same interface as LQR/PID controllers) ----
         self.yaw_rate_setpoint = 0.0
-        self.yaw_damping_k = config.get('YAW_DAMPING_K', 0.5)
+        self.yaw_damping_k = config.control.yaw_damping_k
 
         # ---- Sensor-to-actuator delay pipeline ----
-        delay_steps = config.get('SENSOR_TO_ACTUATOR_DELAY_STEPS', 0)
+        delay_steps = config.control.sensor_to_actuator_delay_steps
         self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
         self.delay_depth = delay_steps + 1
 
@@ -1166,7 +1149,7 @@ class MPCHybridController(BalanceControllerBase):
         try:
             Q_term = la.solve_discrete_are(Ad, Bd, Q, R)
         except Exception:
-            Q_term = Q * self.cfg.get('MPC_Q_TERMINAL_SCALE', 3.0)
+            Q_term = Q * self.cfg.mpc.q_terminal_scale
 
         self.mpc_solver = MPCSolver(
             Ad, Bd, Q, R, Q_term, self.N,
@@ -1443,8 +1426,8 @@ class MPCHybridController(BalanceControllerBase):
             self.next_mpc_time = sim_time + self.mpc_period
 
         # ---- Fast PD loop ----
-        jitter = (np.random.normal(0, self.cfg.get('CONTROL_JITTER_STD', 0))
-                  if self.cfg.get('ADD_SENSOR_NOISE', False) else 0)
+        jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
+                  if self.cfg.imu.add_sensor_noise else 0)
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter

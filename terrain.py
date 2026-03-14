@@ -23,11 +23,11 @@ import pybullet_data
 # ============================================================================
 
 def create_terrain(config):
-    """Create the terrain specified by config['TERRAIN'].
+    """Create the terrain specified by config.terrain.terrain_type.
 
     Returns a list of PyBullet body IDs (ground plane + any obstacles).
     """
-    kind = config.get('TERRAIN', 'flat')
+    kind = config.terrain.terrain_type
 
     if kind == 'flat':
         return _create_flat(config)
@@ -48,7 +48,7 @@ def _create_flat(config):
     """Plain flat ground (PyBullet built-in plane.urdf)."""
     ground_id = p.loadURDF("plane.urdf")
     p.changeDynamics(ground_id, -1,
-                     lateralFriction=config['GROUND_FRICTION'])
+                     lateralFriction=config.terrain.ground_friction)
     return [ground_id]
 
 
@@ -111,7 +111,7 @@ def _create_heightfield(config):
 
     p.changeVisualShape(terrain_body, -1, rgbaColor=[0.75, 0.75, 0.75, 1])
     p.changeDynamics(terrain_body, -1,
-                     lateralFriction=config['GROUND_FRICTION'])
+                     lateralFriction=config.terrain.ground_friction)
     return [terrain_body]
 
 
@@ -136,16 +136,16 @@ def _create_box_stairs(config):
     # Ground plane (base floor)
     ground_id = p.loadURDF("plane.urdf")
     p.changeDynamics(ground_id, -1,
-                     lateralFriction=config['GROUND_FRICTION'])
+                     lateralFriction=config.terrain.ground_friction)
 
     body_ids = [ground_id]
 
-    num_steps   = config.get('STAIR_NUM_STEPS', 2)
-    step_depth  = config.get('STAIR_STEP_DEPTH', 0.20)
-    step_height = config.get('STAIR_STEP_HEIGHT', [0.1, 0.15])
-    step_width  = config.get('STAIR_WIDTH', 0.6)
-    start_x     = config.get('STAIR_START_X', 0.5)
-    friction    = config['GROUND_FRICTION']
+    num_steps   = config.terrain.stair_num_steps
+    step_depth  = config.terrain.stair_step_depth
+    step_height = config.terrain.stair_step_height
+    step_width  = config.terrain.stair_width
+    start_x     = config.terrain.stair_start_x
+    friction    = config.terrain.ground_friction
 
     step_color_a = [0.55, 0.55, 0.60, 1.0]
     step_color_b = [0.65, 0.65, 0.70, 1.0]
