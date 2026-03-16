@@ -218,10 +218,16 @@ class LQRBalanceController(BalanceControllerBase):
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
 
-        # --- Lean setpoint (left-joystick lean command, rad) ---
-        # The controller receives (measured_pitch - target_lean) so an
-        # intentional user lean is not treated as an error to correct.
+        # --- Lean setpoints ---
+        # _requested_lean: raw operator command from gamepad / remote.
+        # target_lean:     actual pitch reference, set by robot loop from
+        #                  the triplet's current supported lean.
+        self._requested_lean = 0.0
         self.target_lean = 0.0
+
+        # --- Triplet reaction feedforward torque ---
+        # Set by the robot loop each tick; added to u_raw before clamping.
+        self.triplet_feedforward_torque = 0.0
 
         # --- LQR-implied desired lean (computed each control tick) ---
         # Exposed so the triplet PD can cooperate with the lean the LQR
@@ -241,13 +247,33 @@ class LQRBalanceController(BalanceControllerBase):
         self.yaw_rate_setpoint = yaw_rate
 
     def set_lean(self, lean_rad):
-        """Set desired lean angle (rad). Positive = lean forward.
+        """Store the raw operator lean command (rad). Positive = forward.
 
-        The controller will see (measured_pitch - lean_rad) as the pitch
-        error, so the robot leans to the requested angle without fighting it.
+        The actual LQR pitch reference (target_lean) is set separately
+        via set_supported_lean(), based on the actual triplet position.
+        """
+        self._requested_lean = lean_rad
+
+    def set_supported_lean(self, lean_rad):
+        """Set the LQR pitch reference to the lean the triplet supports.
+
+        Called by the robot loop after computing inverse geometry from
+        the measured triplet angle.  Makes the LQR 'follow the triplet'.
         """
         self.target_lean = lean_rad
-        self.target_pitch = lean_rad   # keep log field in sync
+        self.target_pitch = lean_rad
+
+    @property
+    def requested_lean(self) -> float:
+        """Raw operator lean command (rad), before triplet coordination."""
+        return self._requested_lean
+
+    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R):
+        """Update triplet encoder readings (called each tick from tribot_sim)."""
+        self._triplet_angle_L = angle_L
+        self._triplet_angle_R = angle_R
+        self._triplet_rate_L = rate_L
+        self._triplet_rate_R = rate_R
 
     @property
     def desired_lean(self) -> float:
@@ -266,10 +292,12 @@ class LQRBalanceController(BalanceControllerBase):
             "K_pitch":          float(self.K_contributions[2]),
             "K_pitch_rate":     float(self.K_contributions[3]),
             "desired_lean":     float(self._desired_lean),
+            "requested_lean":   float(self._requested_lean),
             "target_pos":       float(self.target_position),
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
+            "triplet_ff":       float(self.triplet_feedforward_torque),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -343,8 +371,8 @@ class LQRBalanceController(BalanceControllerBase):
             else:
                 self._desired_lean = 0.0
 
-            # u = -K x  (total torque for both sides)
-            u_raw = float(-self.K @ x)
+            # u = -K x + feedforward  (total torque for both sides)
+            u_raw = float(-self.K @ x) + self.triplet_feedforward_torque
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque

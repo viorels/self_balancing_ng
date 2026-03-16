@@ -379,6 +379,38 @@ class TribotBalanceBot:
             s.triplet_rate_L, s.triplet_rate_R,
         )
 
+        # --- "Follow the triplet" (2WD only): supported lean + feedforward ---
+        # In 2WD a single wheel per side is grounded; the triplet angle
+        # determines where the ground contact is relative to the CoG.
+        # The LQR pitch reference tracks the lean the actual triplet
+        # position supports (filtered), not the raw operator command.
+        #
+        # In 4WD two wheels per side form a support polygon — the triplet
+        # position doesn't define the balance geometry.  The LQR uses
+        # the operator's lean command directly (original behaviour).
+        if not self.controller.plans_triplet_torque:
+            self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
+            self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
+
+            if self.drive_mode == DriveMode.TWO_WD:
+                # 2WD: LQR follows the filtered supported lean
+                supported_lean = self.triplet_ctrl_L.compute_supported_lean(
+                    s.triplet_angle_L)
+                self.controller.set_supported_lean(supported_lean)
+
+                # Feedforward: cancel the body-pitch reaction from triplet
+                # acceleration (sum both hubs).
+                ff_L = self.triplet_ctrl_L.update_feedforward(
+                    s.triplet_rate_L, dt)
+                ff_R = self.triplet_ctrl_R.update_feedforward(
+                    s.triplet_rate_R, dt)
+                self.controller.triplet_feedforward_torque = ff_L + ff_R
+            else:
+                # 4WD: pass operator lean straight through, no feedforward
+                self.controller.set_supported_lean(
+                    self.controller.requested_lean)
+                self.controller.triplet_feedforward_torque = 0.0
+
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             s.pitch, s.pitch_rate,
@@ -390,27 +422,31 @@ class TribotBalanceBot:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
-            lean_comp = 0.0
-            lean_offset = self.controller.desired_lean
-            alpha = self.controller.target_pitch
+            # Triplet target: mode-dependent
             if self.drive_mode == DriveMode.TWO_WD:
-                beta = compute_triplet_from_pitch(alpha, h=self.cfg.triplet.cog_dist_2wd)
-                lean_comp = -beta
+                # 2WD: triplet target from operator's requested lean
+                triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
+                    self.controller.requested_lean, self.controller.desired_lean,
+                    self.triplet_base_angle,
+                    s.triplet_angle_L, s.triplet_rate_L, s.pitch,
+                    body_pitch_rate=s.pitch_rate, dt=dt)
+                triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
+                    self.controller.requested_lean, self.controller.desired_lean,
+                    self.triplet_base_angle,
+                    s.triplet_angle_R, s.triplet_rate_R, s.pitch,
+                    body_pitch_rate=s.pitch_rate, dt=dt)
             else:
-                lean_scale = self.cfg.triplet.lean_scale_4wd
-                lean_comp = -alpha * lean_scale - lean_offset
-
-            self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
-            self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
-            self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
-            self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
-
-            triplet_cmd_L = self.triplet_ctrl_L.update(
-                s.triplet_angle_L, s.triplet_rate_L, s.pitch,
-                body_pitch_rate=s.pitch_rate, dt=dt)
-            triplet_cmd_R = self.triplet_ctrl_R.update(
-                s.triplet_angle_R, s.triplet_rate_R, s.pitch,
-                body_pitch_rate=s.pitch_rate, dt=dt)
+                # 4WD: original behaviour (target from LQR's active pitch ref)
+                triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
+                    self.controller.target_pitch, self.controller.desired_lean,
+                    self.triplet_base_angle,
+                    s.triplet_angle_L, s.triplet_rate_L, s.pitch,
+                    body_pitch_rate=s.pitch_rate, dt=dt)
+                triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
+                    self.controller.target_pitch, self.controller.desired_lean,
+                    self.triplet_base_angle,
+                    s.triplet_angle_R, s.triplet_rate_R, s.pitch,
+                    body_pitch_rate=s.pitch_rate, dt=dt)
 
         # --- Apply motor torque through motor models ---
         side_configs = [

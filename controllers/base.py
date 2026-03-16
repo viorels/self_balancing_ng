@@ -134,6 +134,11 @@ class BalanceControllerBase(ABC):
         """LQR/MPC-implied lean demand (rad) for triplet cooperation.  Default 0."""
         return 0.0
 
+    @property
+    def requested_lean(self) -> float:
+        """Raw operator lean command (rad) before triplet coordination.  Default 0."""
+        return 0.0
+
     # ------------------------------------------------------------------
     # Optional telemetry extensions
     # ------------------------------------------------------------------
