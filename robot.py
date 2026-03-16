@@ -21,7 +21,6 @@ from imu_model import IMUSensorModel
 from triplet_controller import (
     TripletController,
     compute_triplet_from_pitch,
-    compute_pitch_from_triplet,
 )
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
@@ -136,8 +135,6 @@ class TribotBalanceBot:
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
-
-        self.lean_offset_ema = 0.0
 
         # Sensor state (populated by read_sensors() on each tick)
         self.state = RobotState(drive_mode=self.drive_mode,
@@ -379,34 +376,14 @@ class TribotBalanceBot:
             s.triplet_rate_L, s.triplet_rate_R,
         )
 
-        # --- "Follow the triplet" (2WD only): supported lean + feedforward ---
-        # In 2WD a single wheel per side is grounded; the triplet angle
-        # determines where the ground contact is relative to the CoG.
-        # The LQR pitch reference tracks the lean the actual triplet
-        # position supports (filtered), not the raw operator command.
-        #
-        # In 4WD two wheels per side form a support polygon — the triplet
-        # position doesn't define the balance geometry.  The LQR uses
-        # the operator's lean command directly (original behaviour).
+        # --- "Follow the triplet" removed ---
+        # Lean transitions are now handled by the trajectory planner
+        # in LQR (see docs/LEAN_TRAJECTORY.md).  In 2WD the LQR pitch
+        # reference tracks the trajectory; in 4WD the operator's lean
+        # command is used directly.
         if not self.controller.plans_triplet_torque:
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
             self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
-
-            if self.drive_mode == DriveMode.TWO_WD:
-                # 2WD: LQR follows the filtered supported lean
-                supported_lean = self.triplet_ctrl_L.compute_supported_lean(
-                    s.triplet_angle_L)
-                self.controller.set_supported_lean(supported_lean)
-
-                # Feedforward disabled — the finite-difference accel estimate
-                # on the low-inertia hub produces ±1.3 Nm swings that exceed
-                # motor capacity and cause actuator saturation oscillation.
-                self.controller.triplet_feedforward_torque = 0.0
-            else:
-                # 4WD: pass operator lean straight through, no feedforward
-                self.controller.set_supported_lean(
-                    self.controller.requested_lean)
-                self.controller.triplet_feedforward_torque = 0.0
 
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(

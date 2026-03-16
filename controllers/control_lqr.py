@@ -226,10 +226,6 @@ class LQRBalanceController(BalanceControllerBase):
         self._requested_lean = 0.0
         self.target_lean = 0.0
 
-        # --- Triplet reaction feedforward torque ---
-        # Set by the robot loop each tick; added to u_raw before clamping.
-        self.triplet_feedforward_torque = 0.0
-
         # --- LQR-implied desired lean (computed each control tick) ---
         # Exposed so the triplet PD can cooperate with the lean the LQR
         # needs for position tracking.
@@ -280,18 +276,6 @@ class LQRBalanceController(BalanceControllerBase):
                 theta_end=lean_rad,
             )
 
-    def set_supported_lean(self, lean_rad):
-        """Set the LQR pitch reference to the lean the triplet supports.
-
-        Called by the robot loop after computing inverse geometry from
-        the measured triplet angle.  When a lean trajectory is active,
-        this is ignored — the trajectory planner owns the reference.
-        """
-        if self._lean_traj.active:
-            return  # trajectory planner owns the reference
-        self.target_lean = lean_rad
-        self.target_pitch = lean_rad
-
     @property
     def requested_lean(self) -> float:
         """Raw operator lean command (rad), before triplet coordination."""
@@ -326,7 +310,6 @@ class LQRBalanceController(BalanceControllerBase):
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
-            "triplet_ff":       float(self.triplet_feedforward_torque),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -418,8 +401,8 @@ class LQRBalanceController(BalanceControllerBase):
             else:
                 self._desired_lean = 0.0
 
-            # u = -K x + feedforward  (total torque for both sides)
-            u_raw = float(-self.K @ x) + self.triplet_feedforward_torque
+            # u = -K x  (total torque for both sides)
+            u_raw = float(-self.K @ x)
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque
