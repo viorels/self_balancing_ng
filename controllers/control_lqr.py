@@ -22,6 +22,7 @@ import math
 import numpy as np
 
 from .base import BalanceControllerBase
+from lean_trajectory import LeanTrajectory
 
 
 # ============================================================================
@@ -234,6 +235,20 @@ class LQRBalanceController(BalanceControllerBase):
         # needs for position tracking.
         self._desired_lean = 0.0
 
+        # --- Lean transition trajectory planner ---
+        # Generates smooth [pos, vel, pitch, pitch_rate] references when
+        # the operator commands a large lean change, preventing free-fall
+        # overshoot and position excursion.
+        self._lean_traj = LeanTrajectory(
+            h_cog=config.triplet.cog_dist_2wd,
+            min_duration=0.3,
+            max_duration=2.0,
+            lean_per_sec_factor=0.5,
+        )
+        self._last_sim_time = 0.0
+        self._traj_ref_velocity = 0.0    # for debug/telemetry
+        self._traj_ref_pitch_rate = 0.0  # for debug/telemetry
+
     # ----------------------------------------------------------------
     # BalanceControllerBase interface
     # ----------------------------------------------------------------
@@ -249,17 +264,31 @@ class LQRBalanceController(BalanceControllerBase):
     def set_lean(self, lean_rad):
         """Store the raw operator lean command (rad). Positive = forward.
 
-        The actual LQR pitch reference (target_lean) is set separately
-        via set_supported_lean(), based on the actual triplet position.
+        When the lean command changes by more than ~1°, a minimum-jerk
+        trajectory is started that smoothly ramps the full LQR state
+        reference [pos, vel, pitch, pitch_rate] to the new equilibrium.
         """
+        prev = self._requested_lean
         self._requested_lean = lean_rad
+
+        # Start trajectory if lean command changed significantly
+        if abs(lean_rad - prev) > math.radians(1.0):
+            self._lean_traj.start(
+                sim_time=self._last_sim_time,
+                current_position=self.target_position,
+                theta_start=self.target_lean,
+                theta_end=lean_rad,
+            )
 
     def set_supported_lean(self, lean_rad):
         """Set the LQR pitch reference to the lean the triplet supports.
 
         Called by the robot loop after computing inverse geometry from
-        the measured triplet angle.  Makes the LQR 'follow the triplet'.
+        the measured triplet angle.  When a lean trajectory is active,
+        this is ignored — the trajectory planner owns the reference.
         """
+        if self._lean_traj.active:
+            return  # trajectory planner owns the reference
         self.target_lean = lean_rad
         self.target_pitch = lean_rad
 
@@ -324,6 +353,8 @@ class LQRBalanceController(BalanceControllerBase):
         jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
                   if self.cfg.imu.add_sensor_noise else 0)
 
+        self._last_sim_time = sim_time
+
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
 
@@ -335,14 +366,30 @@ class LQRBalanceController(BalanceControllerBase):
             self.prev_position = position
             self.prev_vel_time = sim_time
 
+            # --- Lean trajectory tracking ---
+            # When active, the trajectory planner provides smooth
+            # [pos, vel, pitch, pitch_rate] references so the LQR
+            # tracks a feasible path instead of a step.
+            if self._lean_traj.active:
+                ref_pos, ref_vel, ref_pitch, ref_prate = \
+                    self._lean_traj.update(sim_time)
+                self.target_position = ref_pos
+                self.target_lean = ref_pitch
+                self.target_pitch = ref_pitch
+                self._traj_ref_velocity = ref_vel
+                self._traj_ref_pitch_rate = ref_prate
+            else:
+                self._traj_ref_velocity = 0.0
+                self._traj_ref_pitch_rate = 0.0
+
             # State error vector
-            # Subtract the user-requested lean so the controller does not
-            # try to correct an intentional lean commanded via the joystick.
+            # During a trajectory, ref_vel and ref_prate are subtracted
+            # so the LQR doesn't fight the planned motion.
             x = np.array([
                 position - self.target_position,
-                self.velocity,
+                self.velocity - self._traj_ref_velocity,
                 measured_pitch - self.target_lean,
-                measured_pitch_rate,
+                measured_pitch_rate - self._traj_ref_pitch_rate,
             ])
             self.state_error = x.copy()
 

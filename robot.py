@@ -398,13 +398,10 @@ class TribotBalanceBot:
                     s.triplet_angle_L)
                 self.controller.set_supported_lean(supported_lean)
 
-                # Feedforward: cancel the body-pitch reaction from triplet
-                # acceleration (sum both hubs).
-                ff_L = self.triplet_ctrl_L.update_feedforward(
-                    s.triplet_rate_L, dt)
-                ff_R = self.triplet_ctrl_R.update_feedforward(
-                    s.triplet_rate_R, dt)
-                self.controller.triplet_feedforward_torque = ff_L + ff_R
+                # Feedforward disabled — the finite-difference accel estimate
+                # on the low-inertia hub produces ±1.3 Nm swings that exceed
+                # motor capacity and cause actuator saturation oscillation.
+                self.controller.triplet_feedforward_torque = 0.0
             else:
                 # 4WD: pass operator lean straight through, no feedforward
                 self.controller.set_supported_lean(
@@ -424,14 +421,19 @@ class TribotBalanceBot:
         else:
             # Triplet target: mode-dependent
             if self.drive_mode == DriveMode.TWO_WD:
-                # 2WD: triplet target from operator's requested lean
+                # 2WD: triplet target from the trajectory pitch reference
+                # (smooth ramp) when active, else from operator's lean.
+                if self.controller._lean_traj.active:
+                    triplet_lean_target = self.controller.target_lean
+                else:
+                    triplet_lean_target = self.controller.requested_lean
                 triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
-                    self.controller.requested_lean, self.controller.desired_lean,
+                    triplet_lean_target, self.controller.desired_lean,
                     self.triplet_base_angle,
                     s.triplet_angle_L, s.triplet_rate_L, s.pitch,
                     body_pitch_rate=s.pitch_rate, dt=dt)
                 triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
-                    self.controller.requested_lean, self.controller.desired_lean,
+                    triplet_lean_target, self.controller.desired_lean,
                     self.triplet_base_angle,
                     s.triplet_angle_R, s.triplet_rate_R, s.pitch,
                     body_pitch_rate=s.pitch_rate, dt=dt)

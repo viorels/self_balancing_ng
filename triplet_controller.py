@@ -165,7 +165,8 @@ class TripletController:
         # α=0.05 at 500 Hz gives τ ≈ 40 ms (3 dB at ~4 Hz), well above
         # the ~1 Hz balance bandwidth but below the PD ringing band.
         self._supported_lean_filtered = 0.0
-        self._supported_lean_alpha = 0.05
+        self._supported_lean_alpha = 0.5
+        self._supported_lean_raw = 0.0  # debug: unfiltered value
 
         print(f"  TripletController: Kp={self.kp}, Kd={self.kd}, "
               f"target={math.degrees(self.target_angle):.1f}\u00b0")
