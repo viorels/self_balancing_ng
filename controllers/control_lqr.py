@@ -21,8 +21,7 @@ Outputs: per-side commanded torques (left, right)
 import math
 import numpy as np
 
-from .base import BalanceControllerBase
-from lean_trajectory import LeanTrajectory
+from .base import BalanceControllerBase, StateReference
 
 
 # ============================================================================
@@ -221,8 +220,8 @@ class LQRBalanceController(BalanceControllerBase):
 
         # --- Lean setpoints ---
         # _requested_lean: raw operator command from gamepad / remote.
-        # target_lean:     actual pitch reference, set by robot loop from
-        #                  the triplet's current supported lean.
+        # target_lean:     effective pitch reference (from last ref passed
+        #                  to update), kept for telemetry and sim-loop reads.
         self._requested_lean = 0.0
         self.target_lean = 0.0
 
@@ -230,20 +229,6 @@ class LQRBalanceController(BalanceControllerBase):
         # Exposed so the triplet PD can cooperate with the lean the LQR
         # needs for position tracking.
         self._desired_lean = 0.0
-
-        # --- Lean transition trajectory planner ---
-        # Generates smooth [pos, vel, pitch, pitch_rate] references when
-        # the operator commands a large lean change, preventing free-fall
-        # overshoot and position excursion.
-        self._lean_traj = LeanTrajectory(
-            h_cog=config.triplet.cog_dist_2wd,
-            min_duration=0.2,
-            max_duration=1.0,
-            lean_per_sec_factor=0.25,
-        )
-        self._last_sim_time = 0.0
-        self._traj_ref_velocity = 0.0    # for debug/telemetry
-        self._traj_ref_pitch_rate = 0.0  # for debug/telemetry
 
     # ----------------------------------------------------------------
     # BalanceControllerBase interface
@@ -258,23 +243,8 @@ class LQRBalanceController(BalanceControllerBase):
         self.yaw_rate_setpoint = yaw_rate
 
     def set_lean(self, lean_rad):
-        """Store the raw operator lean command (rad). Positive = forward.
-
-        When the lean command changes by more than ~1°, a minimum-jerk
-        trajectory is started that smoothly ramps the full LQR state
-        reference [pos, vel, pitch, pitch_rate] to the new equilibrium.
-        """
-        prev = self._requested_lean
+        """Store the raw operator lean command (rad). Positive = forward."""
         self._requested_lean = lean_rad
-
-        # Start trajectory if lean command changed significantly
-        if abs(lean_rad - prev) > math.radians(1.0):
-            self._lean_traj.start(
-                sim_time=self._last_sim_time,
-                current_position=self.target_position,
-                theta_start=self.target_lean,
-                theta_end=lean_rad,
-            )
 
     @property
     def requested_lean(self) -> float:
@@ -313,7 +283,8 @@ class LQRBalanceController(BalanceControllerBase):
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt):
+               position, yaw_rate, sim_time, dt,
+               ref=None):
         """
         Run one controller tick.
 
@@ -324,10 +295,25 @@ class LQRBalanceController(BalanceControllerBase):
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
+            ref:                 StateReference with target [pos, vel, pitch,
+                                 pitch_rate].  Built by the robot loop which
+                                 owns the trajectory planner and drive-mode
+                                 knowledge.
 
         Returns:
             (left_torque, right_torque): commanded motor torques (Nm)
         """
+        # Fallback when no ref provided (e.g. standalone use)
+        if ref is None:
+            ref = StateReference(
+                position=self.target_position,
+                pitch=self._requested_lean,
+            )
+
+        # Keep telemetry-visible attributes in sync with the ref
+        self.target_lean = ref.pitch
+        self.target_pitch = ref.pitch
+
         # --- Velocity estimation (only at control rate to avoid noise) ---
         # Estimating at 500Hz physics rate amplifies tiny position jitter.
         # Instead, update velocity only when the control loop fires.
@@ -335,8 +321,6 @@ class LQRBalanceController(BalanceControllerBase):
         # --- LQR update at CONTROL_RATE_HZ ---
         jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
                   if self.cfg.imu.add_sensor_noise else 0)
-
-        self._last_sim_time = sim_time
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
@@ -349,30 +333,15 @@ class LQRBalanceController(BalanceControllerBase):
             self.prev_position = position
             self.prev_vel_time = sim_time
 
-            # --- Lean trajectory tracking ---
-            # When active, the trajectory planner provides smooth
-            # [pos, vel, pitch, pitch_rate] references so the LQR
-            # tracks a feasible path instead of a step.
-            if self._lean_traj.active:
-                ref_pos, ref_vel, ref_pitch, ref_prate = \
-                    self._lean_traj.update(sim_time)
-                self.target_position = ref_pos
-                self.target_lean = ref_pitch
-                self.target_pitch = ref_pitch
-                self._traj_ref_velocity = ref_vel
-                self._traj_ref_pitch_rate = ref_prate
-            else:
-                self._traj_ref_velocity = 0.0
-                self._traj_ref_pitch_rate = 0.0
-
-            # State error vector
-            # During a trajectory, ref_vel and ref_prate are subtracted
-            # so the LQR doesn't fight the planned motion.
+            # State error: measured − reference.
+            # The robot loop provides ref.velocity and ref.pitch_rate
+            # during trajectory transitions so the LQR doesn't fight
+            # the planned motion.
             x = np.array([
-                position - self.target_position,
-                self.velocity - self._traj_ref_velocity,
-                measured_pitch - self.target_lean,
-                measured_pitch_rate - self._traj_ref_pitch_rate,
+                position - ref.position,
+                self.velocity - ref.velocity,
+                measured_pitch - ref.pitch,
+                measured_pitch_rate - ref.pitch_rate,
             ])
             self.state_error = x.copy()
 

@@ -80,7 +80,7 @@ class BalanceController(BalanceControllerBase):
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt):
+               position, yaw_rate, sim_time, dt, ref=None):
         """
         Run one controller tick.
 

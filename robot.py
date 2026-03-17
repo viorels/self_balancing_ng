@@ -22,9 +22,11 @@ from triplet_controller import (
     TripletController,
     compute_triplet_from_pitch,
 )
+from controllers.base import StateReference
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
 from controllers.control_mpc_hybrid import MPCHybridController
+from controllers.lean_trajectory import LeanTrajectory
 
 
 # ============================================================================
@@ -120,6 +122,17 @@ class TribotBalanceBot:
         # Drive mode: '4wd' (two wheels/side) or '2wd' (one wheel/side)
         self.drive_mode = DriveMode.FOUR_WD
         self.triplet_base_angle = config.sim.initial_triplet_angle
+
+        # Lean transition trajectory planner (2WD only).
+        # Generates smooth state references so the LQR tracks a feasible
+        # path instead of a step when the operator commands a lean change.
+        self._lean_traj = LeanTrajectory(
+            h_cog=config.triplet.cog_dist_2wd,
+            min_duration=0.2,
+            max_duration=1.0,
+            lean_per_sec_factor=0.25,
+        )
+        self._prev_requested_lean = 0.0
 
         # IMU sensor model
         self.imu = IMUSensorModel(config)
@@ -357,6 +370,49 @@ class TribotBalanceBot:
         return state
 
     # ----------------------------------------------------------------
+    # State reference
+    # ----------------------------------------------------------------
+
+    def _build_state_reference(self, sim_time):
+        """Build the StateReference for the current tick.
+
+        In 2WD, when the operator commands a lean change, a minimum-jerk
+        trajectory provides smooth [pos, vel, pitch, pitch_rate] references
+        so the LQR tracks a feasible path.  In 4WD (or when no trajectory
+        is active) the reference is simply the operator's commanded lean
+        at the current target position.
+        """
+        requested = self.controller.requested_lean
+
+        # Detect lean change → start trajectory (2WD only)
+        if (self.drive_mode == DriveMode.TWO_WD
+                and abs(requested - self._prev_requested_lean) > math.radians(1.0)):
+            self._lean_traj.start(
+                sim_time=sim_time,
+                current_position=self.controller.target_position,
+                theta_start=self.controller.target_lean,
+                theta_end=requested,
+            )
+        self._prev_requested_lean = requested
+
+        # Active trajectory → use its smooth reference
+        if self._lean_traj.active:
+            ref_pos, ref_vel, ref_pitch, ref_prate = \
+                self._lean_traj.update(sim_time)
+            return StateReference(
+                position=ref_pos,
+                velocity=ref_vel,
+                pitch=ref_pitch,
+                pitch_rate=ref_prate,
+            )
+
+        # Steady state: track operator commands directly
+        return StateReference(
+            position=self.controller.target_position,
+            pitch=requested,
+        )
+
+    # ----------------------------------------------------------------
     # Control update
     # ----------------------------------------------------------------
 
@@ -376,19 +432,20 @@ class TribotBalanceBot:
             s.triplet_rate_L, s.triplet_rate_R,
         )
 
-        # --- "Follow the triplet" removed ---
-        # Lean transitions are now handled by the trajectory planner
-        # in LQR (see docs/LEAN_TRAJECTORY.md).  In 2WD the LQR pitch
-        # reference tracks the trajectory; in 4WD the operator's lean
-        # command is used directly.
         if not self.controller.plans_triplet_torque:
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
             self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
 
+        # --- Build state reference ---
+        # The robot loop owns the trajectory planner and knows the drive
+        # mode, so it builds the StateReference that the controller
+        # tracks.  The controller is a pure function of (state, ref, K).
+        ref = self._build_state_reference(sim_time)
+
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             s.pitch, s.pitch_rate,
-            s.position, s.yaw_rate, sim_time, dt
+            s.position, s.yaw_rate, sim_time, dt, ref=ref
         )
 
         # Triplet hub commands
@@ -396,36 +453,19 @@ class TribotBalanceBot:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
-            # Triplet target: mode-dependent
-            if self.drive_mode == DriveMode.TWO_WD:
-                # 2WD: triplet target from the trajectory pitch reference
-                # (smooth ramp) when active, else from operator's lean.
-                if self.controller._lean_traj.active:
-                    triplet_lean_target = self.controller.target_lean
-                else:
-                    triplet_lean_target = self.controller.requested_lean
-                triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
-                    triplet_lean_target, self.controller.desired_lean,
-                    self.triplet_base_angle,
-                    s.triplet_angle_L, s.triplet_rate_L, s.pitch,
-                    body_pitch_rate=s.pitch_rate, dt=dt)
-                triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
-                    triplet_lean_target, self.controller.desired_lean,
-                    self.triplet_base_angle,
-                    s.triplet_angle_R, s.triplet_rate_R, s.pitch,
-                    body_pitch_rate=s.pitch_rate, dt=dt)
-            else:
-                # 4WD: original behaviour (target from LQR's active pitch ref)
-                triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
-                    self.controller.target_pitch, self.controller.desired_lean,
-                    self.triplet_base_angle,
-                    s.triplet_angle_L, s.triplet_rate_L, s.pitch,
-                    body_pitch_rate=s.pitch_rate, dt=dt)
-                triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
-                    self.controller.target_pitch, self.controller.desired_lean,
-                    self.triplet_base_angle,
-                    s.triplet_angle_R, s.triplet_rate_R, s.pitch,
-                    body_pitch_rate=s.pitch_rate, dt=dt)
+            # Triplet target = ref.pitch (trajectory pitch during
+            # transitions, requested lean otherwise).  Works for
+            # both 2WD and 4WD — the ref already encodes the mode.
+            triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
+                ref.pitch, self.controller.desired_lean,
+                self.triplet_base_angle,
+                s.triplet_angle_L, s.triplet_rate_L, s.pitch,
+                body_pitch_rate=s.pitch_rate, dt=dt)
+            triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
+                ref.pitch, self.controller.desired_lean,
+                self.triplet_base_angle,
+                s.triplet_angle_R, s.triplet_rate_R, s.pitch,
+                body_pitch_rate=s.pitch_rate, dt=dt)
 
         # --- Apply motor torque through motor models ---
         side_configs = [
@@ -542,6 +582,8 @@ class TribotBalanceBot:
             print(f"  [MODE] 2WD → 4WD  (triplet target 0°)")
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
+        if self.drive_mode == DriveMode.FOUR_WD:
+            self._lean_traj.cancel()
 
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""
