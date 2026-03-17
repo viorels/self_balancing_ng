@@ -237,9 +237,9 @@ class LQRBalanceController(BalanceControllerBase):
         # overshoot and position excursion.
         self._lean_traj = LeanTrajectory(
             h_cog=config.triplet.cog_dist_2wd,
-            min_duration=0.3,
-            max_duration=2.0,
-            lean_per_sec_factor=0.5,
+            min_duration=0.2,
+            max_duration=1.0,
+            lean_per_sec_factor=0.25,
         )
         self._last_sim_time = 0.0
         self._traj_ref_velocity = 0.0    # for debug/telemetry
