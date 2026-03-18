@@ -166,6 +166,65 @@ class TribotBalanceBot:
         mode = '2WD' if abs(trip_angle - math.pi / 3) < 0.05 else ('4WD' if abs(trip_angle) < 0.05 else 'Lean')
         print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° ({mode} mode)")
 
+    def reset(self):
+        """Reset the robot to its initial upright pose with zero velocities.
+
+        Intended for AI-driven experiments: call between trials to start fresh
+        without restarting the simulation process.
+        """
+        # --- Restore base pose ---
+        init_pos = [0, 0, self.cfg.sim.initial_height]
+        init_orn = p.getQuaternionFromEuler([0, self.cfg.sim.initial_pitch, 0])
+        p.resetBasePositionAndOrientation(self.body_id, init_pos, init_orn)
+        p.resetBaseVelocity(self.body_id,
+                            linearVelocity=[0, 0, 0],
+                            angularVelocity=[0, 0, 0])
+
+        # --- Restore all joint states ---
+        num_joints = p.getNumJoints(self.body_id)
+        trip_angle = self.cfg.sim.initial_triplet_angle
+        for i in range(num_joints):
+            if i in (self.l_triplet_joint, self.r_triplet_joint):
+                p.resetJointState(self.body_id, i, trip_angle, 0.0)
+            else:
+                p.resetJointState(self.body_id, i, 0.0, 0.0)
+
+        # --- Reset motor first-order lag models ---
+        self.motors = [
+            type(self.motors[0])(self.cfg),
+            type(self.motors[1])(self.cfg),
+        ]
+
+        # --- Reset IMU ---
+        self.imu = type(self.imu)(self.cfg)
+
+        # --- Reset software state ---
+        self.position = 0.0
+        self.pitch_angle = 0.0
+        self.pitch_rate = 0.0
+        self.actual_torques = [0.0, 0.0]
+        self.drive_mode = DriveMode.FOUR_WD
+        self.triplet_base_angle = self.cfg.sim.initial_triplet_angle
+        self.state = RobotState(drive_mode=self.drive_mode,
+                                triplet_base_angle=self.triplet_base_angle)
+
+        # --- Reset controller integrators (best-effort) ---
+        ctrl = self.controller
+        for attr in ('_integral', '_pos_integral', 'x_hat',
+                     '_prev_error', '_prev_pos_error'):
+            if hasattr(ctrl, attr):
+                import numpy as np
+                val = getattr(ctrl, attr)
+                if hasattr(val, 'shape'):
+                    setattr(ctrl, attr, np.zeros_like(val))
+                else:
+                    setattr(ctrl, attr, 0.0)
+        ctrl.set_target_position(0.0)
+        ctrl.set_yaw_rate(0.0)
+        ctrl.set_lean(0.0)
+
+        print("[reset] Robot pose and state restored to initial conditions.")
+
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -563,6 +622,11 @@ class TribotBalanceBot:
         fwd_y = -rot[3]
         yaw = math.atan2(fwd_y, fwd_x)
         return pos[0], pos[1], yaw, fwd_x, fwd_y
+
+    def set_drive_mode(self, mode: DriveMode):
+        """Set a specific drive mode; no-op if already in that mode."""
+        if mode != self.drive_mode:
+            self.toggle_drive_mode()
 
     def toggle_drive_mode(self):
         """Toggle between 4WD and 2WD drive modes."""

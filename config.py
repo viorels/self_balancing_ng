@@ -28,7 +28,7 @@ class SimConfig:
     """Simulation-level parameters and initial conditions."""
     gravity: float = -9.81
     timestep: float = 1.0 / 500.0       # 500 Hz physics
-    sim_duration: float = 60.0
+    sim_duration: float = 600.0
     controller: str = 'lqr'             # 'lqr', 'pid', or 'mpc'
     urdf_path: str = 'tribot_description/urdf/tribot.urdf'
     initial_pitch: float = -0.03        # rad (~1.7°)
