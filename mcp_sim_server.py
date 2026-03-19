@@ -11,12 +11,14 @@ Tools exposed
   sim_ping                → check bridge is alive
   sim_get_state           → full robot state snapshot (all variables)
   sim_get_config          → full CONFIG dump
-  sim_drive_command       → inject fwd/yaw velocity commands for N ticks
+  sim_start_recording     → start buffering every sim tick into a ring buffer
+  sim_stop_recording      → stop + return all buffered samples at full sim rate
+  sim_drive_command       → inject fwd/yaw commands for N ticks
   sim_set_lean            → set operator lean bias (rad)
   sim_set_target_position → set position setpoint (m)
   sim_set_param           → live-patch any CONFIG field
+  sim_set_drive_mode      → switch between 2WD and 4WD
   sim_reset               → reset physics to initial conditions
-  sim_run_experiment      → apply command, wait N ticks, report final state
 
 Usage (VS Code MCP integration)
 ────────────────────────────────
@@ -26,10 +28,9 @@ Usage (VS Code MCP integration)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
-import sys
-import time
 from typing import Any
 
 import mcp.server.stdio
@@ -39,12 +40,14 @@ from mcp.server import Server
 _BRIDGE_HOST = "127.0.0.1"
 _BRIDGE_PORT = 9871
 _TIMEOUT = 3.0
+_TIMEOUT_RECORDING = 30.0   # stop_recording can return a large payload
 
 # ---------------------------------------------------------------------------
 # Low-level bridge client
 # ---------------------------------------------------------------------------
 
-def _call_bridge(method: str, params: dict | None = None) -> dict:
+def _call_bridge(method: str, params: dict | None = None,
+                 timeout: float = _TIMEOUT) -> dict:
     """Open a short-lived connection, send one request, return parsed response."""
     req = {"method": method}
     if params:
@@ -53,12 +56,12 @@ def _call_bridge(method: str, params: dict | None = None) -> dict:
 
     try:
         sock = socket.create_connection((_BRIDGE_HOST, _BRIDGE_PORT),
-                                        timeout=_TIMEOUT)
+                                        timeout=timeout)
         sock.sendall(raw)
         buf = b""
-        sock.settimeout(_TIMEOUT)
+        sock.settimeout(timeout)
         while b"\n" not in buf:
-            chunk = sock.recv(65536)
+            chunk = sock.recv(1 << 20)   # 1 MiB chunks for large payloads
             if not chunk:
                 break
             buf += chunk
@@ -188,6 +191,41 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="sim_start_recording",
+            description=(
+                "Start buffering every simulation tick into a ring buffer "
+                "(up to 20 000 samples ≈ 40 s at 500 Hz). "
+                "Optionally restrict to a subset of variable names to keep "
+                "the payload small. "
+                "Typical flow: sim_start_recording → sim_drive_command → "
+                "sim_stop_recording."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "vars": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Variable names to record, e.g. "
+                            '["timestamp","pitch","pitch_rate","forward_velocity"]. '
+                            "Omit to record all telemetry fields."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="sim_stop_recording",
+            description=(
+                "Stop buffering and return all collected samples as a JSON list. "
+                "Each entry is one simulation tick. "
+                "Returns {n_samples, samples}."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
             name="sim_reset",
             description=(
                 "Reset the robot to its initial upright pose and zero velocities. "
@@ -195,92 +233,70 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
-        types.Tool(
-            name="sim_run_experiment",
-            description=(
-                "Apply a drive command, wait `wait_ms` milliseconds (real time), "
-                "then return the final state. Useful for step-response tests. "
-                "`fwd`, `yaw`, `ticks` same as sim_drive_command."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "fwd":     {"type": "number", "default": 0.0},
-                    "yaw":     {"type": "number", "default": 0.0},
-                    "ticks":   {"type": "integer", "default": 500},
-                    "wait_ms": {"type": "integer",
-                                "description": "Real-time milliseconds to wait before sampling state",
-                                "default": 1200},
-                },
-                "required": [],
-            },
-        ),
     ]
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    # --------------------------------------------------------------------------
+    # Build (bridge_method, params, timeout) without doing any I/O, then run
+    # the blocking socket call off the event loop via asyncio.to_thread so that
+    # VS Code's stdio pipe to this process stays responsive at all times.
+    # --------------------------------------------------------------------------
+    timeout = _TIMEOUT
 
     if name == "sim_ping":
-        resp = _call_bridge("ping")
+        method, params = "ping", None
 
     elif name == "sim_get_state":
-        resp = _call_bridge("get_state")
+        method, params = "get_state", None
 
     elif name == "sim_get_config":
-        resp = _call_bridge("get_config")
+        method, params = "get_config", None
 
     elif name == "sim_drive_command":
-        resp = _call_bridge("drive_command", {
+        method = "drive_command"
+        params = {
             "fwd":   arguments.get("fwd", 0.0),
             "yaw":   arguments.get("yaw", 0.0),
             "ticks": arguments.get("ticks", 500),
-        })
+        }
 
     elif name == "sim_set_lean":
-        resp = _call_bridge("set_lean", {"lean_rad": arguments["lean_rad"]})
+        method = "set_lean"
+        params = {"lean_rad": arguments["lean_rad"]}
 
     elif name == "sim_set_target_position":
-        resp = _call_bridge("set_target_position",
-                            {"position": arguments["position"]})
+        method = "set_target_position"
+        params = {"position": arguments["position"]}
 
     elif name == "sim_set_param":
-        resp = _call_bridge("set_param", {
+        method = "set_param"
+        params = {
             "section": arguments["section"],
             "key":     arguments["key"],
             "value":   arguments["value"],
-        })
+        }
 
     elif name == "sim_set_drive_mode":
-        resp = _call_bridge("set_drive_mode", {"mode": arguments["mode"]})
+        method = "set_drive_mode"
+        params = {"mode": arguments["mode"]}
+
+    elif name == "sim_start_recording":
+        method = "start_recording"
+        params = {"vars": arguments["vars"]} if "vars" in arguments else None
+
+    elif name == "sim_stop_recording":
+        method, params, timeout = "stop_recording", None, _TIMEOUT_RECORDING
 
     elif name == "sim_reset":
-        resp = _call_bridge("reset_sim")
-
-    elif name == "sim_run_experiment":
-        fwd     = arguments.get("fwd", 0.0)
-        yaw     = arguments.get("yaw", 0.0)
-        ticks   = arguments.get("ticks", 500)
-        wait_ms = arguments.get("wait_ms", 1200)
-
-        # Inject the command
-        _call_bridge("drive_command",
-                     {"fwd": fwd, "yaw": yaw, "ticks": ticks})
-
-        # Wait for the sim to run it
-        time.sleep(wait_ms / 1000.0)
-
-        # Sample final state
-        resp = _call_bridge("get_state")
-        if resp.get("ok"):
-            resp["result"]["experiment"] = {
-                "fwd": fwd, "yaw": yaw,
-                "ticks": ticks, "wait_ms": wait_ms,
-            }
+        method, params = "reset_sim", None
 
     else:
         resp = {"ok": False, "error": f"Unknown tool: {name}"}
+        return [types.TextContent(type="text", text=_result_text(resp))]
 
+    resp = await asyncio.to_thread(_call_bridge, method, params, timeout)
     return [types.TextContent(type="text", text=_result_text(resp))]
 
 

@@ -117,7 +117,9 @@ def run_simulation():
     marker_h = CONFIG.gamepad.target_marker_height
 
     # Persistent bridge overrides (survive multiple ticks; ticks countdown to 0)
-    _bridge_fwd = None
+    # _bridge_target_abs stores an ABSOLUTE position setpoint (m), computed once
+    # at command-receipt time so the target doesn't drift as the robot moves.
+    _bridge_target_abs = None
     _bridge_yaw = None
     _bridge_lean = None
     _bridge_ticks_left = 0
@@ -134,13 +136,15 @@ def run_simulation():
         for cmd in bridge.pop_commands():
             ctype = cmd.get("type")
             if ctype == "drive":
-                _bridge_fwd = cmd["fwd"]
+                # Compute absolute target once from current position + offset.
+                # Storing as absolute prevents the target from drifting each tick.
+                _bridge_target_abs = robot.position + cmd["fwd"]
                 _bridge_yaw = cmd["yaw"]
                 _bridge_ticks_left = cmd.get("ticks", 500)
             elif ctype == "lean":
                 _bridge_lean = cmd["lean_rad"]
             elif ctype == "target_position":
-                _bridge_fwd = cmd["position"] - robot.position   # absolute → relative
+                _bridge_target_abs = cmd["position"]   # already absolute
                 _bridge_ticks_left = 5000   # hold indefinitely
             elif ctype == "set_drive_mode":
                 from robot_state import DriveMode
@@ -148,7 +152,7 @@ def run_simulation():
                 robot.set_drive_mode(target)
             elif ctype == "reset":
                 robot.reset()
-                _bridge_fwd = _bridge_yaw = _bridge_lean = None
+                _bridge_target_abs = _bridge_yaw = _bridge_lean = None
                 _bridge_ticks_left = 0
 
         # --- Input (gamepad / autonomy) ---
@@ -163,8 +167,8 @@ def run_simulation():
 
         # --- Apply bridge overrides (take priority over gamepad) ---
         if _bridge_ticks_left > 0:
-            if _bridge_fwd is not None:
-                robot.controller.set_target_position(robot.position + _bridge_fwd)
+            if _bridge_target_abs is not None:
+                robot.controller.set_target_position(_bridge_target_abs)
             if _bridge_yaw is not None:
                 robot.controller.set_yaw_rate(_bridge_yaw)
             if _bridge_lean is not None:
@@ -202,9 +206,9 @@ def run_simulation():
         bridge.push_state(telem)
 
         # --- Fall detection ---
-        if robot.check_fallen():
-            print(f"\n[{sim_time:.2f}s] Robot fell over!")
-            break
+        # if robot.check_fallen():
+        #     print(f"\n[{sim_time:.2f}s] Robot fell over!")
+        #     break
 
         # --- Periodic console log ---
         if sim_time - last_log_time >= log_interval:

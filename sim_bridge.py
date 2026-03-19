@@ -17,16 +17,19 @@ Responses always include:
 
 Supported methods
 ──────────────────
-  get_state           → full latest RobotState + ControlOutput snapshot
+  ping                → {"pong": true}
+  get_state           → full latest telemetry snapshot
   get_config          → full CONFIG dict (serialised)
-  drive_command       → params: {fwd: float, yaw: float}
-                        Injects a synthetic ControlGoals for N ticks.
+  start_recording     → params: {vars: [str, ...] or omit for all}
+                        Starts buffering every sim tick into a ring buffer.
+  stop_recording      → returns {n_samples: int, samples: [...]}
+                        Stops buffering and flushes the ring buffer.
+  drive_command       → params: {fwd: float, yaw: float, ticks: int}
   set_lean            → params: {lean_rad: float}
   set_target_position → params: {position: float}
   set_param           → params: {section: str, key: str, value: any}
-                        Live-patches CONFIG (e.g. section="lqr", key="q_diag")
+  set_drive_mode      → params: {mode: "2wd" | "4wd"}
   reset_sim           → queues a physics reset on the next tick
-  ping                → returns {"pong": true}
 """
 
 from __future__ import annotations
@@ -35,12 +38,14 @@ import json
 import logging
 import socket
 import threading
+from collections import deque
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _PORT = 9871
 _HOST = "127.0.0.1"
+_RECORD_MAXLEN = 20_000   # ~40 s at 500 Hz
 
 
 class SimBridge:
@@ -59,6 +64,11 @@ class SimBridge:
 
         # Pending command queue  (consumed by sim loop via pop_commands)
         self._cmds: list[dict] = []
+
+        # Ring-buffer recording (filled by push_state when active)
+        self._recording: bool = False
+        self._record_vars: list[str] | None = None   # None = all
+        self._record_buf: deque = deque(maxlen=_RECORD_MAXLEN)
 
         self._server_thread: threading.Thread | None = None
         self._running = False
@@ -81,9 +91,18 @@ class SimBridge:
         self._running = False
 
     def push_state(self, state_dict: dict):
-        """Called every sim tick — updates the shared state snapshot."""
+        """Called every sim tick — updates the shared state snapshot and
+        appends to the recording ring buffer when recording is active."""
         with self._lock:
             self._state = state_dict
+            if self._recording:
+                if self._record_vars:
+                    sample = {k: state_dict[k]
+                               for k in self._record_vars
+                               if k in state_dict}
+                else:
+                    sample = dict(state_dict)
+                self._record_buf.append(sample)
 
     def pop_commands(self) -> list[dict]:
         """Called every sim tick — returns and clears any injected commands."""
@@ -114,7 +133,7 @@ class SimBridge:
     def _handle(self, conn: socket.socket):
         try:
             data = b""
-            conn.settimeout(3.0)
+            conn.settimeout(5.0)   # longer for stop_recording (big payload)
             while b"\n" not in data:
                 chunk = conn.recv(4096)
                 if not chunk:
@@ -123,7 +142,13 @@ class SimBridge:
             line = data.split(b"\n")[0]
             req = json.loads(line.decode())
             resp = self._dispatch(req)
-            conn.sendall((json.dumps(resp) + "\n").encode())
+            payload = (json.dumps(resp) + "\n").encode()
+            # Send in chunks so large recording payloads don't block
+            view = memoryview(payload)
+            sent = 0
+            while sent < len(payload):
+                n = conn.send(view[sent:])
+                sent += n
         except Exception as exc:
             try:
                 conn.sendall(
@@ -194,6 +219,28 @@ class SimBridge:
                 }}
             except AttributeError as e:
                 return {"ok": False, "error": str(e)}
+
+        elif method == "start_recording":
+            vars_ = params.get("vars")   # list or None
+            with self._lock:
+                self._record_buf.clear()
+                self._record_vars = list(vars_) if vars_ else None
+                self._recording = True
+            return {"ok": True, "result": {
+                "recording": True,
+                "vars": self._record_vars or "all",
+                "buffer_maxlen": _RECORD_MAXLEN,
+            }}
+
+        elif method == "stop_recording":
+            with self._lock:
+                self._recording = False
+                samples = list(self._record_buf)
+                self._record_buf.clear()
+            return {"ok": True, "result": {
+                "n_samples": len(samples),
+                "samples": samples,
+            }}
 
         elif method == "set_drive_mode":
             mode = params.get("mode", "").lower()

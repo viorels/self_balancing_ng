@@ -189,6 +189,34 @@ class TribotBalanceBot:
             else:
                 p.resetJointState(self.body_id, i, 0.0, 0.0)
 
+        # --- Drain gear-constraint solver warmstart before any physics steps.
+        #
+        # PyBullet's JOINT_GEAR constraints keep internal Lagrange-multiplier
+        # state (warmstart) across ticks.  After resetJointState the positions
+        # and velocities are zero, but the solver's internal force estimate is
+        # still whatever it was on the last tick before reset.  On the very
+        # first step after reset those stale forces are applied in full,
+        # launching the robot skyward.
+        #
+        # Fix: temporarily disable all wheel actuators (force=0) and step the
+        # simulation ~20 times so the solver converges to zero forces before
+        # we hand control back to the balance controller.
+        all_wheel_joints = self.l_wheel_joints + self.r_wheel_joints
+        for ji in all_wheel_joints:
+            p.setJointMotorControl2(
+                self.body_id, ji,
+                p.VELOCITY_CONTROL,
+                targetVelocity=0, force=0)
+        for _ in range(20):
+            p.stepSimulation()
+        # Re-enable default friction damping on wheel joints.
+        for ji in all_wheel_joints:
+            p.setJointMotorControl2(
+                self.body_id, ji,
+                p.VELOCITY_CONTROL,
+                targetVelocity=0,
+                force=self.cfg.robot.belt_max_force)
+
         # --- Reset motor first-order lag models ---
         self.motors = [
             type(self.motors[0])(self.cfg),
@@ -207,6 +235,8 @@ class TribotBalanceBot:
         self.triplet_base_angle = self.cfg.sim.initial_triplet_angle
         self.state = RobotState(drive_mode=self.drive_mode,
                                 triplet_base_angle=self.triplet_base_angle)
+        self.triplet_ctrl_L.drive_mode = self.drive_mode
+        self.triplet_ctrl_R.drive_mode = self.drive_mode
 
         # --- Reset controller integrators (best-effort) ---
         ctrl = self.controller
