@@ -17,9 +17,9 @@ from robot_state import DriveMode
 # TRIPLET GEOMETRY — sine-theorem lean compensation
 # ============================================================================
 
-def compute_triplet_from_pitch(alpha, h, l=0.12):
+def compute_triplet_from_pitch(alpha, h, l=0.12, base_angle=None):
     """
-    Compute triplet-to-body angle β for a given body lean α using the
+    Compute triplet joint angle for a given body lean α using the
     sine theorem on the CoG–hub–contact triangle.
 
     Triangle vertices:
@@ -39,25 +39,48 @@ def compute_triplet_from_pitch(alpha, h, l=0.12):
     Valid for |α| < arcsin(l/h).  Clamped to ±π/2 for safety.
 
     Args:
-        alpha:  body lean angle (rad, positive = forward)
-        h:      hub-to-CoG distance (m)
-        l:      hub-to-wheel contact distance (m), default 0.12
+        alpha:      body lean angle (rad, positive = forward)
+        h:          hub-to-CoG distance (m)
+        l:          hub-to-wheel contact distance (m), default 0.12
+        base_angle: joint reading at equilibrium (e.g. ±π/3 in 2WD).
+                    When provided, returns the absolute joint angle
+                    (base_angle − β).  When None (legacy), returns
+                    the raw geometric offset β.
 
     Returns:
-        beta:   required triplet-to-body angle (rad)
+        If base_angle is None: geometric offset β (rad)
+        If base_angle given:   absolute joint angle (rad)
     """
     ratio = h / l
     sin_arg = ratio * math.sin(alpha)
     sin_arg = max(-1.0, min(1.0, sin_arg))  # clamp for safety
-    return alpha + math.asin(sin_arg)
+    beta = alpha + math.asin(sin_arg)
+    if base_angle is not None:
+        return base_angle - beta
+    return beta
 
 
-def compute_pitch_from_triplet(beta, h, l=0.12):
+def compute_pitch_from_triplet(beta, h, l=0.12, base_angle=None):
     """
-    Inverse of compute_triplet_from_pitch: compute body lean α from triplet angle β.
-    Rearranging the sine theorem gives:
-    α = arctan((l sin β) / (h + l cos β))
+    Inverse of compute_triplet_from_pitch: compute body lean α from
+    a triplet joint angle.
+
+    Args:
+        beta:       triplet angle (rad).  If base_angle is None this is
+                    the raw geometric offset (0 = balanced).  If base_angle
+                    is given this is the *absolute* joint reading.
+        h:          hub-to-CoG distance (m)
+        l:          hub-to-wheel contact distance (m), default 0.12
+        base_angle: joint reading at equilibrium (e.g. ±π/3 in 2WD).
+                    When provided, the geometric offset is computed as
+                    (base_angle − beta) so the caller can pass the raw
+                    encoder value directly.
+
+    Returns:
+        alpha: body lean angle supported by this triplet position (rad)
     """
+    if base_angle is not None:
+        beta = base_angle - beta
     alpha = math.atan2(l * math.sin(beta), h + l * math.cos(beta))
     return alpha
 
@@ -101,6 +124,10 @@ class TripletController:
         self.kd = config.triplet.lean_kd
         self.target_angle = config.sim.initial_triplet_angle
         self.base_angle = config.sim.initial_triplet_angle  # equilibrium angle (set by sim loop)
+
+        # Lean compensation geometry
+        self.cog_dist_2wd = config.triplet.cog_dist_2wd
+        self.lean_scale_4wd = config.triplet.lean_scale_4wd
 
         # Gravity compensation gains (mode-dependent)
         self.grav_comp_4wd = config.triplet.grav_comp_4wd
@@ -165,9 +192,9 @@ class TripletController:
         tau_grav = -grav_gain * math.sin(body_pitch + angle - self.base_angle)
         self.last_grav_comp = tau_grav
 
-        print(f"  TripletController: target_angle={math.degrees(self.target_angle):.1f}\u00b0, "
-              f"angle={math.degrees(angle):.1f}\u00b0, body_pitch={math.degrees(body_pitch):.1f}\u00b0, error={math.degrees(error):.1f}\u00b0, "
-              f"tau_pd={tau_pd:.2f} Nm, tau_grav={tau_grav:.2f} Nm")
+        # print(f"  TripletController: target_angle={math.degrees(self.target_angle):.1f}\u00b0, "
+        #       f"angle={math.degrees(angle):.1f}\u00b0, body_pitch={math.degrees(body_pitch):.1f}\u00b0, error={math.degrees(error):.1f}\u00b0, "
+        #       f"tau_pd={tau_pd:.2f} Nm, tau_grav={tau_grav:.2f} Nm")
 
         base_force = tau_pd
 
@@ -206,6 +233,44 @@ class TripletController:
             self.last_assist_force += alpha * (assist_force_raw - self.last_assist_force)
 
         return base_force + self.last_assist_force
+
+    def compute_lean_and_update(self, target_pitch, desired_lean, base_angle,
+                                 triplet_angle, triplet_rate, body_pitch,
+                                 body_pitch_rate=0.0, dt=0.002):
+        """
+        Compute lean-compensation target and run the PD update in one call.
+
+        Encapsulates the mode-dependent geometry that converts a body-pitch
+        target into a triplet-hub target angle, then drives the hub toward it.
+
+        In 2WD the full sine-theorem mapping is used; in 4WD a linear scale
+        plus the raw desired-lean offset is applied.
+
+        Args:
+            target_pitch:    controller's target body pitch (rad)
+            desired_lean:    raw lean offset from remote input (rad)
+            base_angle:      current triplet equilibrium / base angle (rad)
+            triplet_angle:   measured triplet joint angle (rad, relative to body)
+            triplet_rate:    measured triplet joint angular velocity (rad/s)
+            body_pitch:      measured body pitch in world frame (rad)
+            body_pitch_rate: measured body pitch rate (rad/s)
+            dt:              timestep (s)
+
+        Returns:
+            torque (Nm) to apply at the triplet hub joint
+        """
+        if self.drive_mode == DriveMode.TWO_WD:
+            joint_target = compute_triplet_from_pitch(
+                target_pitch, h=self.cog_dist_2wd, base_angle=base_angle)
+        else:
+            lean_comp = -target_pitch * self.lean_scale_4wd - desired_lean
+            joint_target = base_angle + lean_comp
+
+        self.set_base_angle(base_angle)
+        self.set_target(joint_target)
+
+        return self.update(triplet_angle, triplet_rate, body_pitch,
+                           body_pitch_rate=body_pitch_rate, dt=dt)
 
     def set_target(self, angle_rad):
         """Override the target triplet joint angle (rad)."""

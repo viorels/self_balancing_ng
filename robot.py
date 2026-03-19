@@ -21,11 +21,12 @@ from imu_model import IMUSensorModel
 from triplet_controller import (
     TripletController,
     compute_triplet_from_pitch,
-    compute_pitch_from_triplet,
 )
+from controllers.base import StateReference
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
 from controllers.control_mpc_hybrid import MPCHybridController
+from controllers.lean_trajectory import LeanTrajectory
 
 
 # ============================================================================
@@ -122,6 +123,17 @@ class TribotBalanceBot:
         self.drive_mode = DriveMode.FOUR_WD
         self.triplet_base_angle = config.sim.initial_triplet_angle
 
+        # Lean transition trajectory planner (2WD only).
+        # Generates smooth state references so the LQR tracks a feasible
+        # path instead of a step when the operator commands a lean change.
+        self._lean_traj = LeanTrajectory(
+            h_cog=config.triplet.cog_dist_2wd,
+            min_duration=0.2,
+            max_duration=1.0,
+            lean_per_sec_factor=0.25,
+        )
+        self._prev_requested_lean = 0.0
+
         # IMU sensor model
         self.imu = IMUSensorModel(config)
 
@@ -136,8 +148,6 @@ class TribotBalanceBot:
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
-
-        self.lean_offset_ema = 0.0
 
         # Sensor state (populated by read_sensors() on each tick)
         self.state = RobotState(drive_mode=self.drive_mode,
@@ -156,6 +166,105 @@ class TribotBalanceBot:
         mode = '2WD' if abs(trip_angle - math.pi / 3) < 0.05 else ('4WD' if abs(trip_angle) < 0.05 else 'Lean')
         print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° ({mode} mode)")
 
+    def reset(self):
+        """Reset the robot to its initial upright pose with zero velocities.
+
+        Intended for AI-driven experiments: call between trials to start fresh
+        without restarting the simulation process.
+        """
+        # --- Restore base pose (CoM frame, not link frame!) ---
+        # See _load_robot() for why we use _initial_com_pos instead of
+        # config.initial_height.
+        p.resetBasePositionAndOrientation(
+            self.body_id,
+            list(self._initial_com_pos),
+            list(self._initial_com_orn))
+        p.resetBaseVelocity(self.body_id,
+                            linearVelocity=[0, 0, 0],
+                            angularVelocity=[0, 0, 0])
+
+        # --- Restore all joint states ---
+        num_joints = p.getNumJoints(self.body_id)
+        trip_angle = self.cfg.sim.initial_triplet_angle
+        for i in range(num_joints):
+            if i in (self.l_triplet_joint, self.r_triplet_joint):
+                p.resetJointState(self.body_id, i, trip_angle, 0.0)
+            else:
+                p.resetJointState(self.body_id, i, 0.0, 0.0)
+
+        # --- Nuke gear constraints and recreate them fresh.
+        #
+        # PyBullet's JOINT_GEAR constraints keep internal solver warmstart
+        # across ticks.  The only way to get a clean state is to destroy
+        # and recreate them.
+        for cid in self.belt_constraints:
+            p.removeConstraint(cid)
+        self.belt_constraints.clear()
+
+        # Disable all joint motors so no stale TORQUE_CONTROL forces leak.
+        all_actuated = (self.l_wheel_joints + self.r_wheel_joints
+                        + [self.l_triplet_joint, self.r_triplet_joint])
+        for ji in all_actuated:
+            p.setJointMotorControl2(
+                self.body_id, ji,
+                p.VELOCITY_CONTROL,
+                targetVelocity=0, force=0)
+
+        # Flush broadphase so the collision engine knows the body has
+        # teleported.  Without this, PyBullet may retain stale contact
+        # manifolds from the fallen pose and apply ghost impulses on the
+        # first post-reset step.
+        p.performCollisionDetection()
+
+        # Recreate belt constraints with fresh solver state.
+        self._setup_belt_constraints()
+
+        # --- Reset motor first-order lag models ---
+        self.motors = [
+            type(self.motors[0])(self.cfg),
+            type(self.motors[1])(self.cfg),
+        ]
+
+        # --- Reset IMU ---
+        self.imu = type(self.imu)(self.cfg)
+
+        # --- Reset software state ---
+        self.position = 0.0
+        self.pitch_angle = 0.0
+        self.pitch_rate = 0.0
+        self.actual_torques = [0.0, 0.0]
+        self.drive_mode = DriveMode.FOUR_WD
+        self.triplet_base_angle = self.cfg.sim.initial_triplet_angle
+        self.state = RobotState(drive_mode=self.drive_mode,
+                                triplet_base_angle=self.triplet_base_angle)
+        self.triplet_ctrl_L.drive_mode = self.drive_mode
+        self.triplet_ctrl_R.drive_mode = self.drive_mode
+
+        # --- Reset controller ---
+        ctrl = self.controller
+        if hasattr(ctrl, 'reset'):
+            ctrl.reset()
+        else:
+            # Fallback for controllers without a reset() method.
+            for attr in ('_integral', '_pos_integral', 'x_hat',
+                         '_prev_error', '_prev_pos_error'):
+                if hasattr(ctrl, attr):
+                    import numpy as np
+                    val = getattr(ctrl, attr)
+                    if hasattr(val, 'shape'):
+                        setattr(ctrl, attr, np.zeros_like(val))
+                    else:
+                        setattr(ctrl, attr, 0.0)
+            ctrl.set_target_position(0.0)
+            ctrl.set_yaw_rate(0.0)
+            ctrl.set_lean(0.0)
+
+        # --- Reset lean trajectory planner ---
+        self._lean_traj.cancel()
+        self._prev_requested_lean = 0.0
+
+        print("[reset] Robot pose and state restored to initial conditions.")
+
     def _load_robot(self):
         """Load the URDF with preprocessed paths."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -173,6 +282,15 @@ class TribotBalanceBot:
             )
         finally:
             os.unlink(temp_urdf)
+
+        # Capture initial CoM pose for use by reset().
+        # loadURDF places the *link frame origin* at basePosition, then
+        # PyBullet internally shifts to the CoM using the <inertial>
+        # <origin> offset.  getBasePositionAndOrientation returns the CoM,
+        # and resetBasePositionAndOrientation expects the CoM — so we must
+        # store the CoM pose (NOT the config value) for a correct reset.
+        self._initial_com_pos, self._initial_com_orn = \
+            p.getBasePositionAndOrientation(self.body_id)
 
     def _discover_joints(self):
         """Build a name→index map and identify joint groups."""
@@ -360,6 +478,49 @@ class TribotBalanceBot:
         return state
 
     # ----------------------------------------------------------------
+    # State reference
+    # ----------------------------------------------------------------
+
+    def _build_state_reference(self, sim_time):
+        """Build the StateReference for the current tick.
+
+        In 2WD, when the operator commands a lean change, a minimum-jerk
+        trajectory provides smooth [pos, vel, pitch, pitch_rate] references
+        so the LQR tracks a feasible path.  In 4WD (or when no trajectory
+        is active) the reference is simply the operator's commanded lean
+        at the current target position.
+        """
+        requested = self.controller.requested_lean
+
+        # Detect lean change → start trajectory (2WD only)
+        if (self.drive_mode == DriveMode.TWO_WD
+                and abs(requested - self._prev_requested_lean) > math.radians(1.0)):
+            self._lean_traj.start(
+                sim_time=sim_time,
+                current_position=self.controller.target_position,
+                theta_start=self.controller.target_lean,
+                theta_end=requested,
+            )
+        self._prev_requested_lean = requested
+
+        # Active trajectory → use its smooth reference
+        if self._lean_traj.active:
+            ref_pos, ref_vel, ref_pitch, ref_prate = \
+                self._lean_traj.update(sim_time)
+            return StateReference(
+                position=ref_pos,
+                velocity=ref_vel,
+                pitch=ref_pitch,
+                pitch_rate=ref_prate,
+            )
+
+        # Steady state: track operator commands directly
+        return StateReference(
+            position=self.controller.target_position,
+            pitch=requested,
+        )
+
+    # ----------------------------------------------------------------
     # Control update
     # ----------------------------------------------------------------
 
@@ -379,10 +540,20 @@ class TribotBalanceBot:
             s.triplet_rate_L, s.triplet_rate_R,
         )
 
+        if not self.controller.plans_triplet_torque:
+            self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
+            self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
+
+        # --- Build state reference ---
+        # The robot loop owns the trajectory planner and knows the drive
+        # mode, so it builds the StateReference that the controller
+        # tracks.  The controller is a pure function of (state, ref, K).
+        ref = self._build_state_reference(sim_time)
+
         # --- Controller → per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             s.pitch, s.pitch_rate,
-            s.position, s.yaw_rate, sim_time, dt
+            s.position, s.yaw_rate, sim_time, dt, ref=ref
         )
 
         # Triplet hub commands
@@ -390,25 +561,17 @@ class TribotBalanceBot:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
-            lean_comp = 0.0
-            lean_offset = self.controller.desired_lean
-            alpha = self.controller.target_pitch
-            if self.drive_mode == DriveMode.TWO_WD:
-                beta = compute_triplet_from_pitch(alpha, h=self.cfg.triplet.cog_dist_2wd)
-                lean_comp = -beta
-            else:
-                lean_scale = self.cfg.triplet.lean_scale_4wd
-                lean_comp = -alpha * lean_scale - lean_offset
-
-            self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
-            self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
-            self.triplet_ctrl_L.set_target(self.triplet_base_angle + lean_comp)
-            self.triplet_ctrl_R.set_target(self.triplet_base_angle + lean_comp)
-
-            triplet_cmd_L = self.triplet_ctrl_L.update(
+            # Triplet target = ref.pitch (trajectory pitch during
+            # transitions, requested lean otherwise).  Works for
+            # both 2WD and 4WD — the ref already encodes the mode.
+            triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
+                ref.pitch, self.controller.desired_lean,
+                self.triplet_base_angle,
                 s.triplet_angle_L, s.triplet_rate_L, s.pitch,
                 body_pitch_rate=s.pitch_rate, dt=dt)
-            triplet_cmd_R = self.triplet_ctrl_R.update(
+            triplet_cmd_R = self.triplet_ctrl_R.compute_lean_and_update(
+                ref.pitch, self.controller.desired_lean,
+                self.triplet_base_angle,
                 s.triplet_angle_R, s.triplet_rate_R, s.pitch,
                 body_pitch_rate=s.pitch_rate, dt=dt)
 
@@ -509,6 +672,11 @@ class TribotBalanceBot:
         yaw = math.atan2(fwd_y, fwd_x)
         return pos[0], pos[1], yaw, fwd_x, fwd_y
 
+    def set_drive_mode(self, mode: DriveMode):
+        """Set a specific drive mode; no-op if already in that mode."""
+        if mode != self.drive_mode:
+            self.toggle_drive_mode()
+
     def toggle_drive_mode(self):
         """Toggle between 4WD and 2WD drive modes."""
         angle_2wd = self.cfg.robot.triplet_2wd_angle
@@ -527,6 +695,8 @@ class TribotBalanceBot:
             print(f"  [MODE] 2WD → 4WD  (triplet target 0°)")
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
+        if self.drive_mode == DriveMode.FOUR_WD:
+            self._lean_traj.cancel()
 
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""

@@ -22,6 +22,7 @@ from input.gamepad import Gamepad
 from input.input_manager import InputManager
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain
+from sim_bridge import SimBridge
 
 
 CONFIG = load_config()
@@ -106,10 +107,22 @@ def run_simulation():
     pj = PlotJugglerStreamer()
     print("PlotJuggler UDP streamer active on 127.0.0.1:9870")
 
+    # --- AI bridge ---
+    bridge = SimBridge(CONFIG)
+    bridge.start()
+
     # --- Visual target marker ---
     marker_id = -1
     marker_color = [0.0, 1.0, 0.0]
     marker_h = CONFIG.gamepad.target_marker_height
+
+    # Persistent bridge overrides (survive multiple ticks; ticks countdown to 0)
+    # _bridge_target_abs stores an ABSOLUTE position setpoint (m), computed once
+    # at command-receipt time so the target doesn't drift as the robot moves.
+    _bridge_target_abs = None
+    _bridge_yaw = None
+    _bridge_lean = None
+    _bridge_ticks_left = 0
 
     sim_time = 0.0
     log_interval = 0.1
@@ -119,7 +132,44 @@ def run_simulation():
     # Main loop: input → sensors → controller → actuators → step → telem
     # ==================================================================
     while sim_time < CONFIG.sim.sim_duration:
-        # --- Input ---
+        # --- Drain bridge command queue ---
+        for cmd in bridge.pop_commands():
+            ctype = cmd.get("type")
+            if ctype == "drive":
+                # Compute absolute target once from current position + offset.
+                # Storing as absolute prevents the target from drifting each tick.
+                _bridge_target_abs = robot.position + cmd["fwd"]
+                _bridge_yaw = cmd["yaw"]
+                _bridge_ticks_left = cmd.get("ticks", 500)
+            elif ctype == "lean":
+                _bridge_lean = cmd["lean_rad"]
+            elif ctype == "target_position":
+                _bridge_target_abs = cmd["position"]   # already absolute
+                _bridge_ticks_left = 5000   # hold indefinitely
+            elif ctype == "set_drive_mode":
+                from robot_state import DriveMode
+                target = DriveMode.TWO_WD if cmd["mode"] == "2wd" else DriveMode.FOUR_WD
+                robot.set_drive_mode(target)
+            elif ctype == "reset":
+                robot.reset()
+                _bridge_target_abs = _bridge_yaw = _bridge_lean = None
+                _bridge_ticks_left = 0
+                inp.target_position = 0.0     # flush stale gamepad target
+                sim_time = 0.0
+                last_log_time = 0.0
+
+        # --- Keyboard shortcuts (PyBullet GUI) ---
+        keys = p.getKeyboardEvents()
+        if ord('r') in keys and (keys[ord('r')] & p.KEY_WAS_TRIGGERED):
+            print("[key] R pressed — resetting robot")
+            robot.reset()
+            _bridge_target_abs = _bridge_yaw = _bridge_lean = None
+            _bridge_ticks_left = 0
+            inp.target_position = 0.0
+            sim_time = 0.0
+            last_log_time = 0.0
+
+        # --- Input (gamepad / autonomy) ---
         goals, mode_toggle, marker = inp.update(
             robot.position, robot.get_world_pose_2d()
         )
@@ -128,6 +178,16 @@ def run_simulation():
         robot.controller.set_lean(goals.pitch_bias)
         if mode_toggle:
             robot.toggle_drive_mode()
+
+        # --- Apply bridge overrides (take priority over gamepad) ---
+        if _bridge_ticks_left > 0:
+            if _bridge_target_abs is not None:
+                robot.controller.set_target_position(_bridge_target_abs)
+            if _bridge_yaw is not None:
+                robot.controller.set_yaw_rate(_bridge_yaw)
+            if _bridge_lean is not None:
+                robot.controller.set_lean(_bridge_lean)
+            _bridge_ticks_left -= 1
 
         # --- Update visual marker ---
         if inp.connected:
@@ -151,16 +211,18 @@ def run_simulation():
         # --- Telemetry: pull from robot + controller, merge, stream ---
         ctrl_telem = robot.controller.get_telemetry()
         robot_telem = robot.get_telemetry()
-        pj.send({
+        telem = {
             "timestamp": sim_time,
             **robot_telem,
             **{f"ctrl/{k}": v for k, v in ctrl_telem.items()},
-        })
+        }
+        pj.send(telem)
+        bridge.push_state(telem)
 
         # --- Fall detection ---
-        if robot.check_fallen():
-            print(f"\n[{sim_time:.2f}s] Robot fell over!")
-            break
+        # if robot.check_fallen():
+        #     print(f"\n[{sim_time:.2f}s] Robot fell over!")
+        #     break
 
         # --- Periodic console log ---
         if sim_time - last_log_time >= log_interval:
@@ -190,6 +252,7 @@ def run_simulation():
     else:
         print("✗ Robot fell.")
 
+    bridge.stop()
     pj.close()
     print("\nClose the PyBullet window to exit.")
     while p.isConnected(physics_client):

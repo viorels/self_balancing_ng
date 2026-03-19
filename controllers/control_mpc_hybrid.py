@@ -1392,7 +1392,7 @@ class MPCHybridController(BalanceControllerBase):
     # ----------------------------------------------------------------
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt):
+               position, yaw_rate, sim_time, dt, ref=None):
         """
         Run one tick of the hybrid MPC+PD controller.
 

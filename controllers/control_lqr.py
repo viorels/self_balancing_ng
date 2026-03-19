@@ -21,7 +21,7 @@ Outputs: per-side commanded torques (left, right)
 import math
 import numpy as np
 
-from .base import BalanceControllerBase
+from .base import BalanceControllerBase, StateReference
 
 
 # ============================================================================
@@ -218,15 +218,53 @@ class LQRBalanceController(BalanceControllerBase):
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
 
-        # --- Lean setpoint (left-joystick lean command, rad) ---
-        # The controller receives (measured_pitch - target_lean) so an
-        # intentional user lean is not treated as an error to correct.
+        # --- Lean setpoints ---
+        # _requested_lean: raw operator command from gamepad / remote.
+        # target_lean:     effective pitch reference (from last ref passed
+        #                  to update), kept for telemetry and sim-loop reads.
+        self._requested_lean = 0.0
         self.target_lean = 0.0
 
         # --- LQR-implied desired lean (computed each control tick) ---
         # Exposed so the triplet PD can cooperate with the lean the LQR
         # needs for position tracking.
         self._desired_lean = 0.0
+
+    def reset(self):
+        """Zero all internal state for a clean restart.
+
+        Called by robot.reset() to ensure the controller doesn't inject
+        stale torques, velocity estimates, or gain-scheduling state from
+        a previous run.
+        """
+        self.target_position = 0.0
+        self.yaw_rate_setpoint = 0.0
+        self._requested_lean = 0.0
+        self.target_lean = 0.0
+        self.target_pitch = 0.0
+        self._desired_lean = 0.0
+
+        # Velocity estimator — stale prev_position causes a wild velocity
+        # spike on the first control tick after reset.
+        self.prev_position = 0.0
+        self.prev_vel_time = 0.0
+        self.velocity = 0.0
+
+        # Control-loop timing — let it fire on the very next tick.
+        self.next_control_time = 0.0
+
+        # Torque delay buffer — flush pre-reset saturated torques.
+        delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
+        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
+
+        # Gain scheduling — return to normal mode.
+        self.K = self.K_normal
+        self.aggressive_active = False
+
+        # Zero telemetry accumulators.
+        self.control_torque = 0.0
+        self.K_contributions = np.zeros(4)
+        self.state_error = np.zeros(4)
 
     # ----------------------------------------------------------------
     # BalanceControllerBase interface
@@ -241,13 +279,20 @@ class LQRBalanceController(BalanceControllerBase):
         self.yaw_rate_setpoint = yaw_rate
 
     def set_lean(self, lean_rad):
-        """Set desired lean angle (rad). Positive = lean forward.
+        """Store the raw operator lean command (rad). Positive = forward."""
+        self._requested_lean = lean_rad
 
-        The controller will see (measured_pitch - lean_rad) as the pitch
-        error, so the robot leans to the requested angle without fighting it.
-        """
-        self.target_lean = lean_rad
-        self.target_pitch = lean_rad   # keep log field in sync
+    @property
+    def requested_lean(self) -> float:
+        """Raw operator lean command (rad), before triplet coordination."""
+        return self._requested_lean
+
+    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R):
+        """Update triplet encoder readings (called each tick from tribot_sim)."""
+        self._triplet_angle_L = angle_L
+        self._triplet_angle_R = angle_R
+        self._triplet_rate_L = rate_L
+        self._triplet_rate_R = rate_R
 
     @property
     def desired_lean(self) -> float:
@@ -266,6 +311,7 @@ class LQRBalanceController(BalanceControllerBase):
             "K_pitch":          float(self.K_contributions[2]),
             "K_pitch_rate":     float(self.K_contributions[3]),
             "desired_lean":     float(self._desired_lean),
+            "requested_lean":   float(self._requested_lean),
             "target_pos":       float(self.target_position),
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
@@ -273,7 +319,8 @@ class LQRBalanceController(BalanceControllerBase):
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt):
+               position, yaw_rate, sim_time, dt,
+               ref=None):
         """
         Run one controller tick.
 
@@ -284,10 +331,25 @@ class LQRBalanceController(BalanceControllerBase):
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
+            ref:                 StateReference with target [pos, vel, pitch,
+                                 pitch_rate].  Built by the robot loop which
+                                 owns the trajectory planner and drive-mode
+                                 knowledge.
 
         Returns:
             (left_torque, right_torque): commanded motor torques (Nm)
         """
+        # Fallback when no ref provided (e.g. standalone use)
+        if ref is None:
+            ref = StateReference(
+                position=self.target_position,
+                pitch=self._requested_lean,
+            )
+
+        # Keep telemetry-visible attributes in sync with the ref
+        self.target_lean = ref.pitch
+        self.target_pitch = ref.pitch
+
         # --- Velocity estimation (only at control rate to avoid noise) ---
         # Estimating at 500Hz physics rate amplifies tiny position jitter.
         # Instead, update velocity only when the control loop fires.
@@ -307,14 +369,15 @@ class LQRBalanceController(BalanceControllerBase):
             self.prev_position = position
             self.prev_vel_time = sim_time
 
-            # State error vector
-            # Subtract the user-requested lean so the controller does not
-            # try to correct an intentional lean commanded via the joystick.
+            # State error: measured − reference.
+            # The robot loop provides ref.velocity and ref.pitch_rate
+            # during trajectory transitions so the LQR doesn't fight
+            # the planned motion.
             x = np.array([
-                position - self.target_position,
-                self.velocity,
-                measured_pitch - self.target_lean,
-                measured_pitch_rate,
+                position - ref.position,
+                self.velocity - ref.velocity,
+                measured_pitch - ref.pitch,
+                measured_pitch_rate - ref.pitch_rate,
             ])
             self.state_error = x.copy()
 

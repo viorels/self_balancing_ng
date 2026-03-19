@@ -27,6 +27,21 @@ Design notes
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass
+class StateReference:
+    """Reference state passed to the controller each tick.
+
+    Built by the robot loop (which knows the drive mode and owns the
+    trajectory planner).  The controller is a pure function of
+    (measured_state, ref, gains) → torques.
+    """
+    position: float = 0.0
+    velocity: float = 0.0
+    pitch: float = 0.0
+    pitch_rate: float = 0.0
 
 
 class BalanceControllerBase(ABC):
@@ -56,7 +71,8 @@ class BalanceControllerBase(ABC):
     @abstractmethod
     def update(self, measured_pitch: float, measured_pitch_rate: float,
                position: float, yaw_rate: float,
-               sim_time: float, dt: float) -> tuple[float, float]:
+               sim_time: float, dt: float,
+               ref: StateReference | None = None) -> tuple[float, float]:
         """
         Compute one control step.
 
@@ -67,6 +83,10 @@ class BalanceControllerBase(ABC):
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
+            ref:                 reference state (position, velocity, pitch,
+                                 pitch_rate).  Built by the robot loop.
+                                 Controllers that manage their own references
+                                 may ignore this (default None).
 
         Returns:
             (left_torque, right_torque) — commanded motor torques (Nm)
@@ -132,6 +152,11 @@ class BalanceControllerBase(ABC):
     @property
     def desired_lean(self) -> float:
         """LQR/MPC-implied lean demand (rad) for triplet cooperation.  Default 0."""
+        return 0.0
+
+    @property
+    def requested_lean(self) -> float:
+        """Raw operator lean command (rad) before triplet coordination.  Default 0."""
         return 0.0
 
     # ------------------------------------------------------------------
