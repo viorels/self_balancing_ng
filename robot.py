@@ -172,10 +172,13 @@ class TribotBalanceBot:
         Intended for AI-driven experiments: call between trials to start fresh
         without restarting the simulation process.
         """
-        # --- Restore base pose ---
-        init_pos = [0, 0, self.cfg.sim.initial_height]
-        init_orn = p.getQuaternionFromEuler([0, self.cfg.sim.initial_pitch, 0])
-        p.resetBasePositionAndOrientation(self.body_id, init_pos, init_orn)
+        # --- Restore base pose (CoM frame, not link frame!) ---
+        # See _load_robot() for why we use _initial_com_pos instead of
+        # config.initial_height.
+        p.resetBasePositionAndOrientation(
+            self.body_id,
+            list(self._initial_com_pos),
+            list(self._initial_com_orn))
         p.resetBaseVelocity(self.body_id,
                             linearVelocity=[0, 0, 0],
                             angularVelocity=[0, 0, 0])
@@ -189,33 +192,32 @@ class TribotBalanceBot:
             else:
                 p.resetJointState(self.body_id, i, 0.0, 0.0)
 
-        # --- Drain gear-constraint solver warmstart before any physics steps.
+        # --- Nuke gear constraints and recreate them fresh.
         #
-        # PyBullet's JOINT_GEAR constraints keep internal Lagrange-multiplier
-        # state (warmstart) across ticks.  After resetJointState the positions
-        # and velocities are zero, but the solver's internal force estimate is
-        # still whatever it was on the last tick before reset.  On the very
-        # first step after reset those stale forces are applied in full,
-        # launching the robot skyward.
-        #
-        # Fix: temporarily disable all wheel actuators (force=0) and step the
-        # simulation ~20 times so the solver converges to zero forces before
-        # we hand control back to the balance controller.
-        all_wheel_joints = self.l_wheel_joints + self.r_wheel_joints
-        for ji in all_wheel_joints:
+        # PyBullet's JOINT_GEAR constraints keep internal solver warmstart
+        # across ticks.  The only way to get a clean state is to destroy
+        # and recreate them.
+        for cid in self.belt_constraints:
+            p.removeConstraint(cid)
+        self.belt_constraints.clear()
+
+        # Disable all joint motors so no stale TORQUE_CONTROL forces leak.
+        all_actuated = (self.l_wheel_joints + self.r_wheel_joints
+                        + [self.l_triplet_joint, self.r_triplet_joint])
+        for ji in all_actuated:
             p.setJointMotorControl2(
                 self.body_id, ji,
                 p.VELOCITY_CONTROL,
                 targetVelocity=0, force=0)
-        for _ in range(20):
-            p.stepSimulation()
-        # Re-enable default friction damping on wheel joints.
-        for ji in all_wheel_joints:
-            p.setJointMotorControl2(
-                self.body_id, ji,
-                p.VELOCITY_CONTROL,
-                targetVelocity=0,
-                force=self.cfg.robot.belt_max_force)
+
+        # Flush broadphase so the collision engine knows the body has
+        # teleported.  Without this, PyBullet may retain stale contact
+        # manifolds from the fallen pose and apply ghost impulses on the
+        # first post-reset step.
+        p.performCollisionDetection()
+
+        # Recreate belt constraints with fresh solver state.
+        self._setup_belt_constraints()
 
         # --- Reset motor first-order lag models ---
         self.motors = [
@@ -238,20 +240,28 @@ class TribotBalanceBot:
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
 
-        # --- Reset controller integrators (best-effort) ---
+        # --- Reset controller ---
         ctrl = self.controller
-        for attr in ('_integral', '_pos_integral', 'x_hat',
-                     '_prev_error', '_prev_pos_error'):
-            if hasattr(ctrl, attr):
-                import numpy as np
-                val = getattr(ctrl, attr)
-                if hasattr(val, 'shape'):
-                    setattr(ctrl, attr, np.zeros_like(val))
-                else:
-                    setattr(ctrl, attr, 0.0)
-        ctrl.set_target_position(0.0)
-        ctrl.set_yaw_rate(0.0)
-        ctrl.set_lean(0.0)
+        if hasattr(ctrl, 'reset'):
+            ctrl.reset()
+        else:
+            # Fallback for controllers without a reset() method.
+            for attr in ('_integral', '_pos_integral', 'x_hat',
+                         '_prev_error', '_prev_pos_error'):
+                if hasattr(ctrl, attr):
+                    import numpy as np
+                    val = getattr(ctrl, attr)
+                    if hasattr(val, 'shape'):
+                        setattr(ctrl, attr, np.zeros_like(val))
+                    else:
+                        setattr(ctrl, attr, 0.0)
+            ctrl.set_target_position(0.0)
+            ctrl.set_yaw_rate(0.0)
+            ctrl.set_lean(0.0)
+
+        # --- Reset lean trajectory planner ---
+        self._lean_traj.cancel()
+        self._prev_requested_lean = 0.0
 
         print("[reset] Robot pose and state restored to initial conditions.")
 
@@ -272,6 +282,15 @@ class TribotBalanceBot:
             )
         finally:
             os.unlink(temp_urdf)
+
+        # Capture initial CoM pose for use by reset().
+        # loadURDF places the *link frame origin* at basePosition, then
+        # PyBullet internally shifts to the CoM using the <inertial>
+        # <origin> offset.  getBasePositionAndOrientation returns the CoM,
+        # and resetBasePositionAndOrientation expects the CoM — so we must
+        # store the CoM pose (NOT the config value) for a correct reset.
+        self._initial_com_pos, self._initial_com_orn = \
+            p.getBasePositionAndOrientation(self.body_id)
 
     def _discover_joints(self):
         """Build a name→index map and identify joint groups."""

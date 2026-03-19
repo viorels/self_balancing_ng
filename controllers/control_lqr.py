@@ -230,6 +230,42 @@ class LQRBalanceController(BalanceControllerBase):
         # needs for position tracking.
         self._desired_lean = 0.0
 
+    def reset(self):
+        """Zero all internal state for a clean restart.
+
+        Called by robot.reset() to ensure the controller doesn't inject
+        stale torques, velocity estimates, or gain-scheduling state from
+        a previous run.
+        """
+        self.target_position = 0.0
+        self.yaw_rate_setpoint = 0.0
+        self._requested_lean = 0.0
+        self.target_lean = 0.0
+        self.target_pitch = 0.0
+        self._desired_lean = 0.0
+
+        # Velocity estimator — stale prev_position causes a wild velocity
+        # spike on the first control tick after reset.
+        self.prev_position = 0.0
+        self.prev_vel_time = 0.0
+        self.velocity = 0.0
+
+        # Control-loop timing — let it fire on the very next tick.
+        self.next_control_time = 0.0
+
+        # Torque delay buffer — flush pre-reset saturated torques.
+        delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
+        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
+
+        # Gain scheduling — return to normal mode.
+        self.K = self.K_normal
+        self.aggressive_active = False
+
+        # Zero telemetry accumulators.
+        self.control_torque = 0.0
+        self.K_contributions = np.zeros(4)
+        self.state_error = np.zeros(4)
+
     # ----------------------------------------------------------------
     # BalanceControllerBase interface
     # ----------------------------------------------------------------

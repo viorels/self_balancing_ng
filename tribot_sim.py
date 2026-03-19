@@ -154,6 +154,20 @@ def run_simulation():
                 robot.reset()
                 _bridge_target_abs = _bridge_yaw = _bridge_lean = None
                 _bridge_ticks_left = 0
+                inp.target_position = 0.0     # flush stale gamepad target
+                sim_time = 0.0
+                last_log_time = 0.0
+
+        # --- Keyboard shortcuts (PyBullet GUI) ---
+        keys = p.getKeyboardEvents()
+        if ord('r') in keys and (keys[ord('r')] & p.KEY_WAS_TRIGGERED):
+            print("[key] R pressed — resetting robot")
+            robot.reset()
+            _bridge_target_abs = _bridge_yaw = _bridge_lean = None
+            _bridge_ticks_left = 0
+            inp.target_position = 0.0
+            sim_time = 0.0
+            last_log_time = 0.0
 
         # --- Input (gamepad / autonomy) ---
         goals, mode_toggle, marker = inp.update(
