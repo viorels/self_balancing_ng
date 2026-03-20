@@ -22,7 +22,7 @@ from input.gamepad import Gamepad
 from input.input_manager import InputManager
 from plotjuggler_udp import PlotJugglerStreamer
 from terrain import create_terrain
-from sim_bridge import SimBridge
+from mcp.sim_bridge import SimBridge
 
 
 CONFIG = load_config()

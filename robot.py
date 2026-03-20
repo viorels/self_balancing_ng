@@ -16,9 +16,9 @@ import xml.etree.ElementTree as ET
 import pybullet as p
 
 from robot_state import DriveMode, RobotState
-from motor_model import BrushlessMotorModel
-from imu_model import IMUSensorModel
-from triplet_controller import (
+from models.motor_model import BrushlessMotorModel
+from models.imu_model import IMUSensorModel
+from controllers.triplet_controller import (
     TripletController,
     compute_triplet_from_pitch,
 )
