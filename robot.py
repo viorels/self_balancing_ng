@@ -126,13 +126,31 @@ class TribotBalanceBot:
         # Lean transition trajectory planner (2WD only).
         # Generates smooth state references so the LQR tracks a feasible
         # path instead of a step when the operator commands a lean change.
+        # h_cog uses pole_cog_2wd (ground-to-system-CoG = 0.381 m) because
+        # the position offset is how far the grounded wheels must roll to
+        # stay under the CoG projection.  NOT cog_dist_2wd (hub-to-body-CoG
+        # = 0.247 m) which is for triplet joint geometry only.
         self._lean_traj = LeanTrajectory(
-            h_cog=config.triplet.cog_dist_2wd,
-            min_duration=0.2,
-            max_duration=1.0,
-            lean_per_sec_factor=0.25,
+            h_cog=config.plant.pole_cog_2wd,
+            min_duration=0.5,
+            max_duration=3.0,
+            lean_per_sec_factor=1.0,
         )
         self._prev_requested_lean = 0.0
+        # Safety lean limiting: when trailing-wheel contact is detected in
+        # 2WD, self._effective_lean is pulled back below the current pitch
+        # to initiate a retreat trajectory and release the contact.
+        # When contact clears, the limit ramps back toward the operator
+        # command at a controlled rate so the robot doesn’t immediately
+        # re-hit the same obstacle.
+        self._effective_lean = 0.0    # lean reference actually used by traj
+        self._prev_effective_lean = 0.0
+        self._contact_lean_limit = None  # set when contact first detected
+        self._contact_debounce_count = 0  # consecutive contact ticks; limit fires only after threshold
+
+        # Trailing-wheel contact state (updated every tick before controller)
+        self._trailing_contact = False
+        self._trailing_force = 0.0
 
         # IMU sensor model
         self.imu = IMUSensorModel(config)
@@ -262,6 +280,12 @@ class TribotBalanceBot:
         # --- Reset lean trajectory planner ---
         self._lean_traj.cancel()
         self._prev_requested_lean = 0.0
+        self._effective_lean = 0.0
+        self._prev_effective_lean = 0.0
+        self._contact_lean_limit = None
+        self._contact_debounce_count = 0
+        self._trailing_contact = False
+        self._trailing_force = 0.0
 
         print("[reset] Robot pose and state restored to initial conditions.")
 
@@ -492,21 +516,114 @@ class TribotBalanceBot:
         """
         requested = self.controller.requested_lean
 
+        # --- Safety lean limiting (2WD only) ---
+        # When a trailing wheel touches the ground, the robot is at or past
+        # the geometric limit of the triplet.  Commanding more lean would
+        # worsen the contact; instead we pull the effective target back to
+        # slightly below the current pitch, which triggers a new retreat
+        # trajectory and releases the contact gracefully.
+        # Number of consecutive contact ticks required before activating the
+        # permanent pitch cap.  At 500 Hz this is 25 ticks = 50 ms — long
+        # enough to ignore transient overshoot, short enough to react to real
+        # sustained contact.
+        _CONTACT_DEBOUNCE_TICKS = 25
+
+        if self.drive_mode == DriveMode.TWO_WD:
+            if self._trailing_contact:
+                self._contact_debounce_count += 1
+
+                # Only activate the limit after sustained contact.
+                if self._contact_debounce_count >= _CONTACT_DEBOUNCE_TICKS:
+                    # Compute retreat target: current pitch minus 5°.
+                    retreat_target = math.copysign(
+                        max(abs(self.pitch_angle) - math.radians(5.0), 0.0),
+                        requested
+                    ) if abs(requested) > 1e-6 else 0.0
+
+                    if self._contact_lean_limit is None:
+                        # First activation after debounce — set the limit.
+                        self._contact_lean_limit = retreat_target
+                        print(f"  [CONTACT] sustained trailing-wheel contact "
+                              f"({self._contact_debounce_count} ticks) at "
+                              f"pitch={math.degrees(self.pitch_angle):.1f}° — "
+                              f"retreating to "
+                              f"{math.degrees(retreat_target):.1f}°")
+                    else:
+                        # Sustained contact: keep clamping, allow only retreat.
+                        sign = math.copysign(1.0, requested) if abs(requested) > 1e-6 else 1.0
+                        self._contact_lean_limit = sign * min(
+                            abs(self._contact_lean_limit), abs(retreat_target))
+
+                    self._effective_lean = self._contact_lean_limit
+                else:
+                    # Debounce not yet satisfied — proceed normally this tick.
+                    if self._contact_lean_limit is not None:
+                        self._effective_lean = self._contact_lean_limit
+                    else:
+                        self._effective_lean = requested
+
+            elif self._contact_lean_limit is not None:
+                # Contact released — reset debounce counter.
+                self._contact_debounce_count = 0
+
+                # Hold the discovered safe limit.
+                # Do NOT ramp back toward requested: that would cause
+                # repeated contact cycles.  The limit clears only when the
+                # user commands a lean that is already within the safe envelope
+                # (i.e. |requested| ≤ |_contact_lean_limit|).
+                if abs(requested) <= abs(self._contact_lean_limit) + 1e-4:
+                    # New commanded lean is safe — lift the envelope protection.
+                    self._contact_lean_limit = None
+                    self._effective_lean = requested
+                    print("  [CONTACT] envelope cleared — new lean command is safe")
+                else:
+                    self._effective_lean = self._contact_lean_limit
+            else:
+                # Normal operation — no contact history.
+                self._contact_debounce_count = 0
+                self._effective_lean = requested
+                self._contact_lean_limit = None
+        else:
+            self._effective_lean = requested
+            self._contact_lean_limit = None
+
         # Detect lean change → start trajectory (2WD only)
         if (self.drive_mode == DriveMode.TWO_WD
-                and abs(requested - self._prev_requested_lean) > math.radians(1.0)):
+                and abs(self._effective_lean - self._prev_effective_lean) > math.radians(1.0)):
+            start_lean = self.controller.target_lean
             self._lean_traj.start(
                 sim_time=sim_time,
-                current_position=self.controller.target_position,
-                theta_start=self.controller.target_lean,
-                theta_end=requested,
+                current_position=self.position,
+                theta_start=start_lean,
+                theta_end=self._effective_lean,
             )
-        self._prev_requested_lean = requested
+        self._prev_effective_lean = self._effective_lean
 
         # Active trajectory → use its smooth reference
         if self._lean_traj.active:
             ref_pos, ref_vel, ref_pitch, ref_prate = \
                 self._lean_traj.update(sim_time)
+
+            # --- Trajectory abort on large tracking error ---
+            # If the measured pitch deviates significantly from the
+            # trajectory reference, the trajectory is infeasible.
+            # Abort and let the steady-state reference take over using
+            # the (already-updated) self._effective_lean, which may
+            # already be pulled back by the contact safety limit above.
+            pitch_err = abs(self.pitch_angle - ref_pitch)
+            if self._lean_traj.active and pitch_err > 0.12:
+                print(f"  [TRAJ] ABORT: pitch_err={math.degrees(pitch_err):.1f}°"
+                      f" at t={sim_time:.2f}s")
+                self._lean_traj.cancel()
+                lean_offset = self._lean_traj._h_cog * math.sin(self._effective_lean)
+                self.controller.target_position = self.position - lean_offset
+
+            # When trajectory just completed, absorb final position.
+            elif not self._lean_traj.active:
+                lean_offset = self._lean_traj._h_cog * math.sin(self._effective_lean)
+                self.controller.target_position = ref_pos - lean_offset
+
+        if self._lean_traj.active:
             return StateReference(
                 position=ref_pos,
                 velocity=ref_vel,
@@ -514,10 +631,20 @@ class TribotBalanceBot:
                 pitch_rate=ref_prate,
             )
 
-        # Steady state: track operator commands directly
+        # Steady state: track operator commands directly.
+        # In 2WD, the equilibrium wheel position is offset from
+        # target_position by the geometric CoG shift due to lean:
+        #   Δx = h_cog · sin(lean)
+        # Without this offset the LQR sees a phantom position error
+        # and fights the lean command.
+        if self.drive_mode == DriveMode.TWO_WD and abs(self._effective_lean) > 1e-6:
+            lean_offset = self._lean_traj._h_cog * math.sin(self._effective_lean)
+        else:
+            lean_offset = 0.0
+
         return StateReference(
-            position=self.controller.target_position,
-            pitch=requested,
+            position=self.controller.target_position + lean_offset,
+            pitch=self._effective_lean,
         )
 
     # ----------------------------------------------------------------
@@ -538,7 +665,17 @@ class TribotBalanceBot:
         self.controller.set_triplet_state(
             s.triplet_angle_L, s.triplet_angle_R,
             s.triplet_rate_L, s.triplet_rate_R,
+            base_angle=self.triplet_base_angle,
         )
+
+        # --- Contact-aware gain blending ---
+        # Detect trailing wheel ground contact and let the controller
+        # smoothly shift toward 4WD gains when the plant reality changes.
+        self._trailing_contact, self._trailing_force = \
+            self._get_trailing_wheel_contact()
+        if hasattr(self.controller, 'set_contact_blend'):
+            self.controller.set_contact_blend(
+                self._trailing_contact, self._trailing_force)
 
         if not self.controller.plans_triplet_torque:
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
@@ -608,6 +745,49 @@ class TribotBalanceBot:
                 )
 
     # ----------------------------------------------------------------
+    # Trailing-wheel contact detection
+    # ----------------------------------------------------------------
+
+    def _get_trailing_wheel_contact(self):
+        """Detect whether non-primary wheels are touching ground.
+
+        In 2WD mode at φ=−60°, only wheel_2 (index 1 per side) is the
+        primary grounded wheel.  Wheels 1 and 3 (indices 0 and 2) are
+        lifted.  If the body pitches far enough or the terrain is uneven,
+        a trailing wheel touches ground and the plant dynamics change.
+
+        Returns:
+            (has_contact, total_normal_force):
+              has_contact:        True if any trailing wheel has ground
+                                  contact above the noise threshold.
+              total_normal_force: sum of normal forces on all trailing
+                                  wheel contacts (N).
+        """
+        if self.drive_mode != DriveMode.TWO_WD:
+            return False, 0.0
+
+        total_force = 0.0
+        has_contact = False
+
+        # In 2WD at φ=−60°, wheel_2 (hub-relative position at
+        # (−0.104, y, −0.060)) rotates to the lowest point.
+        # Wheels 1 and 3 (indices 0 and 2 per side) are trailing.
+        trailing_indices = [0, 2]
+
+        for side_wheels in [self.l_wheel_joints, self.r_wheel_joints]:
+            for idx in trailing_indices:
+                joint_id = side_wheels[idx]
+                contacts = p.getContactPoints(
+                    bodyA=self.body_id, linkIndexA=joint_id)
+                for c in contacts:
+                    normal_force = c[9]  # contact normal force
+                    if normal_force > 0.5:  # threshold: ignore sensor noise
+                        has_contact = True
+                        total_force += normal_force
+
+        return has_contact, total_force
+
+    # ----------------------------------------------------------------
     # Telemetry helpers
     # ----------------------------------------------------------------
 
@@ -633,6 +813,8 @@ class TribotBalanceBot:
             "triplet_angle_R": s.triplet_angle_R,
             "wheel_velocity_L": s.wheel_velocity_L,
             "wheel_velocity_R": s.wheel_velocity_R,
+            "trailing_contact": float(getattr(self, '_trailing_contact', False)),
+            "trailing_force": getattr(self, '_trailing_force', 0.0),
         }
 
     # ----------------------------------------------------------------
@@ -697,6 +879,9 @@ class TribotBalanceBot:
         self.triplet_ctrl_R.drive_mode = self.drive_mode
         if self.drive_mode == DriveMode.FOUR_WD:
             self._lean_traj.cancel()
+            self._contact_lean_limit = None
+            self._effective_lean = 0.0
+            self._prev_effective_lean = 0.0
 
     def check_fallen(self):
         """Check if robot has fallen over (|pitch| > 80°)."""

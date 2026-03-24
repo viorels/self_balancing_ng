@@ -122,7 +122,8 @@ class BalanceControllerBase(ABC):
         pass
 
     def set_triplet_state(self, angle_L: float, angle_R: float,
-                          rate_L: float, rate_R: float) -> None:
+                          rate_L: float, rate_R: float,
+                          base_angle: float = 0.0) -> None:
         """Update triplet encoder readings.  Default: no-op."""
         pass
 

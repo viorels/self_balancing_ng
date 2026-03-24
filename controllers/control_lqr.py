@@ -80,7 +80,7 @@ def compute_lqr_gain(A, B, Q, R):
 # Linearised plant model
 # ============================================================================
 
-def build_state_space(config):
+def build_state_space(config, mode='4wd'):
     """
     Build the continuous-time A, B matrices for the linearised
     inverted-pendulum-on-wheels system.
@@ -88,22 +88,34 @@ def build_state_space(config):
     State:  x = [position, velocity, pitch, pitch_rate]
     Input:  u = total motor torque (Nm)
 
-    Physical parameters (from config):
-        BODY_MASS       – mass of the body above the wheel axis (kg)
-        WHEEL_MASS      – total wheel/triplet mass (kg)
-        COG_HEIGHT      – distance from wheel axis to body CoG (m)
-        BODY_INERTIA    – body pitch inertia about its CoG (kg·m²)
-        WHEEL_RADIUS    – effective wheel radius (m)
-    """
-    m_b = config.plant.body_mass
-    m_w = config.plant.wheel_mass
-    l   = config.plant.cog_height
-    I_b = config.plant.body_inertia
-    r   = config.robot.wheel_radius
-    g   = abs(config.sim.gravity)
+    Args:
+        config: Config object with plant parameters.
+        mode:   '4wd' or '2wd' — selects which cart-pendulum decomposition.
 
-    # Effective rotational inertia about the wheel contact point
-    I_eff = I_b + m_b * l**2       # parallel-axis theorem
+    4WD (pivot = hub axis):
+        pole = body only  (m_b=2.717, l=0.247, I_b=0.056)
+        cart = hubs + wheels  (m_w=0.670)
+    2WD (pivot = ground contact):
+        pole = body + 2 hubs + 4 wheels  (m_b=3.333, l=0.381, I_b≈0.574-m·l²)
+        cart = 2 grounded wheels  (m_w=0.054)
+    """
+    r = config.robot.wheel_radius
+    g = abs(config.sim.gravity)
+
+    if mode == '2wd':
+        m_b = config.plant.pole_mass_2wd
+        m_w = config.plant.cart_mass_2wd
+        l   = config.plant.pole_cog_2wd
+        # pole_inertia_2wd is already I_eff (about ground contact pivot)
+        # so we back out I_b_cog for the formula:  I_eff = I_b_cog + m_b * l²
+        I_eff = config.plant.pole_inertia_2wd
+    else:
+        m_b = config.plant.body_mass
+        m_w = config.plant.wheel_mass
+        l   = config.plant.cog_height
+        I_b = config.plant.body_inertia
+        I_eff = I_b + m_b * l**2       # parallel-axis theorem
+
     M_tot = m_b + m_w              # total translational mass
 
     # Coupled mass matrix:
@@ -166,28 +178,51 @@ class LQRBalanceController(BalanceControllerBase):
     def __init__(self, config):
         self.cfg = config
 
-        # Build linearised model and compute gain
-        A, B = build_state_space(config)
+        # Build linearised models for BOTH drive modes
+        A_4wd, B_4wd = build_state_space(config, mode='4wd')
+        A_2wd, B_2wd = build_state_space(config, mode='2wd')
+
         Q = np.diag(config.lqr.q_diag)
         R = np.array([[config.lqr.r]])
-        self.K_normal = compute_lqr_gain(A, B, Q, R)
 
-        print(f"  LQR gain K_normal    = [{', '.join(f'{k:.4f}' for k in self.K_normal[0])}]")
+        # --- Normal gains (one per mode) ---
+        self.K_normal_4wd = compute_lqr_gain(A_4wd, B_4wd, Q, R)
+        self.K_normal_2wd = compute_lqr_gain(A_2wd, B_2wd, Q, R)
+
+        print(f"  LQR K_4wd_normal  = [{', '.join(f'{k:.4f}' for k in self.K_normal_4wd[0])}]")
+        print(f"  LQR K_2wd_normal  = [{', '.join(f'{k:.4f}' for k in self.K_normal_2wd[0])}]")
         print(f"  LQR Q_diag = {config.lqr.q_diag},  R = {config.lqr.r}")
 
-        # --- Gain-scheduled aggressive mode ---
+        # --- Aggressive gains (one per mode) ---
         Q_agg = np.diag(config.lqr.aggressive_q_diag)
         R_agg = np.array([[config.lqr.aggressive_r]])
-        self.K_aggressive = compute_lqr_gain(A, B, Q_agg, R_agg)
+        self.K_aggressive_4wd = compute_lqr_gain(A_4wd, B_4wd, Q_agg, R_agg)
+        self.K_aggressive_2wd = compute_lqr_gain(A_2wd, B_2wd, Q_agg, R_agg)
         self.switch_threshold = config.lqr.switch_threshold
         self.switch_hysteresis = config.lqr.switch_hysteresis
-        print(f"  LQR gain K_aggressive= [{', '.join(f'{k:.4f}' for k in self.K_aggressive[0])}]")
-        print(f"  LQR Q_agg = {config.lqr.aggressive_q_diag},  R_agg = {config.lqr.aggressive_r}")
-        print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
-              f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
+        print(f"  LQR K_4wd_aggr    = [{', '.join(f'{k:.4f}' for k in self.K_aggressive_4wd[0])}]")
+        print(f"  LQR K_2wd_aggr    = [{', '.join(f'{k:.4f}' for k in self.K_aggressive_2wd[0])}]")
 
-        # Active gain (start in normal mode)
-        self.K = self.K_normal
+        # --- Mode blending state ---
+        # blend_alpha: 0.0 = pure 4WD gains, 1.0 = pure 2WD gains.
+        # Two factors drive alpha:
+        #   1) _mode_alpha: set from the commanded drive mode (base_angle).
+        #      In 4WD this is 0.0; in 2WD this is 1.0.
+        #   2) Contact override: when a trailing wheel touches ground
+        #      during 2WD lean, the plant is no longer a single-contact
+        #      pendulum. set_contact_blend() ramps alpha toward 0 (4WD
+        #      gains) proportional to the contact force, preventing the
+        #      LQR from driving a model that contradicts reality.
+        # _blend_alpha is the effective value used for gain scheduling;
+        # it smoothly tracks the combined target.
+        self._blend_alpha = 0.0
+        self._mode_alpha = 0.0          # commanded mode target
+        self._base_angle = 0.0          # stored for contact blend logic
+        self._contact_override_active = False  # True while recovering from contact
+        self._triplet_2wd_angle = config.robot.triplet_2wd_angle  # 60°
+
+        # Active gain (start in 4WD normal mode)
+        self.K = self.K_normal_4wd.copy()
         self.aggressive_active = False
 
         # --- Reference state ---
@@ -257,8 +292,12 @@ class LQRBalanceController(BalanceControllerBase):
         delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
         self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
 
-        # Gain scheduling — return to normal mode.
-        self.K = self.K_normal
+        # Gain scheduling — return to 4WD normal mode.
+        self._blend_alpha = 0.0
+        self._mode_alpha = 0.0
+        self._base_angle = 0.0
+        self._contact_override_active = False
+        self.K = self.K_normal_4wd.copy()
         self.aggressive_active = False
 
         # Zero telemetry accumulators.
@@ -287,12 +326,86 @@ class LQRBalanceController(BalanceControllerBase):
         """Raw operator lean command (rad), before triplet coordination."""
         return self._requested_lean
 
-    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R):
-        """Update triplet encoder readings (called each tick from tribot_sim)."""
+    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R,
+                          base_angle=0.0):
+        """Update triplet encoder readings (called each tick from tribot_sim).
+
+        Also updates the gain blend between 4WD and 2WD plant models.
+        The blend uses the triplet **base angle** (mode command) rather than
+        the measured angles because lean compensation shifts the measured
+        angles away from the 2WD equilibrium, which would incorrectly
+        reduce blend_alpha and inject weaker 4WD gains while still in 2WD.
+
+        For 4WD→2WD transitions, base_angle jumps to ±60° immediately when
+        the mode toggles.  This causes a small gain step (9–13% between
+        modes) which is safe and self-correcting.  For the reverse 2WD→4WD
+        transition, base_angle returns to 0° immediately.
+
+        Args:
+            base_angle: the triplet equilibrium angle for the current drive
+                        mode (0 in 4WD, ±triplet_2wd_angle in 2WD).
+        """
         self._triplet_angle_L = angle_L
         self._triplet_angle_R = angle_R
         self._triplet_rate_L = rate_L
         self._triplet_rate_R = rate_R
+
+        # Store base angle for contact blend logic
+        self._base_angle = base_angle
+
+        # Update commanded-mode alpha from base angle.
+        # This is the "intended" alpha absent any contact override.
+        phi = abs(base_angle)
+        self._mode_alpha = max(0.0, min(1.0,
+            phi / self._triplet_2wd_angle)) if self._triplet_2wd_angle > 0 else 0.0
+
+    def set_contact_blend(self, trailing_wheel_contact, contact_force=0.0):
+        """Adjust gain-blend alpha based on trailing-wheel ground contact.
+
+        When the robot is in 2WD and leans far enough for a trailing wheel
+        to touch ground (or terrain pushes it into contact), the physical
+        plant is no longer a single-contact inverted pendulum — it's
+        closer to the 4WD two-contact model.  This method smoothly ramps
+        _blend_alpha toward 0 (4WD gains) in proportion to the contact
+        force, so the LQR never fights a model that contradicts reality.
+
+        Three operating regimes:
+        1. Normal (no contact, no recent contact): _blend_alpha snaps to
+           _mode_alpha instantly, preserving existing mode-switch behaviour.
+        2. Contact detected: fast ramp toward 4WD gains (≈40 ms to 95%).
+        3. Recovery (contact just released): slow ramp back toward
+           _mode_alpha (≈300 ms) to avoid gain chattering if contact
+           is intermittent.
+
+        Args:
+            trailing_wheel_contact: True if any trailing wheel has ground
+                                    contact above the noise threshold.
+            contact_force:          total normal force (N) on trailing
+                                    wheels (summed across all contacts).
+        """
+        if trailing_wheel_contact and self._mode_alpha > 0.5:
+            # 2WD mode but trailing wheel touching — blend toward 4WD.
+            # Normalise force: body weight ≈ 3.3×9.81 ≈ 32 N total.
+            # At 15 N the trailing wheels are substantially weight-bearing.
+            force_fraction = min(contact_force / 15.0, 1.0)
+            target = self._mode_alpha * (1.0 - force_fraction)
+            self._blend_alpha += (target - self._blend_alpha) * 0.15
+            self._blend_alpha = max(0.0, min(1.0, self._blend_alpha))
+            self._contact_override_active = True
+
+        elif self._contact_override_active:
+            # Contact just released — slow ramp back to mode alpha.
+            target = self._mode_alpha
+            self._blend_alpha += (target - self._blend_alpha) * 0.02
+            self._blend_alpha = max(0.0, min(1.0, self._blend_alpha))
+            # Exit recovery once close enough to mode alpha
+            if abs(self._blend_alpha - self._mode_alpha) < 0.02:
+                self._blend_alpha = self._mode_alpha
+                self._contact_override_active = False
+
+        else:
+            # Normal operation — snap to mode alpha (instant transitions)
+            self._blend_alpha = self._mode_alpha
 
     @property
     def desired_lean(self) -> float:
@@ -316,6 +429,7 @@ class LQRBalanceController(BalanceControllerBase):
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
+            "blend_alpha":      float(self._blend_alpha),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -381,15 +495,20 @@ class LQRBalanceController(BalanceControllerBase):
             ])
             self.state_error = x.copy()
 
-            # --- Gain scheduling: switch K based on position error ---
+            # --- Gain scheduling: blend 4WD/2WD, then normal/aggressive ---
+            # First, interpolate between modes using triplet angle
+            alpha = self._blend_alpha  # 0.0=4WD, 1.0=2WD
+            K_normal = (1.0 - alpha) * self.K_normal_4wd + alpha * self.K_normal_2wd
+            K_aggressive = (1.0 - alpha) * self.K_aggressive_4wd + alpha * self.K_aggressive_2wd
+
+            # Then, pick normal vs aggressive based on position error
             pos_err = abs(x[0])
-            if self.K_aggressive is not None:
-                if not self.aggressive_active and pos_err > self.switch_threshold:
-                    self.aggressive_active = True
-                    self.K = self.K_aggressive
-                elif self.aggressive_active and pos_err < (self.switch_threshold - self.switch_hysteresis):
-                    self.aggressive_active = False
-                    self.K = self.K_normal
+            if not self.aggressive_active and pos_err > self.switch_threshold:
+                self.aggressive_active = True
+            elif self.aggressive_active and pos_err < (self.switch_threshold - self.switch_hysteresis):
+                self.aggressive_active = False
+
+            self.K = K_aggressive if self.aggressive_active else K_normal
 
             self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
 

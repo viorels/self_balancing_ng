@@ -52,7 +52,7 @@ class RobotConfig:
 @dataclass
 class MotorConfig:
     """Brushless motor electrical / mechanical model."""
-    max_torque: float = 1.0             # Nm stall torque per side
+    max_torque: float = 1.5             # Nm stall torque per side
     tau: float = 0.003                  # s — electrical time constant
     back_emf_k: float = 0.005          # Nm per rad/s
     cogging_amplitude: float = 0.005   # Nm
@@ -87,11 +87,24 @@ class ControlConfig:
 
 @dataclass
 class PlantConfig:
-    """Linearised plant physical constants (shared by LQR and MPC)."""
-    body_mass: float = 2.7167          # kg
-    wheel_mass: float = 0.6698         # kg — 2 triplets + 6 wheels
-    cog_height: float = 0.247          # m — CoG above wheel axis
-    body_inertia: float = 0.056436     # kg·m² — Iyy
+    """Linearised plant physical constants (shared by LQR and MPC).
+
+    4WD (pivot = hub axis):
+        pole = body only, cart = 2×(hub + 3 wheels)
+    2WD (pivot = ground contact):
+        pole = body + 2 hubs + 4 non-grounded wheels, cart = 2 grounded wheels
+    """
+    # --- 4WD plant (default / backwards-compatible) ---
+    body_mass: float = 2.7167          # kg — pole mass in 4WD
+    wheel_mass: float = 0.6698         # kg — cart mass in 4WD (2 hubs + 6 wheels)
+    cog_height: float = 0.247          # m — pole CoG above pivot (hub axis)
+    body_inertia: float = 0.056436     # kg·m² — body Iyy about its own CoG
+
+    # --- 2WD plant ---
+    pole_mass_2wd: float = 3.333       # kg — body + 2 hubs + 4 wheels
+    cart_mass_2wd: float = 0.054       # kg — 2 grounded wheels
+    pole_cog_2wd: float = 0.381        # m — composite pole CoG above ground
+    pole_inertia_2wd: float = 0.574    # kg·m² — pole Iyy about ground contact
 
 
 @dataclass
@@ -166,7 +179,7 @@ class TripletConfig:
     grav_comp_4wd: float = 2.0         # Nm
     grav_comp_2wd: float = 2.0         # Nm
     lean_scale_4wd: float = 1.0 / 1.7  # ≈ 0.59
-    cog_dist_2wd: float = 0.19         # m — hub-to-CoG
+    cog_dist_2wd: float = 0.247        # m — body CoG above hub axis
     foot_length_2wd: float = 0.12      # m — hub-to-wheel
     assist_gain: float = 4.0           # Nm/rad²
     assist_deadzone: float = 0.15      # rad (~8.6°)

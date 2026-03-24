@@ -1096,7 +1096,8 @@ class MPCHybridController(BalanceControllerBase):
     def set_yaw_rate(self, yaw_rate):
         self.yaw_rate_setpoint = yaw_rate
 
-    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R):
+    def set_triplet_state(self, angle_L, angle_R, rate_L, rate_R,
+                          base_angle=0.0):
         """Update triplet encoder readings (called each tick from tribot_sim)."""
         self._triplet_angle_L = angle_L
         self._triplet_angle_R = angle_R
