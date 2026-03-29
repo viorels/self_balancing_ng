@@ -144,6 +144,45 @@ def build_state_space(config):
     return A, B
 
 
+def compute_equivalent_triplet_torque(T_wheel, m_b, m_w, l, I_b, r,
+                                       R_trip, contact_angle):
+    """
+    Return the triplet hub torque that produces the same body pitch angular
+    acceleration as T_wheel applied to the drive wheels, accounting for the
+    triplet's ground-contact geometry.
+
+    The triplet foot pushes against the ground, creating horizontal and
+    vertical reaction forces.  The horizontal component (which scales as
+    cos(contact_angle)) provides translational coupling analogous to the
+    drive wheel's 1/r term.  At contact_angle=0 (foot directly below the
+    hub) the triplet is most effective; at 90° it degenerates to a pure
+    reaction couple with no ground push.
+
+    Derivation (corrected input vectors):
+        Wheel:   B = [1/r, 1]                → ground push + reaction couple
+        Triplet: B = [cos(α)/R_trip, 1]       → angle-dependent ground push
+        b3_wheel = (m_b·l)/(det·r) + M_tot/det
+        b3_trip  = (m_b·l·cos(α))/(det·R_trip) + M_tot/det
+        T_trip   = (b3_wheel / b3_trip) · T_wheel
+
+    Args:
+        T_wheel:       drive-wheel torque (Nm)
+        m_b, m_w, l, I_b, r: plant physical parameters
+        R_trip:        triplet hub-to-contact radius (m)
+        contact_angle: angle of contact point from hub vertical in world
+                       frame (rad).  0 = directly below, π/2 = horizontal.
+
+    Returns:
+        T_trip (Nm) — equivalent hub torque (before PyBullet sign flip)
+    """
+    M_tot = m_b + m_w
+    I_eff = I_b + m_b * l ** 2
+    det   = M_tot * I_eff - (m_b * l) ** 2
+    b3_wheel = (m_b * l) / (det * r) + M_tot / det
+    b3_trip  = (m_b * l * math.cos(contact_angle)) / (det * R_trip) + M_tot / det
+    return (b3_wheel / b3_trip) * T_wheel
+
+
 # ============================================================================
 # LQR Balance Controller
 # ============================================================================
@@ -205,7 +244,7 @@ class LQRBalanceController(BalanceControllerBase):
 
         # --- Sensor-to-actuator delay buffer ---
         delay_steps = config.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
+        self.torque_delay_buffer = [(0.0, 0.0, 0.0, 0.0)] * (delay_steps + 1)
 
         # --- Exposed for logging ---
         self.control_torque = 0.0
@@ -229,6 +268,31 @@ class LQRBalanceController(BalanceControllerBase):
         # Exposed so the triplet PD can cooperate with the lean the LQR
         # needs for position tracking.
         self._desired_lean = 0.0
+
+        # --- Lean-assist: dynamic wheel / triplet lean-acceleration split ---
+        # gamma(α) = compute_equivalent_triplet_torque(1.0, ..., α) varies
+        # with the triplet contact angle — called each tick in update().
+        self._lean_plant = (
+            config.plant.body_mass, config.plant.wheel_mass,
+            config.plant.cog_height, config.plant.body_inertia,
+            config.robot.wheel_radius,
+        )
+        self._lean_R_trip = config.robot.triplet_radius
+
+        # Anti-lift: hub torque vertical component must not exceed weight.
+        # T_max = (weight_per_side · R_trip) / |sin(α)|, floored at sin=0.2.
+        _M = config.plant.body_mass + config.plant.wheel_mass
+        self._lean_weight_R = (_M * abs(config.sim.gravity) / 2) * self._lean_R_trip
+
+        self.lean_assist_scale = config.lqr.lean_assist_scale
+        self.lean_assist_fraction = 0.0
+        self._triplet_lean_torque = 0.0
+
+        _gamma_0  = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, 0.0)
+        _gamma_90 = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, math.pi / 2)
+        print(f"  Lean assist: scale={self.lean_assist_scale:.3f} rad, "
+              f"gamma(0°)={_gamma_0:.2f}, gamma(90°)={_gamma_90:.2f}, "
+              f"T_lift(30°)={self._lean_weight_R / math.sin(math.radians(30)):.1f} Nm")
 
     def reset(self):
         """Zero all internal state for a clean restart.
@@ -255,7 +319,10 @@ class LQRBalanceController(BalanceControllerBase):
 
         # Torque delay buffer — flush pre-reset saturated torques.
         delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
+        self.torque_delay_buffer = [(0.0, 0.0, 0.0, 0.0)] * (delay_steps + 1)
+
+        self._triplet_lean_torque = 0.0
+        self.lean_assist_fraction = 0.0
 
         # Gain scheduling — return to normal mode.
         self.K = self.K_normal
@@ -298,6 +365,10 @@ class LQRBalanceController(BalanceControllerBase):
     def desired_lean(self) -> float:
         return self._desired_lean
 
+    @property
+    def triplet_lean_torque(self) -> float:
+        return self._triplet_lean_torque
+
     def get_telemetry(self) -> dict:
         """Return LQR-specific diagnostic signals."""
         return {
@@ -316,6 +387,8 @@ class LQRBalanceController(BalanceControllerBase):
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
+            "triplet_lean_ff":        float(self._triplet_lean_torque),
+            "lean_assist_fraction":   float(self.lean_assist_fraction),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -408,6 +481,20 @@ class LQRBalanceController(BalanceControllerBase):
 
             # u = -K x  (total torque for both sides)
             u_raw = float(-self.K @ x)
+
+            # Decompose u_raw into lean demand vs balance correction.
+            # u_lean:    -(K₀·x₀ + K₁·x₁) — position+velocity driven.
+            #            Smooth, changes on ~0.5 s timescale.  This is the
+            #            "create lean to move" signal the triplet should boost.
+            # u_balance: -(K₂·x₂ + K₃·x₃) — pitch+pitch_rate corrections.
+            #            High-frequency, belongs exclusively to the wheels.
+            u_lean = float(-(K[0] * x[0] + K[1] * x[1]))
+
+            # Fraction: how far pitch is from its target.  Modulates the
+            # triplet so it disengages once the lean is achieved.
+            self.lean_assist_fraction = float(
+                np.clip(abs(x[2]) / self.lean_assist_scale, 0.0, 1.0))
+
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque
@@ -415,14 +502,37 @@ class LQRBalanceController(BalanceControllerBase):
             # Yaw damping relative to setpoint
             yaw_correction = self.cfg.control.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
-            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
+            # Store u_lean (not u_raw) for the triplet feedforward.
+            self.torque_delay_buffer.append(
+                (commanded_torque, yaw_correction, u_lean, self.lean_assist_fraction))
 
         # === Pop delayed torque command ===
         delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
         if len(self.torque_delay_buffer) > delay_depth:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
+            delayed_torque, delayed_yaw, delayed_u_lean, delayed_lean_frac = self.torque_delay_buffer.pop(0)
         else:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
+            delayed_torque, delayed_yaw, delayed_u_lean, delayed_lean_frac = self.torque_delay_buffer[0]
+
+        # Triplet lean feedforward (per-side, symmetric — no yaw component).
+        # Only the lean-demand component (position+velocity) reaches the hub.
+        # Balance corrections (pitch+pitch_rate) stay with the wheels — this
+        # eliminates the high-frequency sign-flipping that caused hub chatter.
+        #
+        # Dynamic gamma: the triplet's ground-contact effectiveness depends
+        # on cos(contact_angle).  Contact angle ≈ body_pitch + triplet_angle
+        # in 4WD (base_angle = 0).
+        _avg_trip = (self._triplet_angle_L + self._triplet_angle_R) / 2
+        _alpha = measured_pitch + _avg_trip
+        _gamma = compute_equivalent_triplet_torque(
+            1.0, *self._lean_plant, self._lean_R_trip, _alpha)
+
+        _raw = -_gamma * delayed_lean_frac * delayed_u_lean
+
+        # Anti-lift clamp: |τ·sin(α)| / R_trip must not exceed weight.
+        # Floor sin at 0.2 (~12°) so the cap stays ≤ ~10 Nm near vertical.
+        _sin_a = max(abs(math.sin(_alpha)), 0.2)
+        _T_lift = self._lean_weight_R / _sin_a
+        self._triplet_lean_torque = max(-_T_lift, min(_T_lift, _raw))
 
         # Per-side torques (left −yaw, right +yaw)
         # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).

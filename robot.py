@@ -588,7 +588,11 @@ class TribotBalanceBot:
             )
             self.actual_torques[motor_idx] = motor_torque
 
-            triplet_total = -motor_torque + triplet_cmd
+            # Lean-assist feedforward is additive on top of the PD controller.
+            # Zero in 2WD where the triplet holds a geometric angle.
+            triplet_lean = (self.controller.triplet_lean_torque
+                            if self.drive_mode == DriveMode.FOUR_WD else 0.0)
+            triplet_total = -motor_torque + triplet_cmd + triplet_lean
             p.setJointMotorControl2(
                 self.body_id, triplet_joint,
                 controlMode=p.TORQUE_CONTROL,
@@ -619,6 +623,7 @@ class TribotBalanceBot:
             "true_pitch_rate": s.true_pitch_rate,
             "torque_L_actual": float(self.actual_torques[0]),
             "torque_R_actual": float(self.actual_torques[1]),
+            "triplet_lean_ff": float(self.controller.triplet_lean_torque),
             "triplet_assist_L": float(self.triplet_ctrl_L.last_assist_force),
             "triplet_assist_R": float(self.triplet_ctrl_R.last_assist_force),
             "triplet_grav_comp_L": float(self.triplet_ctrl_L.last_grav_comp),

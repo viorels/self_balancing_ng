@@ -118,6 +118,7 @@ class LQRConfig:
     aggressive_r: float = 1.0
     switch_threshold: float = 0.20     # m
     switch_hysteresis: float = 0.05    # m
+    lean_assist_scale: float = 0.05    # rad; pitch error at which full triplet assist engages
 
 
 @dataclass

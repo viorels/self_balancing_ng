@@ -159,6 +159,17 @@ class BalanceControllerBase(ABC):
         """Raw operator lean command (rad) before triplet coordination.  Default 0."""
         return 0.0
 
+    @property
+    def triplet_lean_torque(self) -> float:
+        """Dynamic lean feedforward for triplet hubs (Nm, per-side).
+
+        Computed by LQR when torque_alpha > 0. Sign: negative value when
+        u_raw > 0 (forward lean), so a positive PyBullet +Y hub torque
+        produces backward pitch correction matching the wheel direction.
+        Default 0.0 — PID/MPC controllers are unaffected.
+        """
+        return 0.0
+
     # ------------------------------------------------------------------
     # Optional telemetry extensions
     # ------------------------------------------------------------------
