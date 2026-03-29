@@ -244,7 +244,7 @@ class LQRBalanceController(BalanceControllerBase):
 
         # --- Sensor-to-actuator delay buffer ---
         delay_steps = config.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0, 0.0, 0.0)] * (delay_steps + 1)
+        self.torque_delay_buffer = [(0.0, 0.0, 0.0)] * (delay_steps + 1)
 
         # --- Exposed for logging ---
         self.control_torque = 0.0
@@ -284,14 +284,11 @@ class LQRBalanceController(BalanceControllerBase):
         _M = config.plant.body_mass + config.plant.wheel_mass
         self._lean_weight_R = (_M * abs(config.sim.gravity) / 2) * self._lean_R_trip
 
-        self.lean_assist_scale = config.lqr.lean_assist_scale
-        self.lean_assist_fraction = 0.0
         self._triplet_lean_torque = 0.0
 
         _gamma_0  = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, 0.0)
         _gamma_90 = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, math.pi / 2)
-        print(f"  Lean assist: scale={self.lean_assist_scale:.3f} rad, "
-              f"gamma(0°)={_gamma_0:.2f}, gamma(90°)={_gamma_90:.2f}, "
+        print(f"  Lean assist: gamma(0°)={_gamma_0:.2f}, gamma(90°)={_gamma_90:.2f}, "
               f"T_lift(30°)={self._lean_weight_R / math.sin(math.radians(30)):.1f} Nm")
 
     def reset(self):
@@ -319,10 +316,9 @@ class LQRBalanceController(BalanceControllerBase):
 
         # Torque delay buffer — flush pre-reset saturated torques.
         delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0, 0.0, 0.0)] * (delay_steps + 1)
+        self.torque_delay_buffer = [(0.0, 0.0, 0.0)] * (delay_steps + 1)
 
         self._triplet_lean_torque = 0.0
-        self.lean_assist_fraction = 0.0
 
         # Gain scheduling — return to normal mode.
         self.K = self.K_normal
@@ -388,7 +384,6 @@ class LQRBalanceController(BalanceControllerBase):
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
             "triplet_lean_ff":        float(self._triplet_lean_torque),
-            "lean_assist_fraction":   float(self.lean_assist_fraction),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -490,11 +485,6 @@ class LQRBalanceController(BalanceControllerBase):
             #            High-frequency, belongs exclusively to the wheels.
             u_lean = float(-(K[0] * x[0] + K[1] * x[1]))
 
-            # Fraction: how far pitch is from its target.  Modulates the
-            # triplet so it disengages once the lean is achieved.
-            self.lean_assist_fraction = float(
-                np.clip(abs(x[2]) / self.lean_assist_scale, 0.0, 1.0))
-
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque
@@ -504,14 +494,14 @@ class LQRBalanceController(BalanceControllerBase):
 
             # Store u_lean (not u_raw) for the triplet feedforward.
             self.torque_delay_buffer.append(
-                (commanded_torque, yaw_correction, u_lean, self.lean_assist_fraction))
+                (commanded_torque, yaw_correction, u_lean))
 
         # === Pop delayed torque command ===
         delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
         if len(self.torque_delay_buffer) > delay_depth:
-            delayed_torque, delayed_yaw, delayed_u_lean, delayed_lean_frac = self.torque_delay_buffer.pop(0)
+            delayed_torque, delayed_yaw, delayed_u_lean = self.torque_delay_buffer.pop(0)
         else:
-            delayed_torque, delayed_yaw, delayed_u_lean, delayed_lean_frac = self.torque_delay_buffer[0]
+            delayed_torque, delayed_yaw, delayed_u_lean = self.torque_delay_buffer[0]
 
         # Triplet lean feedforward (per-side, symmetric — no yaw component).
         # Only the lean-demand component (position+velocity) reaches the hub.
@@ -526,11 +516,11 @@ class LQRBalanceController(BalanceControllerBase):
         _gamma = compute_equivalent_triplet_torque(
             1.0, *self._lean_plant, self._lean_R_trip, _alpha)
 
-        _raw = -_gamma * delayed_lean_frac * delayed_u_lean
+        _raw = -_gamma * delayed_u_lean
 
         # Anti-lift clamp: |τ·sin(α)| / R_trip must not exceed weight.
         # Floor sin at 0.2 (~12°) so the cap stays ≤ ~10 Nm near vertical.
-        _sin_a = max(abs(math.sin(_alpha)), 0.2)
+        _sin_a = max(abs(math.sin(_alpha)), 1.0)
         _T_lift = self._lean_weight_R / _sin_a
         self._triplet_lean_torque = max(-_T_lift, min(_T_lift, _raw))
 
