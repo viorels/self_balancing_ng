@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tribot-sim": {
+      "command": "/home/vio/projects/self_balancing_ng/.venv/bin/python",
+      "args": ["/home/vio/projects/self_balancing_ng/mcp/mcp_sim_server.py"]
+    }
+  }
+}

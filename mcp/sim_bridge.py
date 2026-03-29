@@ -30,6 +30,7 @@ Supported methods
   set_param           → params: {section: str, key: str, value: any}
   set_drive_mode      → params: {mode: "2wd" | "4wd"}
   reset_sim           → queues a physics reset on the next tick
+  run_experiment      → compound: reset+params+record+drive → downsampled results
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import time
 import threading
 from collections import deque
 from typing import Any
@@ -255,8 +257,124 @@ class SimBridge:
                 self._cmds.append({"type": "reset"})
             return {"ok": True, "result": {"queued": "reset_sim"}}
 
+        elif method == "run_experiment":
+            return self._run_experiment(params)
+
         else:
             return {"ok": False, "error": f"Unknown method: {method!r}"}
+
+    # ------------------------------------------------------------------ #
+    # Compound experiment
+    # ------------------------------------------------------------------ #
+
+    def _run_experiment(self, params: dict) -> dict:
+        """Reset → set params → record while driving → return downsampled results.
+
+        Runs entirely in the TCP handler thread; sleeps while the sim loop
+        processes commands and fills the recording buffer.
+        """
+        do_reset = params.get("reset", True)
+        settle_s = float(params.get("settle_s", 0.5))
+        param_changes = params.get("params") or []
+        command = params.get("command") or {}
+        record_vars = params.get("record_vars")
+        extra_s = float(params.get("extra_s", 0.5))
+        decimation = max(1, int(params.get("decimation", 10)))
+
+        # 1. Reset
+        if do_reset:
+            with self._lock:
+                self._cmds.append({"type": "reset"})
+            time.sleep(settle_s)
+
+        # 2. Apply parameter changes
+        applied = []
+        for pc in param_changes:
+            section = pc.get("section", "")
+            key = pc.get("key", "")
+            value = pc.get("value")
+            try:
+                sec = getattr(self._config, section)
+                old = getattr(sec, key)
+                if isinstance(old, list):
+                    value = list(value)
+                elif isinstance(old, float):
+                    value = float(value)
+                elif isinstance(old, int):
+                    value = int(value)
+                setattr(sec, key, value)
+                applied.append({"section": section, "key": key,
+                                "old": old, "new": value})
+            except AttributeError as exc:
+                return {"ok": False,
+                        "error": f"set_param failed for {section}.{key}: {exc}"}
+
+        # 3. Start recording
+        with self._lock:
+            self._record_buf.clear()
+            self._record_vars = list(record_vars) if record_vars else None
+            self._recording = True
+
+        # 4. Queue drive command
+        fwd = float(command.get("fwd", 0.0))
+        yaw = float(command.get("yaw", 0.0))
+        ticks = int(command.get("ticks", 500))
+        with self._lock:
+            self._cmds.append({"type": "drive", "fwd": fwd, "yaw": yaw,
+                                "ticks": ticks})
+
+        # 5. Wait for command duration + extra settling time
+        wait_s = ticks * self._config.sim.timestep + extra_s
+        time.sleep(wait_s)
+
+        # 6. Stop recording
+        with self._lock:
+            self._recording = False
+            raw_samples = list(self._record_buf)
+            self._record_buf.clear()
+
+        # 7. Downsample and compute stats
+        downsampled, stats = self._downsample_and_stats(raw_samples, decimation)
+
+        return {"ok": True, "result": {
+            "n_samples_raw": len(raw_samples),
+            "n_samples_returned": len(downsampled),
+            "decimation": decimation,
+            "duration_s": round(wait_s, 3),
+            "params_applied": applied,
+            "stats": stats,
+            "samples": downsampled,
+        }}
+
+    @staticmethod
+    def _downsample_and_stats(samples: list[dict], decimation: int
+                              ) -> tuple[list[dict], dict]:
+        """Return (downsampled_samples, per_variable_stats)."""
+        if not samples:
+            return [], {}
+
+        # Per-variable min / max / mean / final
+        stats: dict[str, dict] = {}
+        for key in samples[0]:
+            if not isinstance(samples[0][key], (int, float)):
+                continue
+            vals = [s[key] for s in samples
+                    if key in s and isinstance(s[key], (int, float))]
+            if vals:
+                stats[key] = {
+                    "min":   round(min(vals), 6),
+                    "max":   round(max(vals), 6),
+                    "mean":  round(sum(vals) / len(vals), 6),
+                    "final": round(vals[-1], 6),
+                }
+
+        # Take every Nth sample, round floats to shrink payload
+        picked = samples[::decimation] if decimation > 1 else samples
+        rounded = []
+        for s in picked:
+            rounded.append({k: round(v, 6) if isinstance(v, float) else v
+                            for k, v in s.items()})
+        return rounded, stats
 
     # ------------------------------------------------------------------ #
     # Config serialisation helper

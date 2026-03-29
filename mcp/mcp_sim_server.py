@@ -19,6 +19,7 @@ Tools exposed
   sim_set_param           → live-patch any CONFIG field
   sim_set_drive_mode      → switch between 2WD and 4WD
   sim_reset               → reset physics to initial conditions
+  sim_run_experiment      → compound: reset+params+record+drive → downsampled results
 
 Usage (VS Code MCP integration)
 ────────────────────────────────
@@ -233,6 +234,88 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        types.Tool(
+            name="sim_run_experiment",
+            description=(
+                "Run a complete experiment in one call: reset → apply config "
+                "changes → record telemetry while executing a drive command → "
+                "return downsampled samples + per-variable statistics (min, max, "
+                "mean, final). Ideal for testing parameter changes or comparing "
+                "controller tunings. "
+                "Typical usage: sim_run_experiment(command={fwd:0.5, ticks:1000}, "
+                "record_vars=['pitch','position'], decimation=10)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "object",
+                        "description": (
+                            "Drive command to execute during the experiment. "
+                            "fwd: position offset in metres (+ = forward), "
+                            "yaw: yaw rate in rad/s (+ = left), "
+                            "ticks: hold duration in sim steps (default 500 ≈ 1 s)."
+                        ),
+                        "properties": {
+                            "fwd":   {"type": "number"},
+                            "yaw":   {"type": "number"},
+                            "ticks": {"type": "integer"},
+                        },
+                    },
+                    "params": {
+                        "type": "array",
+                        "description": (
+                            "Config changes to apply before the run. "
+                            "Each entry: {section, key, value}."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "section": {"type": "string"},
+                                "key":     {"type": "string"},
+                                "value":   {},
+                            },
+                            "required": ["section", "key", "value"],
+                        },
+                    },
+                    "record_vars": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Variable names to record (e.g. "
+                            '["timestamp","pitch","position"]). '
+                            "Omit to record everything."
+                        ),
+                    },
+                    "decimation": {
+                        "type": "integer",
+                        "description": (
+                            "Keep every Nth sample (default 10). "
+                            "Higher = smaller payload."
+                        ),
+                    },
+                    "reset": {
+                        "type": "boolean",
+                        "description": "Reset robot before the run (default true).",
+                    },
+                    "settle_s": {
+                        "type": "number",
+                        "description": (
+                            "Seconds to wait after reset before starting "
+                            "(default 0.5)."
+                        ),
+                    },
+                    "extra_s": {
+                        "type": "number",
+                        "description": (
+                            "Extra seconds to record after the drive command "
+                            "finishes (default 0.5)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -291,6 +374,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
     elif name == "sim_reset":
         method, params = "reset_sim", None
+
+    elif name == "sim_run_experiment":
+        method = "run_experiment"
+        params = {}
+        if "command" in arguments:
+            params["command"] = arguments["command"]
+        if "params" in arguments:
+            params["params"] = arguments["params"]
+        if "record_vars" in arguments:
+            params["record_vars"] = arguments["record_vars"]
+        if "decimation" in arguments:
+            params["decimation"] = arguments["decimation"]
+        if "reset" in arguments:
+            params["reset"] = arguments["reset"]
+        if "settle_s" in arguments:
+            params["settle_s"] = arguments["settle_s"]
+        if "extra_s" in arguments:
+            params["extra_s"] = arguments["extra_s"]
+        # Experiment involves reset + drive + settle; needs generous timeout
+        timeout = _TIMEOUT_RECORDING
 
     else:
         resp = {"ok": False, "error": f"Unknown tool: {name}"}
