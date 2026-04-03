@@ -144,30 +144,24 @@ def build_state_space(config):
     return A, B
 
 
-def compute_equivalent_triplet_torque(T_wheel, m_b, m_w, l, I_b, r,
-                                       R_trip, contact_angle):
+def compute_equivalent_triplet_torque(T_wheel, l, R_trip, contact_angle):
     """
-    Return the triplet hub torque that produces the same body pitch angular
-    acceleration as T_wheel applied to the drive wheels, accounting for the
-    triplet's ground-contact geometry.
+    Return the triplet hub torque that produces the same body pitch effect
+    as T_wheel applied to the drive wheels.
 
-    The triplet foot pushes against the ground, creating horizontal and
-    vertical reaction forces.  The horizontal component (which scales as
-    cos(contact_angle)) provides translational coupling analogous to the
-    drive wheel's 1/r term.  At contact_angle=0 (foot directly below the
-    hub) the triplet is most effective; at 90° it degenerates to a pure
-    reaction couple with no ground push.
+    The triplet foot pushes down on the ground asymmetrically.  Ground
+    pushes back up at horizontal offset d = R_trip·sin(contact_angle) from
+    the hub.  The pitch leverage is this offset relative to CoG height:
 
-    Derivation (corrected input vectors):
-        Wheel:   B = [1/r, 1]                → ground push + reaction couple
-        Triplet: B = [cos(α)/R_trip, 1]       → angle-dependent ground push
-        b3_wheel = (m_b·l)/(det·r) + M_tot/det
-        b3_trip  = (m_b·l·cos(α))/(det·R_trip) + M_tot/det
-        T_trip   = (b3_wheel / b3_trip) · T_wheel
+        γ = l / (R_trip · |sin(contact_angle)|)
+
+    At contact_angle ≈ 0 the foot is directly below the hub — no horizontal
+    offset, no pitch leverage (γ → ∞, clamped).  At 90° the foot is
+    maximally offset and most effective.
 
     Args:
         T_wheel:       drive-wheel torque (Nm)
-        m_b, m_w, l, I_b, r: plant physical parameters
+        l:             CoG height above hub axis (m)
         R_trip:        triplet hub-to-contact radius (m)
         contact_angle: angle of contact point from hub vertical in world
                        frame (rad).  0 = directly below, π/2 = horizontal.
@@ -175,12 +169,36 @@ def compute_equivalent_triplet_torque(T_wheel, m_b, m_w, l, I_b, r,
     Returns:
         T_trip (Nm) — equivalent hub torque (before PyBullet sign flip)
     """
-    M_tot = m_b + m_w
-    I_eff = I_b + m_b * l ** 2
-    det   = M_tot * I_eff - (m_b * l) ** 2
-    b3_wheel = (m_b * l) / (det * r) + M_tot / det
-    b3_trip  = (m_b * l * math.cos(contact_angle)) / (det * R_trip) + M_tot / det
-    return (b3_wheel / b3_trip) * T_wheel
+    sin_a = max(abs(math.sin(contact_angle)), 0.5)    # floor ≈ 30°
+    return T_wheel * l / (R_trip * sin_a)
+
+
+def compute_max_triplet_torque(weight_R, contact_angle):
+    """
+    Maximum hub torque before the triplet flips over its ground contact.
+
+    The robot's weight pressing down through the hub creates a restoring
+    moment about the foot contact point:
+
+        T_max = (W/2) · R_trip · sin(contact_angle)
+
+    Since weight_R = (W/2) · R_trip is precomputed:
+
+        T_max = weight_R · sin(contact_angle)
+
+    At small angles the foot is below the hub — tiny horizontal lever arm,
+    so very little torque before flipping.  At large angles the foot is
+    far to the side — weight has a long moment arm, so more torque is safe.
+
+    Args:
+        weight_R:      (W/2) · R_trip precomputed (N·m)
+        contact_angle: angle of contact point from hub vertical (rad)
+
+    Returns:
+        T_max (Nm) — absolute torque limit (symmetric ±)
+    """
+    sin_a = abs(math.sin(contact_angle))
+    return weight_R * sin_a
 
 
 # ============================================================================
@@ -272,11 +290,7 @@ class LQRBalanceController(BalanceControllerBase):
         # --- Lean-assist: dynamic wheel / triplet lean-acceleration split ---
         # gamma(α) = compute_equivalent_triplet_torque(1.0, ..., α) varies
         # with the triplet contact angle — called each tick in update().
-        self._lean_plant = (
-            config.plant.body_mass, config.plant.wheel_mass,
-            config.plant.cog_height, config.plant.body_inertia,
-            config.robot.wheel_radius,
-        )
+        self._lean_cog_height = config.plant.cog_height
         self._lean_R_trip = config.robot.triplet_radius
 
         # Anti-lift: hub torque vertical component must not exceed weight.
@@ -285,11 +299,16 @@ class LQRBalanceController(BalanceControllerBase):
         self._lean_weight_R = (_M * abs(config.sim.gravity) / 2) * self._lean_R_trip
 
         self._triplet_lean_torque = 0.0
+        self._debug_u_lean = 0.0
+        self._debug_delayed_u_lean = 0.0
+        self._debug_gamma = 0.0
+        self._debug_lean_ff_raw = 0.0
 
-        _gamma_0  = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, 0.0)
-        _gamma_90 = compute_equivalent_triplet_torque(1.0, *self._lean_plant, self._lean_R_trip, math.pi / 2)
+        _gamma_0  = compute_equivalent_triplet_torque(1.0, self._lean_cog_height, self._lean_R_trip, 0.0)
+        _gamma_90 = compute_equivalent_triplet_torque(1.0, self._lean_cog_height, self._lean_R_trip, math.pi / 2)
         print(f"  Lean assist: gamma(0°)={_gamma_0:.2f}, gamma(90°)={_gamma_90:.2f}, "
-              f"T_lift(30°)={self._lean_weight_R / math.sin(math.radians(30)):.1f} Nm")
+              f"T_max(30°)={compute_max_triplet_torque(self._lean_weight_R, math.radians(30)):.2f} Nm, "
+              f"T_max(60°)={compute_max_triplet_torque(self._lean_weight_R, math.radians(60)):.2f} Nm")
 
     def reset(self):
         """Zero all internal state for a clean restart.
@@ -319,6 +338,10 @@ class LQRBalanceController(BalanceControllerBase):
         self.torque_delay_buffer = [(0.0, 0.0, 0.0)] * (delay_steps + 1)
 
         self._triplet_lean_torque = 0.0
+        self._debug_u_lean = 0.0
+        self._debug_delayed_u_lean = 0.0
+        self._debug_gamma = 0.0
+        self._debug_lean_ff_raw = 0.0
 
         # Gain scheduling — return to normal mode.
         self.K = self.K_normal
@@ -384,6 +407,10 @@ class LQRBalanceController(BalanceControllerBase):
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
             "triplet_lean_ff":        float(self._triplet_lean_torque),
+            "u_lean":                 float(self._debug_u_lean),
+            "delayed_u_lean":         float(self._debug_delayed_u_lean),
+            "gamma":                  float(self._debug_gamma),
+            "lean_ff_raw":            float(self._debug_lean_ff_raw),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -484,6 +511,9 @@ class LQRBalanceController(BalanceControllerBase):
             # u_balance: -(K₂·x₂ + K₃·x₃) — pitch+pitch_rate corrections.
             #            High-frequency, belongs exclusively to the wheels.
             u_lean = float(-(K[0] * x[0] + K[1] * x[1]))
+            u_lean = max(-self.cfg.motor.max_torque,
+                         min(self.cfg.motor.max_torque, u_lean))
+            self._debug_u_lean = u_lean
 
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
@@ -502,6 +532,7 @@ class LQRBalanceController(BalanceControllerBase):
             delayed_torque, delayed_yaw, delayed_u_lean = self.torque_delay_buffer.pop(0)
         else:
             delayed_torque, delayed_yaw, delayed_u_lean = self.torque_delay_buffer[0]
+        self._debug_delayed_u_lean = delayed_u_lean
 
         # Triplet lean feedforward (per-side, symmetric — no yaw component).
         # Only the lean-demand component (position+velocity) reaches the hub.
@@ -514,15 +545,20 @@ class LQRBalanceController(BalanceControllerBase):
         _avg_trip = (self._triplet_angle_L + self._triplet_angle_R) / 2
         _alpha = measured_pitch + _avg_trip
         _gamma = compute_equivalent_triplet_torque(
-            1.0, *self._lean_plant, self._lean_R_trip, _alpha)
+            1.0, self._lean_cog_height, self._lean_R_trip, _alpha)
+        # Clamp gamma: the geometric formula diverges near α=0 (foot
+        # below hub, no pitch leverage).  The sin floor inside the
+        # function caps it at ~12; add a safety clamp here too.
+        _gamma = max(0.0, min(_gamma, 5.0))
+        self._debug_gamma = _gamma
 
         _raw = -_gamma * delayed_u_lean
+        self._debug_lean_ff_raw = _raw
 
-        # Anti-lift clamp: |τ·sin(α)| / R_trip must not exceed weight.
-        # Floor sin at 0.2 (~12°) so the cap stays ≤ ~10 Nm near vertical.
-        _sin_a = max(abs(math.sin(_alpha)), 1.0)
-        _T_lift = self._lean_weight_R / _sin_a
-        self._triplet_lean_torque = max(-_T_lift, min(_T_lift, _raw))
+        # Anti-flip clamp: hub torque must not exceed the weight's restoring
+        # moment about the foot contact point.
+        _T_max = 50 * compute_max_triplet_torque(self._lean_weight_R, _alpha)
+        self._triplet_lean_torque = max(-_T_max, min(_T_max, _raw))
 
         # Per-side torques (left −yaw, right +yaw)
         # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
