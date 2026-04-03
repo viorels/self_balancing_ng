@@ -30,7 +30,7 @@ class SimConfig:
     timestep: float = 1.0 / 500.0       # 500 Hz physics
     sim_duration: float = 600.0
     controller: str = 'lqr'             # 'lqr', 'pid', or 'mpc'
-    urdf_path: str = 'tribot_description/urdf/tribot.urdf'
+    mjcf_path: str = 'tribot_description/mjcf/tribot.xml'
     initial_pitch: float = -0.03        # rad (~1.7°)
     initial_height: float = 0.118       # m
     initial_triplet_angle: float = 0.0  # rad (0° = 4WD)

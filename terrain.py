@@ -1,74 +1,112 @@
 """
-Terrain generators for PyBullet simulation.
+Terrain generators for MuJoCo simulation.
 
-Provides swappable terrain factories selected by CONFIG['TERRAIN'].
+Provides swappable terrain factories selected by config.terrain.terrain_type.
 
 Supported values:
-    'flat'        — default PyBullet plane (plane.urdf)
+    'flat'        — infinite ground plane
     'heightfield' — procedural heightfield with stair-step regions
     'box_stairs'  — sharp-edged stairs built from box primitives
 
 Usage:
-    from terrain import create_terrain
-    ground_ids = create_terrain(config)   # returns list of body IDs
+    from terrain import get_terrain_xml, post_load_terrain
+
+    # Before model compilation: get XML fragments to inject
+    terrain = get_terrain_xml(config)
+    # terrain['asset']     — XML string for <asset> section (or None)
+    # terrain['worldbody'] — XML string for <worldbody> section
+
+    # After model compilation: fill runtime data (heightfield only)
+    post_load_terrain(model, config)
 """
 
 import numpy as np
-import pybullet as p
-import pybullet_data
 
 
 # ============================================================================
 # PUBLIC API
 # ============================================================================
 
-def create_terrain(config):
-    """Create the terrain specified by config.terrain.terrain_type.
+def get_terrain_xml(config):
+    """Return MJCF XML fragments for the configured terrain type.
 
-    Returns a list of PyBullet body IDs (ground plane + any obstacles).
+    Returns a dict with:
+        'asset'     — XML string to insert inside <asset>, or None
+        'worldbody' — XML string to insert inside <worldbody>
     """
     kind = config.terrain.terrain_type
 
     if kind == 'flat':
-        return _create_flat(config)
+        return _flat_xml(config)
     elif kind == 'heightfield':
-        return _create_heightfield(config)
+        return _heightfield_xml(config)
     elif kind == 'box_stairs':
-        return _create_box_stairs(config)
+        return _box_stairs_xml(config)
     else:
         raise ValueError(f"Unknown terrain type: '{kind}'. "
                          "Choose from: flat, heightfield, box_stairs")
+
+
+def post_load_terrain(model, config):
+    """Fill runtime terrain data after model compilation.
+
+    Currently only needed for heightfield terrain (fills model.hfield_data).
+    Call this after mujoco.MjModel.from_xml_string() but before stepping.
+    """
+    if config.terrain.terrain_type == 'heightfield':
+        _fill_heightfield_data(model, config)
 
 
 # ============================================================================
 # FLAT PLANE
 # ============================================================================
 
-def _create_flat(config):
-    """Plain flat ground (PyBullet built-in plane.urdf)."""
-    ground_id = p.loadURDF("plane.urdf")
-    p.changeDynamics(ground_id, -1,
-                     lateralFriction=config.terrain.ground_friction)
-    return [ground_id]
+def _flat_xml(config):
+    friction = config.terrain.ground_friction
+    return {
+        'asset': None,
+        'worldbody': (
+            f'<geom name="floor" type="plane" size="10 10 0.1" '
+            f'friction="{friction} 0.005 0.001" '
+            f'rgba="0.8 0.8 0.8 1"/>'
+        ),
+    }
 
 
 # ============================================================================
 # HEIGHTFIELD TERRAIN
 # ============================================================================
 
-def _create_heightfield(config):
-    """Procedural heightfield with ascending/descending stair-step regions.
+def _heightfield_xml(config):
+    """Return XML fragments declaring a heightfield.
 
-    Layout (centred on the origin):
-      - flat zone around spawn
-      - ascending stairs in +X
-      - descending stairs in -X
+    The actual height data is filled by post_load_terrain() after compilation.
     """
     rows = cols = 256
-    height_data = np.zeros(rows * cols, dtype=np.float32)
+    friction = config.terrain.ground_friction
+    # size = [x_half_extent, y_half_extent, z_max, z_min_clip]
+    x_half = cols * 0.05 / 2  # 256 * 0.05 / 2 = 6.4
+    y_half = rows * 0.05 / 2
 
-    mesh_scale_x = 0.05   # metres per cell in X
-    mesh_scale_y = 0.05   # metres per cell in Y
+    return {
+        'asset': (
+            f'<hfield name="terrain" nrow="{rows}" ncol="{cols}" '
+            f'size="{x_half} {y_half} 0.3 0.001"/>'
+        ),
+        'worldbody': (
+            f'<geom name="floor" type="hfield" hfield="terrain" '
+            f'friction="{friction} 0.005 0.001" '
+            f'rgba="0.75 0.75 0.75 1"/>'
+        ),
+    }
+
+
+def _fill_heightfield_data(model, config):
+    """Generate and fill heightfield data into the compiled model."""
+    import mujoco
+
+    rows = cols = 256
+    height_data = np.zeros(rows * cols, dtype=np.float32)
 
     centre = cols // 2
     flat_half = 20         # cells of flat ground around spawn
@@ -90,94 +128,58 @@ def _create_heightfield(config):
                 stair_index = (abs(offset) - flat_half) // step_width_cells
                 height_data[idx] = (stair_index + 1) * step_height
 
-    # Shift so the minimum is at 0
-    min_h = float(np.min(height_data))
-    height_data -= min_h
-
-    terrain_shape = p.createCollisionShape(
-        shapeType=p.GEOM_HEIGHTFIELD,
-        meshScale=[mesh_scale_x, mesh_scale_y, 1.0],
-        heightfieldTextureScaling=1,
-        numHeightfieldRows=rows,
-        numHeightfieldColumns=cols,
-        heightfieldData=height_data.tolist(),
-    )
-    terrain_body = p.createMultiBody(0, terrain_shape)
-
-    # Position so the flat centre zone sits at Z = 0
+    # Normalize to [0, 1] range — MuJoCo hfield_data expects values in [0, 1]
+    # which are then scaled by the z component of the hfield size attribute.
     max_h = float(np.max(height_data))
-    p.resetBasePositionAndOrientation(
-        terrain_body, [0, 0, max_h / 2], [0, 0, 0, 1])
+    if max_h > 0:
+        height_data /= max_h
 
-    p.changeVisualShape(terrain_body, -1, rgbaColor=[0.75, 0.75, 0.75, 1])
-    p.changeDynamics(terrain_body, -1,
-                     lateralFriction=config.terrain.ground_friction)
-    return [terrain_body]
+    hfield_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, 'terrain')
+    model.hfield_data[:] = height_data
 
 
 # ============================================================================
 # BOX STAIRS
 # ============================================================================
 
-def _create_box_stairs(config):
-    """Sharp-edged staircases made from box primitives on a flat plane.
-
-    Creates a flat ground plane plus two staircases:
-      - ascending in +X
-      - descending in -X (i.e. ascending when approached from the -X side)
-
-    Tunable via CONFIG keys (all optional, sensible defaults provided):
-        STAIR_NUM_STEPS   — number of steps per staircase  (default 8)
-        STAIR_STEP_DEPTH  — tread depth in metres           (default 0.15)
-        STAIR_STEP_HEIGHT — riser height in metres           (default 0.02)
-        STAIR_WIDTH       — width of the staircase           (default 0.6)
-        STAIR_START_X     — distance from origin to 1st step (default 0.5)
-    """
-    # Ground plane (base floor)
-    ground_id = p.loadURDF("plane.urdf")
-    p.changeDynamics(ground_id, -1,
-                     lateralFriction=config.terrain.ground_friction)
-
-    body_ids = [ground_id]
-
-    num_steps   = config.terrain.stair_num_steps
-    step_depth  = config.terrain.stair_step_depth
+def _box_stairs_xml(config):
+    """Generate box stair XML geoms on a flat ground plane."""
+    friction = config.terrain.ground_friction
+    num_steps = config.terrain.stair_num_steps
+    step_depth = config.terrain.stair_step_depth
     step_height = config.terrain.stair_step_height
-    step_width  = config.terrain.stair_width
-    start_x     = config.terrain.stair_start_x
-    friction    = config.terrain.ground_friction
+    step_width = config.terrain.stair_width
+    start_x = config.terrain.stair_start_x
 
-    step_color_a = [0.55, 0.55, 0.60, 1.0]
-    step_color_b = [0.65, 0.65, 0.70, 1.0]
+    step_color_a = "0.55 0.55 0.60 1"
+    step_color_b = "0.65 0.65 0.70 1"
 
-    def _make_staircase(x_origin, x_sign, step_height):
-        """Place one staircase. x_sign = +1 for +X, -1 for -X."""
-        ids = []
+    parts = [
+        f'<geom name="floor" type="plane" size="10 10 0.1" '
+        f'friction="{friction} 0.005 0.001" rgba="0.8 0.8 0.8 1"/>'
+    ]
+
+    def _make_staircase(prefix, x_origin, x_sign, sh):
         for i in range(num_steps):
-            # Each step is a box whose height = cumulative height up to this step
-            h = step_height * (i + 1)
-            half = [step_depth / 2, step_width / 2, h / 2]
-
-            col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
-            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half,
-                                      rgbaColor=step_color_a if i % 2 == 0
-                                      else step_color_b)
-
+            h = sh * (i + 1)
+            half_x = step_depth / 2
+            half_y = step_width / 2
+            half_z = h / 2
             cx = x_origin + x_sign * (i * step_depth + step_depth / 2)
             cz = h / 2
+            color = step_color_a if i % 2 == 0 else step_color_b
+            parts.append(
+                f'<geom name="stair_{prefix}_{i}" type="box" '
+                f'size="{half_x} {half_y} {half_z}" '
+                f'pos="{cx} 0 {cz}" '
+                f'friction="{friction} 0.005 0.001" '
+                f'rgba="{color}"/>'
+            )
 
-            body = p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=col,
-                baseVisualShapeIndex=vis,
-                basePosition=[cx, 0, cz])
-            p.changeDynamics(body, -1, lateralFriction=friction)
-            ids.append(body)
-        return ids
+    _make_staircase("pos", start_x, +1, step_height[0])
+    _make_staircase("neg", -start_x, -1, step_height[1])
 
-    # Ascending staircase in +X
-    body_ids += _make_staircase(start_x, +1, step_height=step_height[0])
-    # Ascending staircase in -X (descending when going from origin)
-    body_ids += _make_staircase(-start_x, -1, step_height=step_height[1])
-
-    return body_ids
+    return {
+        'asset': None,
+        'worldbody': '\n    '.join(parts),
+    }

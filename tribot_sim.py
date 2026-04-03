@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tribot Self-Balancing Robot Simulation — thin orchestration loop.
+Tribot Self-Balancing Robot Simulation — thin orchestration loop (MuJoCo).
 
 Wires together: config, robot, input, controller, physics, telemetry.
 No control logic, no sensor code, no motor physics lives here.
@@ -9,19 +9,22 @@ USAGE:
     python3 tribot_sim.py
 """
 
-import time
 import math
+import os
+import time
+import xml.etree.ElementTree as ET
 
-import pybullet as p
-import pybullet_data
+import mujoco
+import mujoco.viewer
+import numpy as np
 
 from config import load_config
-from robot import TribotBalanceBot
+from robot import TribotBalanceBot, _euler_to_mj_quat
 from robot_state import DriveMode
 from input.gamepad import Gamepad
 from input.input_manager import InputManager
 from plotjuggler_udp import PlotJugglerStreamer
-from terrain import create_terrain
+from terrain import get_terrain_xml, post_load_terrain
 from mcp.sim_bridge import SimBridge
 
 
@@ -29,22 +32,107 @@ CONFIG = load_config()
 
 
 # ============================================================================
+# SCENE BUILDER
+# ============================================================================
+
+def _build_scene_xml(mjcf_path, config):
+    """Read base MJCF, inject terrain fragments, return complete XML string."""
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+
+    # Resolve meshdir to absolute path (needed when loading via from_xml_string)
+    compiler = root.find('compiler')
+    if compiler is not None:
+        meshdir = compiler.get('meshdir', '')
+        if meshdir and not os.path.isabs(meshdir):
+            abs_meshdir = os.path.normpath(
+                os.path.join(os.path.dirname(mjcf_path), meshdir))
+            compiler.set('meshdir', abs_meshdir + '/')
+
+    terrain = get_terrain_xml(config)
+    worldbody = root.find('worldbody')
+
+    # Inject terrain asset (heightfield declaration)
+    if terrain.get('asset'):
+        asset = root.find('asset')
+        if asset is None:
+            asset = ET.SubElement(root, 'asset')
+        for line in terrain['asset'].strip().split('\n'):
+            line = line.strip()
+            if line:
+                asset.append(ET.fromstring(line))
+
+    # Inject terrain worldbody geoms at start of worldbody
+    wb_xml = terrain.get('worldbody', '')
+    insert_idx = 0
+    for line in wb_xml.strip().split('\n'):
+        line = line.strip()
+        if line:
+            worldbody.insert(insert_idx, ET.fromstring(line))
+            insert_idx += 1
+
+    return ET.tostring(root, encoding='unicode')
+
+
+# ============================================================================
+# KEYBOARD CALLBACK
+# ============================================================================
+
+_reset_requested = False
+
+
+def _key_callback(keycode):
+    global _reset_requested
+    # MuJoCo viewer key codes: 'r' = 82 (uppercase) or check for glfw code
+    if keycode == ord('r') or keycode == ord('R'):
+        _reset_requested = True
+
+
+# ============================================================================
+# VISUAL MARKER
+# ============================================================================
+
+def _draw_marker(viewer, x, y, h, color):
+    """Draw a vertical line marker at (x, y) using the viewer scene."""
+    if viewer is None:
+        return
+    scn = viewer.user_scn
+    if scn.ngeom >= scn.maxgeom:
+        return
+    mujoco.mjv_initGeom(
+        scn.geoms[scn.ngeom],
+        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+        size=np.zeros(3),
+        pos=np.zeros(3),
+        mat=np.eye(3).flatten(),
+        rgba=np.array([*color, 1.0], dtype=np.float32),
+    )
+    mujoco.mjv_connector(
+        scn.geoms[scn.ngeom],
+        mujoco.mjtGeom.mjGEOM_CAPSULE,
+        0.003,  # width
+        np.array([x, y, 0.0]),
+        np.array([x, y, h]),
+    )
+    scn.ngeom += 1
+
+
+# ============================================================================
 # SIMULATION MAIN LOOP
 # ============================================================================
 
-def _print_config_summary(robot, config):
+def _print_config_summary(model, robot, config):
     """Print a one-time startup banner with key parameters."""
-    total_mass = sum(p.getDynamicsInfo(robot.body_id, i)[0]
-                     for i in range(-1, p.getNumJoints(robot.body_id)))
+    total_mass = sum(model.body_mass)
     ctrl_type = config.sim.controller.upper()
     print(f"\nRobot total mass: {total_mass:.3f} kg")
     print(f"Controller: {ctrl_type}")
     if ctrl_type == 'PID':
-        print(f"  Inner PID (pitch→torque): Kp={config.pid.kp}, "
+        print(f"  Inner PID (pitch->torque): Kp={config.pid.kp}, "
               f"Ki={config.pid.ki}, Kd={config.pid.kd}")
-        print(f"  Outer PID (pos→pitch):   Kp={config.pid.pos_kp}, "
+        print(f"  Outer PID (pos->pitch):   Kp={config.pid.pos_kp}, "
               f"Ki={config.pid.pos_ki}, Kd={config.pid.pos_kd}, "
-              f"max_pitch={math.degrees(config.pid.pos_max_pitch):.1f}°")
+              f"max_pitch={math.degrees(config.pid.pos_max_pitch):.1f}")
     elif ctrl_type == 'MPC':
         print(f"  MPC rate: {config.mpc.rate_hz}Hz, N={config.mpc.horizon}, "
               f"sim_solve={config.mpc.simulated_solve_ms}ms")
@@ -53,47 +141,64 @@ def _print_config_summary(robot, config):
         print(f"  Plant: m_body={config.plant.body_mass}kg, "
               f"m_wheel={config.plant.wheel_mass}kg, "
               f"l_cog={config.plant.cog_height}m, "
-              f"I_body={config.plant.body_inertia}kg·m²")
+              f"I_body={config.plant.body_inertia}kg*m^2")
     else:
         print(f"  Q_diag={config.lqr.q_diag}, R={config.lqr.r}")
         print(f"  Plant: m_body={config.plant.body_mass}kg, "
               f"m_wheel={config.plant.wheel_mass}kg, "
               f"l_cog={config.plant.cog_height}m, "
-              f"I_body={config.plant.body_inertia}kg·m²")
-    print(f"Motor: τ={config.motor.tau*1000:.0f}ms lag, "
+              f"I_body={config.plant.body_inertia}kg*m^2")
+    print(f"Motor: tau={config.motor.tau*1000:.0f}ms lag, "
           f"back-EMF K={config.motor.back_emf_k}, "
           f"deadband={config.motor.deadband}Nm")
-    print(f"IMU: complementary filter α={config.imu.comp_filter_alpha}, "
-          f"gyro drift={config.imu.gyro_drift_rate} rad/s²")
+    print(f"IMU: complementary filter alpha={config.imu.comp_filter_alpha}, "
+          f"gyro drift={config.imu.gyro_drift_rate} rad/s^2")
     print(f"Control: {config.control.control_rate_hz}Hz")
-    print(f"Initial pitch: {math.degrees(config.sim.initial_pitch):.1f}°  "
+    print(f"Initial pitch: {math.degrees(config.sim.initial_pitch):.1f}  "
           f"height: {config.sim.initial_height:.3f}m")
     print("-" * 70)
 
 
 def run_simulation():
     """Run the tribot self-balancing simulation."""
+    global _reset_requested
 
     print("=" * 70)
-    print("Tribot Self-Balancing Robot — URDF-based Simulation")
+    print("Tribot Self-Balancing Robot — MuJoCo Simulation")
     print("=" * 70)
 
-    # --- Physics engine ---
-    physics_client = p.connect(p.GUI, options="--width=1920 --height=1080 --maximized")
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, CONFIG.sim.gravity)
-    p.setPhysicsEngineParameter(fixedTimeStep=CONFIG.sim.timestep, numSubSteps=1)
+    # --- Build scene XML (MJCF + terrain) ---
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mjcf_path = os.path.join(script_dir, CONFIG.sim.mjcf_path)
+    xml_string = _build_scene_xml(mjcf_path, CONFIG)
 
-    # --- Environment + robot ---
-    create_terrain(CONFIG)
-    print("\nLoading tribot URDF...")
-    robot = TribotBalanceBot(physics_client, CONFIG)
+    # --- Load model and create data ---
+    model = mujoco.MjModel.from_xml_string(xml_string)
+    data = mujoco.MjData(model)
 
-    p.resetDebugVisualizerCamera(
-        cameraDistance=1.2, cameraYaw=0, cameraPitch=-30,
-        cameraTargetPosition=[0, 0, 0.15]
-    )
-    _print_config_summary(robot, CONFIG)
+    # Apply initial pitch via quaternion
+    quat = _euler_to_mj_quat(0, CONFIG.sim.initial_pitch, 0)
+    data.qpos[3:7] = quat
+
+    # Forward kinematics before robot init
+    mujoco.mj_forward(model, data)
+
+    # Fill runtime terrain data (heightfield)
+    post_load_terrain(model, CONFIG)
+
+    # --- Robot ---
+    print("\nLoading tribot MJCF...")
+    robot = TribotBalanceBot(model, data, CONFIG)
+
+    _print_config_summary(model, robot, CONFIG)
+
+    # --- Viewer ---
+    viewer = mujoco.viewer.launch_passive(
+        model, data, key_callback=_key_callback)
+    viewer.cam.distance = 2.0
+    viewer.cam.azimuth = 120
+    viewer.cam.elevation = -20
+    viewer.cam.lookat[:] = [0, 0, 0.15]
 
     # --- Input ---
     gp = Gamepad(CONFIG.gamepad.device, deadzone=CONFIG.gamepad.deadzone)
@@ -111,55 +216,51 @@ def run_simulation():
     bridge.start()
 
     # --- Visual target marker ---
-    marker_id = -1
     marker_color = [0.0, 1.0, 0.0]
     marker_h = CONFIG.gamepad.target_marker_height
 
-    # Persistent bridge overrides (survive multiple ticks; ticks countdown to 0)
-    # _bridge_target_abs stores an ABSOLUTE position setpoint (m), computed once
-    # at command-receipt time so the target doesn't drift as the robot moves.
+    # Persistent bridge overrides
     _bridge_target_abs = None
     _bridge_yaw = None
     _bridge_lean = None
     _bridge_ticks_left = 0
 
     sim_time = 0.0
+    wall_start = time.monotonic()
     log_interval = 0.1
     last_log_time = 0.0
 
     # ==================================================================
-    # Main loop: input → sensors → controller → actuators → step → telem
+    # Main loop: input -> sensors -> controller -> actuators -> step -> telem
     # ==================================================================
-    while sim_time < CONFIG.sim.sim_duration:
+    while sim_time < CONFIG.sim.sim_duration and viewer.is_running():
         # --- Drain bridge command queue ---
         for cmd in bridge.pop_commands():
             ctype = cmd.get("type")
             if ctype == "drive":
-                # Compute absolute target once from current position + offset.
-                # Storing as absolute prevents the target from drifting each tick.
                 _bridge_target_abs = robot.position + cmd["fwd"]
                 _bridge_yaw = cmd["yaw"]
                 _bridge_ticks_left = cmd.get("ticks", 500)
             elif ctype == "lean":
                 _bridge_lean = cmd["lean_rad"]
             elif ctype == "target_position":
-                _bridge_target_abs = cmd["position"]   # already absolute
-                _bridge_ticks_left = 5000   # hold indefinitely
+                _bridge_target_abs = cmd["position"]
+                _bridge_ticks_left = 5000
             elif ctype == "set_drive_mode":
-                from robot_state import DriveMode
                 target = DriveMode.TWO_WD if cmd["mode"] == "2wd" else DriveMode.FOUR_WD
                 robot.set_drive_mode(target)
             elif ctype == "reset":
                 robot.reset()
                 _bridge_target_abs = _bridge_yaw = _bridge_lean = None
                 _bridge_ticks_left = 0
-                inp.target_position = 0.0     # flush stale gamepad target
+                inp.target_position = 0.0
                 sim_time = 0.0
                 last_log_time = 0.0
+                wall_start = time.monotonic()
 
-        # --- Keyboard shortcuts (PyBullet GUI) ---
-        keys = p.getKeyboardEvents()
-        if ord('r') in keys and (keys[ord('r')] & p.KEY_WAS_TRIGGERED):
+        # --- Keyboard shortcuts ---
+        if _reset_requested:
+            _reset_requested = False
             print("[key] R pressed — resetting robot")
             robot.reset()
             _bridge_target_abs = _bridge_yaw = _bridge_lean = None
@@ -167,6 +268,7 @@ def run_simulation():
             inp.target_position = 0.0
             sim_time = 0.0
             last_log_time = 0.0
+            wall_start = time.monotonic()
 
         # --- Input (gamepad / autonomy) ---
         goals, mode_toggle, marker = inp.update(
@@ -189,23 +291,19 @@ def run_simulation():
             _bridge_ticks_left -= 1
 
         # --- Update visual marker ---
+        viewer.user_scn.ngeom = 0  # clear previous frame's markers
         if inp.connected:
-            pt_from = [marker.x, marker.y, 0.0]
-            pt_to   = [marker.x, marker.y, marker_h]
-            if marker_id >= 0:
-                marker_id = p.addUserDebugLine(
-                    pt_from, pt_to, marker_color, lineWidth=3,
-                    replaceItemUniqueId=marker_id)
-            else:
-                marker_id = p.addUserDebugLine(
-                    pt_from, pt_to, marker_color, lineWidth=3)
+            _draw_marker(viewer, marker.x, marker.y, marker_h, marker_color)
 
-        # --- Sensors → controller → actuators ---
+        # --- Sensors -> controller -> actuators ---
         robot.update(sim_time, CONFIG.sim.timestep)
 
         # --- Physics step ---
-        p.stepSimulation()
+        mujoco.mj_step(model, data)
         sim_time += CONFIG.sim.timestep
+
+        # --- Sync viewer ---
+        viewer.sync()
 
         # --- Telemetry: pull from robot + controller, merge, stream ---
         ctrl_telem = robot.controller.get_telemetry()
@@ -218,11 +316,6 @@ def run_simulation():
         pj.send(telem)
         bridge.push_state(telem)
 
-        # --- Fall detection ---
-        # if robot.check_fallen():
-        #     print(f"\n[{sim_time:.2f}s] Robot fell over!")
-        #     break
-
         # --- Periodic console log ---
         if sim_time - last_log_time >= log_interval:
             dbg = robot.get_debug_state()
@@ -232,31 +325,33 @@ def run_simulation():
             at0, at1 = robot.actual_torques
             print(
                 f"[{sim_time:5.2f}s] "
-                f"Euler(p={ry:6.1f})° | "
-                f"TgtPitch:{math.degrees(robot.controller.target_pitch):5.2f}° | "
-                f"TripAng({math.degrees(ta[0]):5.1f},{math.degrees(ta[1]):5.1f})° "
+                f"Euler(p={ry:6.1f}) | "
+                f"TgtPitch:{math.degrees(robot.controller.target_pitch):5.2f} | "
+                f"TripAng({math.degrees(ta[0]):5.1f},{math.degrees(ta[1]):5.1f}) "
                 f"Whl({wv[0]:5.1f},{wv[1]:5.1f})rad/s | "
                 f"Act:{at0:6.3f},{at1:6.3f}"
             )
             last_log_time = sim_time
 
-        time.sleep(CONFIG.sim.timestep)
+        # Realtime pacing: sleep only the remaining time until next step
+        wall_target = wall_start + sim_time
+        wall_remaining = wall_target - time.monotonic()
+        if wall_remaining > 0:
+            time.sleep(wall_remaining)
 
     # --- Shutdown ---
     print("-" * 70)
     final_pitch_deg = math.degrees(robot.pitch_angle)
-    print(f"\nSimulation complete! Final pitch: {final_pitch_deg:.2f}°")
+    print(f"\nSimulation complete! Final pitch: {final_pitch_deg:.2f}")
     if abs(final_pitch_deg) < 10:
-        print("✓ Robot balanced!")
+        print("Robot balanced!")
     else:
-        print("✗ Robot fell.")
+        print("Robot fell.")
 
     bridge.stop()
     pj.close()
-    print("\nClose the PyBullet window to exit.")
-    while p.isConnected(physics_client):
-        time.sleep(0.01)
-    p.disconnect()
+    viewer.close()
+    print("Simulation ended.")
 
 
 if __name__ == "__main__":
