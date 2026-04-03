@@ -46,12 +46,10 @@ class BalanceController(BalanceControllerBase):
         self.pos_control_period = 1.0 / config.pid.pos_rate_hz
         self.next_pos_control_time = 0.0
 
-        # --- Sensor-to-actuator delay buffer ---
-        delay_steps = config.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
-
         # --- Last commanded torque (for logging) ---
         self.control_torque = 0.0
+        self._left_torque = 0.0
+        self._right_torque = 0.0
 
         # --- Yaw rate setpoint (for joystick control) ---
         self.yaw_rate_setpoint = 0.0
@@ -143,20 +141,10 @@ class BalanceController(BalanceControllerBase):
             # Yaw damping: oppose yaw rate relative to setpoint
             yaw_correction = self.cfg.control.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
-            # Push into delay buffer
-            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
+            # === Per-side torques (left −yaw, right +yaw) ===
+            # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
+            # Positive yaw_correction → more torque on right side → turns right.
+            self._left_torque = commanded_torque - yaw_correction
+            self._right_torque = commanded_torque + yaw_correction
 
-        # === Pop delayed torque command ===
-        delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
-        if len(self.torque_delay_buffer) > delay_depth:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
-        else:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
-
-        # === Per-side torques (left −yaw, right +yaw) ===
-        # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
-        # Positive yaw_correction → more torque on right side → turns right.
-        left_torque = delayed_torque - delayed_yaw
-        right_torque = delayed_torque + delayed_yaw
-
-        return left_torque, right_torque
+        return self._left_torque, self._right_torque

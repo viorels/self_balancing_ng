@@ -203,13 +203,11 @@ class LQRBalanceController(BalanceControllerBase):
         self.control_period = 1.0 / config.control.control_rate_hz
         self.next_control_time = 0.0
 
-        # --- Sensor-to-actuator delay buffer ---
-        delay_steps = config.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
-
         # --- Exposed for logging ---
         self.control_torque = 0.0
         self.target_pitch = 0.0       # mirrors target_lean for log compat
+        self._left_torque = 0.0
+        self._right_torque = 0.0
 
         # --- Per-state torque contributions (for PlotJuggler / debug) ---
         self.K_contributions = np.zeros(4)  # K[0]*x_pos, K[1]*x_vel, K[2]*x_pitch, K[3]*x_prate
@@ -252,10 +250,6 @@ class LQRBalanceController(BalanceControllerBase):
 
         # Control-loop timing — let it fire on the very next tick.
         self.next_control_time = 0.0
-
-        # Torque delay buffer — flush pre-reset saturated torques.
-        delay_steps = self.cfg.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
 
         # Gain scheduling — return to normal mode.
         self.K = self.K_normal
@@ -415,19 +409,10 @@ class LQRBalanceController(BalanceControllerBase):
             # Yaw damping relative to setpoint
             yaw_correction = self.cfg.control.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
-            self.torque_delay_buffer.append((commanded_torque, yaw_correction))
+            # Per-side torques (left −yaw, right +yaw)
+            # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
+            # Positive yaw_correction → more torque on right side → turns right.
+            self._left_torque = commanded_torque - yaw_correction
+            self._right_torque = commanded_torque + yaw_correction
 
-        # === Pop delayed torque command ===
-        delay_depth = self.cfg.control.sensor_to_actuator_delay_steps + 1
-        if len(self.torque_delay_buffer) > delay_depth:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer.pop(0)
-        else:
-            delayed_torque, delayed_yaw = self.torque_delay_buffer[0]
-
-        # Per-side torques (left −yaw, right +yaw)
-        # l_triplet is at -Y (robot's left from behind), r_triplet at +Y (right).
-        # Positive yaw_correction → more torque on right side → turns right.
-        left_torque = delayed_torque - delayed_yaw
-        right_torque = delayed_torque + delayed_yaw
-
-        return left_torque, right_torque
+        return self._left_torque, self._right_torque

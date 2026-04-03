@@ -81,7 +81,6 @@ class ControlConfig:
     """Shared control-loop timing and parameters."""
     control_rate_hz: int = 200          # PD tracking loop rate
     control_jitter_std: float = 0.0005  # s — timing jitter σ
-    sensor_to_actuator_delay_steps: int = 0
     yaw_damping_k: float = 0.5
 
 

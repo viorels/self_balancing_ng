@@ -65,8 +65,7 @@ def _print_config_summary(robot, config):
           f"deadband={config.motor.deadband}Nm")
     print(f"IMU: complementary filter α={config.imu.comp_filter_alpha}, "
           f"gyro drift={config.imu.gyro_drift_rate} rad/s²")
-    print(f"Control: {config.control.control_rate_hz}Hz, "
-          f"{config.control.sensor_to_actuator_delay_steps} step pipeline delay")
+    print(f"Control: {config.control.control_rate_hz}Hz")
     print(f"Initial pitch: {math.degrees(config.sim.initial_pitch):.1f}°  "
           f"height: {config.sim.initial_height:.3f}m")
     print("-" * 70)

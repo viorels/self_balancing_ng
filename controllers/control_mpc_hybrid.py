@@ -1004,11 +1004,6 @@ class MPCHybridController(BalanceControllerBase):
         self.yaw_rate_setpoint = 0.0
         self.yaw_damping_k = config.control.yaw_damping_k
 
-        # ---- Sensor-to-actuator delay pipeline ----
-        delay_steps = config.control.sensor_to_actuator_delay_steps
-        self.torque_delay_buffer = [(0.0, 0.0)] * (delay_steps + 1)
-        self.delay_depth = delay_steps + 1
-
         # ---- Triplet torque outputs (for tribot_sim to apply) ----
         self._triplet_torque_L = 0.0
         self._triplet_torque_R = 0.0
@@ -1016,6 +1011,8 @@ class MPCHybridController(BalanceControllerBase):
         # ---- Logging (compatible with tribot_sim PlotJuggler) ----
         self.control_torque = 0.0
         self.target_pitch = 0.0
+        self._left_torque = 0.0
+        self._right_torque = 0.0
         self.K_contributions = np.zeros(4)   # [trip_L, trip_R, drive_L, drive_R] ff
         self.state_error = np.zeros(4)       # [pos_err, vel, pitch, pitch_rate]
 
@@ -1469,11 +1466,6 @@ class MPCHybridController(BalanceControllerBase):
             # Yaw damping (differential torque opposing yaw rate)
             yaw_correction = self.yaw_damping_k * (yaw_rate - self.yaw_rate_setpoint)
 
-            # Push into delay buffer (drive L, drive R, trip L, trip R, yaw)
-            self.torque_delay_buffer.append((drive_torque_L, drive_torque_R,
-                                             trip_torque_L, trip_torque_R,
-                                             yaw_correction))
-
             # Logging: fill state_error for compatibility with tribot_sim
             self.state_error[0] = position - self.target_position
             self.state_error[1] = self.velocity
@@ -1488,32 +1480,12 @@ class MPCHybridController(BalanceControllerBase):
 
             self.target_pitch = float(x_ref[self.IDX_PITCH])
 
-        # ---- Pop delayed torque command ----
-        if len(self.torque_delay_buffer) > self.delay_depth:
-            entry = self.torque_delay_buffer.pop(0)
-        else:
-            entry = self.torque_delay_buffer[0]
+            # Apply yaw correction differentially on drive motors
+            self._left_torque  = drive_torque_L - yaw_correction
+            self._right_torque = drive_torque_R + yaw_correction
 
-        if len(entry) == 5:
-            delayed_L, delayed_R, delayed_trip_L, delayed_trip_R, delayed_yaw = entry
-        elif len(entry) == 3:
-            delayed_L, delayed_R, delayed_yaw = entry
-            delayed_trip_L = 0.0
-            delayed_trip_R = 0.0
-        else:
-            # Legacy 2-tuple in initial buffer
-            delayed_L = entry[0]
-            delayed_R = entry[1] if len(entry) > 1 else entry[0]
-            delayed_trip_L = 0.0
-            delayed_trip_R = 0.0
-            delayed_yaw = 0.0
+            # Expose triplet torques for tribot_sim to apply
+            self._triplet_torque_L = trip_torque_L
+            self._triplet_torque_R = trip_torque_R
 
-        # Apply yaw correction differentially on drive motors
-        left_torque  = delayed_L - delayed_yaw
-        right_torque = delayed_R + delayed_yaw
-
-        # Expose triplet torques for tribot_sim to apply
-        self._triplet_torque_L = delayed_trip_L
-        self._triplet_torque_R = delayed_trip_R
-
-        return left_torque, right_torque
+        return self._left_torque, self._right_torque
