@@ -304,10 +304,10 @@ class TribotBalanceBot:
     # ----------------------------------------------------------------
 
     def _get_rot_and_vel(self):
-        """Return (rot_3x3, lin_vel_world, ang_vel_world) for c_body."""
+        """Return (rot_3x3, lin_vel_world, ang_vel_body) for c_body."""
         rot = self.data.xmat[self.body_id].reshape(3, 3)
-        lin_vel = self.data.qvel[0:3]
-        ang_vel = self.data.qvel[3:6]
+        lin_vel = self.data.qvel[0:3]   # world frame
+        ang_vel = self.data.qvel[3:6]   # body frame (MuJoCo convention)
         return rot, lin_vel, ang_vel
 
     def _get_true_state(self):
@@ -318,7 +318,6 @@ class TribotBalanceBot:
         MuJoCo xmat is row-major 3x3:
           rot[2,2] = world-Z component of body-Z (body_up_z)
           rot[2,0] = world-Z component of body-X (body_fwd_z)
-        Same layout as PyBullet's getMatrixFromQuaternion.
         """
         rot, _, ang_vel = self._get_rot_and_vel()
 
@@ -326,10 +325,8 @@ class TribotBalanceBot:
         body_fwd_z = rot[2, 0]
         pitch = math.atan2(-body_fwd_z, body_up_z)
 
-        # Pitch rate = angular velocity projected onto body Y axis
-        pitch_rate = (rot[0, 1] * ang_vel[0]
-                      + rot[1, 1] * ang_vel[1]
-                      + rot[2, 1] * ang_vel[2])
+        # Pitch rate = body-frame Y angular velocity (MuJoCo qvel is body frame)
+        pitch_rate = float(ang_vel[1])
 
         return pitch, pitch_rate
 
@@ -355,11 +352,9 @@ class TribotBalanceBot:
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
-        # --- Yaw rate (body-frame) for yaw damping ---
+        # --- Yaw rate (body-frame Z angular velocity) ---
         rot, lin_vel, ang_vel = self._get_rot_and_vel()
-        yaw_rate = -(rot[0, 2] * ang_vel[0]
-                     + rot[1, 2] * ang_vel[1]
-                     + rot[2, 2] * ang_vel[2])
+        yaw_rate = -float(ang_vel[2])
 
         # --- Forward odometry: integrate velocity projected onto heading ---
         body_fwd_x = -rot[0, 0]
