@@ -24,6 +24,20 @@ import numpy as np
 
 
 # ============================================================================
+# FLOOR TEXTURE / MATERIAL
+# ============================================================================
+
+_FLOOR_TEXTURE = (
+    '<texture name="floor_checker" type="2d" builtin="checker" '
+    'rgb1="0.55 0.6 0.7" rgb2="0.75 0.8 0.88" width="512" height="512"/>'
+)
+_FLOOR_MATERIAL = (
+    '<material name="floor_mat" texture="floor_checker" '
+    'texrepeat="5 5" texuniform="true"/>'
+)
+
+
+# ============================================================================
 # PUBLIC API
 # ============================================================================
 
@@ -64,11 +78,11 @@ def post_load_terrain(model, config):
 def _flat_xml(config):
     friction = config.terrain.ground_friction
     return {
-        'asset': None,
+        'asset': f'{_FLOOR_TEXTURE}\n{_FLOOR_MATERIAL}',
         'worldbody': (
             f'<geom name="floor" type="plane" size="10 10 0.1" '
-            f'friction="{friction} 0.005 0.001" '
-            f'rgba="0.8 0.8 0.8 1"/>'
+            f'material="floor_mat" '
+            f'friction="{friction} 0.005 0.001"/>'
         ),
     }
 
@@ -91,12 +105,13 @@ def _heightfield_xml(config):
     return {
         'asset': (
             f'<hfield name="terrain" nrow="{rows}" ncol="{cols}" '
-            f'size="{x_half} {y_half} 0.3 0.001"/>'
+            f'size="{x_half} {y_half} 0.3 0.001"/>\n'
+            f'{_FLOOR_TEXTURE}\n{_FLOOR_MATERIAL}'
         ),
         'worldbody': (
             f'<geom name="floor" type="hfield" hfield="terrain" '
-            f'friction="{friction} 0.005 0.001" '
-            f'rgba="0.75 0.75 0.75 1"/>'
+            f'material="floor_mat" '
+            f'friction="{friction} 0.005 0.001"/>'
         ),
     }
 
@@ -156,7 +171,8 @@ def _box_stairs_xml(config):
 
     parts = [
         f'<geom name="floor" type="plane" size="10 10 0.1" '
-        f'friction="{friction} 0.005 0.001" rgba="0.8 0.8 0.8 1"/>'
+        f'material="floor_mat" '
+        f'friction="{friction} 0.005 0.001"/>'
     ]
 
     def _make_staircase(prefix, x_origin, x_sign, sh):
@@ -180,6 +196,6 @@ def _box_stairs_xml(config):
     _make_staircase("neg", -start_x, -1, step_height[1])
 
     return {
-        'asset': None,
+        'asset': f'{_FLOOR_TEXTURE}\n{_FLOOR_MATERIAL}',
         'worldbody': '\n    '.join(parts),
     }
