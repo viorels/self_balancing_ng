@@ -306,7 +306,12 @@ class TribotBalanceBot:
     def _get_rot_and_vel(self):
         """Return (rot_3x3, lin_vel_world, ang_vel_body) for c_body."""
         rot = self.data.xmat[self.body_id].reshape(3, 3)
-        lin_vel = self.data.qvel[0:3]   # world frame
+        # Use CoM velocity for odometry (matches PyBullet's getBaseVelocity).
+        # qvel[0:3] is the body-frame origin velocity, but the LQR's position
+        # estimate was tuned with CoM velocity.  The difference matters during
+        # pitching: v_CoM = v_origin + ω×r_CoG, which shifts ~0.25 m/s at
+        # pitch_rate≈1 rad/s (h_CoG=0.247 m) and causes position drift.
+        lin_vel = self.data.cvel[self.body_id][3:6]  # CoM velocity, world frame
         ang_vel = self.data.qvel[3:6]   # body frame (MuJoCo convention)
         return rot, lin_vel, ang_vel
 
