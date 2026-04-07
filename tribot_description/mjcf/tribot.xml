@@ -152,19 +152,19 @@
 
   <!-- ================================================================
        Belt constraints: 1:1 gear coupling, 3 wheels per side
-       polycoef="0 -1 0 0 0" means joint2 = -1 * joint1
+       polycoef="0 1 0 0 0" means joint2 = joint1 (same direction)
        ================================================================ -->
   <equality>
     <!-- Left side: wheel_1 is master -->
     <joint joint1="l_triplet_to_l_wheel_1" joint2="l_triplet_to_l_wheel_2"
-           polycoef="0 -1 0 0 0"/>
+           polycoef="0 1 0 0 0"/>
     <joint joint1="l_triplet_to_l_wheel_1" joint2="l_triplet_to_l_wheel_3"
-           polycoef="0 -1 0 0 0"/>
+           polycoef="0 1 0 0 0"/>
     <!-- Right side: wheel_1 is master -->
     <joint joint1="r_triplet_to_r_wheel_1" joint2="r_triplet_to_r_wheel_2"
-           polycoef="0 -1 0 0 0"/>
+           polycoef="0 1 0 0 0"/>
     <joint joint1="r_triplet_to_r_wheel_1" joint2="r_triplet_to_r_wheel_3"
-           polycoef="0 -1 0 0 0"/>
+           polycoef="0 1 0 0 0"/>
   </equality>
 
   <!-- ================================================================
