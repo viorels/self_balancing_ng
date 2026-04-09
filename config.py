@@ -41,7 +41,7 @@ class RobotConfig:
     """Robot geometry, contact properties, and mechanical parameters."""
     wheel_radius: float = 0.058         # m — small drive wheel
     triplet_radius: float = 0.12        # m — circumradius of wheel triangle
-    wheel_friction: float = 1.2
+    wheel_friction: float = 0.7
     triplet_friction: float = 0.3
     belt_max_force: float = 100.0       # N — gear constraint max force
     triplet_joint_damping: float = 0.05 # Nm·s/rad
@@ -192,7 +192,7 @@ class GamepadConfig:
 class TerrainConfig:
     """Terrain type and stair geometry."""
     terrain_type: str = 'flat'         # 'flat', 'heightfield', or 'box_stairs'
-    ground_friction: float = 1.0
+    ground_friction: float = 0.7
     stair_num_steps: int = 2
     stair_step_depth: float = 0.20     # m
     stair_step_height: List[float] = field(
