@@ -243,6 +243,7 @@ def run_simulation():
                 _bridge_ticks_left = cmd.get("ticks", 500)
             elif ctype == "lean":
                 _bridge_lean = cmd["lean_rad"]
+                _bridge_ticks_left = 5000
             elif ctype == "target_position":
                 _bridge_target_abs = cmd["position"]
                 _bridge_ticks_left = 5000

@@ -110,11 +110,11 @@ class PIDConfig:
 class LQRConfig:
     """LQR gain tuning and gain-scheduling parameters."""
     q_diag: List[float] = field(
-        default_factory=lambda: [12.0, 4.0, 55.0, 4.0])
+        default_factory=lambda: [20.0, 12.0, 45.0, 6.0])
     r: float = 2.0
     aggressive_q_diag: List[float] = field(
-        default_factory=lambda: [40.0, 8.0, 35.0, 3.0])
-    aggressive_r: float = 1.0
+        default_factory=lambda: [40.0, 16.0, 35.0, 5.0])
+    aggressive_r: float = 1.5
     switch_threshold: float = 0.20     # m
     switch_hysteresis: float = 0.05    # m
 

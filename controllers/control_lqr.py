@@ -186,8 +186,8 @@ class LQRBalanceController(BalanceControllerBase):
         print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
               f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
 
-        # Active gain (start in normal mode)
-        self.K = self.K_normal
+        # Smooth gain blending (0 = normal, 1 = aggressive)
+        self._blend = 0.0
         self.aggressive_active = False
 
         # --- Reference state ---
@@ -252,7 +252,7 @@ class LQRBalanceController(BalanceControllerBase):
         self.next_control_time = 0.0
 
         # Gain scheduling — return to normal mode.
-        self.K = self.K_normal
+        self._blend = 0.0
         self.aggressive_active = False
 
         # Zero telemetry accumulators.
@@ -310,6 +310,7 @@ class LQRBalanceController(BalanceControllerBase):
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
+            "gain_blend":       float(self._blend),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
@@ -375,33 +376,29 @@ class LQRBalanceController(BalanceControllerBase):
             ])
             self.state_error = x.copy()
 
-            # --- Gain scheduling: switch K based on position error ---
+            # --- Gain scheduling: smooth sigmoid blend ---
             pos_err = abs(x[0])
             if self.K_aggressive is not None:
-                if not self.aggressive_active and pos_err > self.switch_threshold:
-                    self.aggressive_active = True
-                    self.K = self.K_aggressive
-                elif self.aggressive_active and pos_err < (self.switch_threshold - self.switch_hysteresis):
-                    self.aggressive_active = False
-                    self.K = self.K_normal
+                # Sigmoid centred on switch_threshold, steepness from hysteresis
+                scale = max(self.switch_hysteresis, 1e-6)
+                target_blend = 1.0 / (1.0 + math.exp(-(pos_err - self.switch_threshold) / (scale * 0.5)))
+                # Smooth toward target (EMA, ~50ms time constant at control rate)
+                alpha = min(1.0, dt * 10.0)
+                self._blend += alpha * (target_blend - self._blend)
+                self.aggressive_active = self._blend > 0.5
 
-            self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
+            K_blended = (1.0 - self._blend) * self.K_normal + self._blend * self.K_aggressive
+            self.K_contributions = K_blended[0] * x  # element-wise: K_i * x_i
 
             # --- LQR-implied desired lean angle ---
-            # The position+velocity terms of K·x represent a "lean demand":
-            # the pitch the LQR needs to achieve to drive position error
-            # toward zero.  At steady state (pitch_rate=0, u=0):
-            #   K_pos·e_pos + K_vel·v + K_pitch·θ_desired = 0
-            #   θ_desired = -(K_pos·e_pos + K_vel·v) / K_pitch
-            # Expose this so the triplet PD can cooperate instead of fight.
-            K = self.K[0]
+            K = K_blended[0]
             if abs(K[2]) > 1e-9:
                 self._desired_lean = -(K[0] * x[0] + K[1] * x[1]) / K[2]
             else:
                 self._desired_lean = 0.0
 
             # u = -K x  (total torque for both sides)
-            u_raw = float(-self.K @ x)
+            u_raw = float(-K_blended @ x)
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque
