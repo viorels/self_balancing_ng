@@ -195,11 +195,8 @@ class LQRBalanceController(BalanceControllerBase):
         self.target_position = 0.0     # integrated position reference
         self._was_driving = False      # to detect stop → freeze position
 
-        # --- Velocity estimation (finite difference at control rate) ---
-        self.prev_position = 0.0
-        self.prev_vel_time = 0.0
+        # --- Forward velocity (passed in from odometry each tick) ---
         self.velocity = 0.0
-        self.vel_filter_alpha = 0.1   # low-pass on velocity estimate
 
         # --- Control loop timing ---
         self.control_period = 1.0 / config.control.control_rate_hz
@@ -246,10 +243,6 @@ class LQRBalanceController(BalanceControllerBase):
         self.target_pitch = 0.0
         self._desired_lean = 0.0
 
-        # Velocity estimator — stale prev_position causes a wild velocity
-        # spike on the first control tick after reset.
-        self.prev_position = 0.0
-        self.prev_vel_time = 0.0
         self.velocity = 0.0
 
         # Control-loop timing — let it fire on the very next tick.
@@ -323,7 +316,7 @@ class LQRBalanceController(BalanceControllerBase):
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt,
+               position, forward_velocity, yaw_rate, sim_time, dt,
                ref=None):
         """
         Run one controller tick.
@@ -332,13 +325,11 @@ class LQRBalanceController(BalanceControllerBase):
             measured_pitch:      fused pitch angle (rad)
             measured_pitch_rate: gyro pitch rate (rad/s)
             position:            forward position estimate (m)
+            forward_velocity:    forward velocity from odometry (m/s)
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
-            ref:                 StateReference with target [pos, vel, pitch,
-                                 pitch_rate].  Built by the robot loop which
-                                 owns the trajectory planner and drive-mode
-                                 knowledge.
+            ref:                 lean reference (pitch, pitch_rate).
 
         Returns:
             (left_torque, right_torque): commanded motor torques (Nm)
@@ -351,9 +342,7 @@ class LQRBalanceController(BalanceControllerBase):
         self.target_lean = ref.pitch
         self.target_pitch = ref.pitch
 
-        # --- Velocity estimation (only at control rate to avoid noise) ---
-        # Estimating at 500Hz physics rate amplifies tiny position jitter.
-        # Instead, update velocity only when the control loop fires.
+        self.velocity = forward_velocity
 
         # --- LQR update at CONTROL_RATE_HZ ---
         jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
@@ -361,14 +350,6 @@ class LQRBalanceController(BalanceControllerBase):
 
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
-
-            # Velocity estimated over the control period (not physics dt)
-            vel_dt = sim_time - self.prev_vel_time if self.prev_vel_time > 0 else self.control_period
-            if vel_dt > 0:
-                raw_vel = (position - self.prev_position) / vel_dt
-                self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
-            self.prev_position = position
-            self.prev_vel_time = sim_time
 
             # --- Velocity-command reference integration ---
             # Controller owns position/velocity reference. The external

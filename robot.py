@@ -144,8 +144,9 @@ class TribotBalanceBot:
         # IMU sensor model
         self.imu = IMUSensorModel(config)
 
-        # Estimated wheel radius
+        # Wheel radius and velocity filter for odometry
         self.wheel_radius = config.robot.wheel_radius
+        self._fwd_vel_filtered = 0.0
 
         # Current state for logging
         self.position = 0.0
@@ -266,6 +267,7 @@ class TribotBalanceBot:
 
         # Reset software state
         self.position = 0.0
+        self._fwd_vel_filtered = 0.0
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
@@ -358,14 +360,8 @@ class TribotBalanceBot:
         self.pitch_rate = measured_pitch_rate
 
         # --- Yaw rate (body-frame Z angular velocity) ---
-        rot, lin_vel, ang_vel = self._get_rot_and_vel()
+        _, _, ang_vel = self._get_rot_and_vel()
         yaw_rate = -float(ang_vel[2])
-
-        # --- Forward odometry: integrate velocity projected onto heading ---
-        body_fwd_x = -rot[0, 0]
-        body_fwd_y = -rot[1, 0]
-        fwd_vel = lin_vel[0] * body_fwd_x + lin_vel[1] * body_fwd_y
-        self.position += fwd_vel * dt
 
         # --- Triplet encoders ---
         lt_angle = self.data.qpos[self._qpos_addr[self.l_triplet_jnt]]
@@ -376,6 +372,17 @@ class TribotBalanceBot:
         # --- Wheel velocities (one representative per side, belt-coupled) ---
         wheel_vel_L = self.data.qvel[self._qvel_addr[self.l_wheel_jnts[0]]]
         wheel_vel_R = self.data.qvel[self._qvel_addr[self.r_wheel_jnts[0]]]
+
+        # --- Forward odometry from wheel encoders ---
+        # Raw wheel velocity includes pitch-correction oscillation that
+        # doesn't represent true ground travel.  A low-pass filter strips
+        # the high-frequency balance component (~5-10 Hz) while preserving
+        # the actual translation (< 1 Hz bandwidth for a 3 kg robot).
+        v_wheel_raw = -self.wheel_radius * (wheel_vel_L + wheel_vel_R) * 0.5
+        alpha = min(1.0, dt * 20.0)  # ~50ms time constant
+        self._fwd_vel_filtered += alpha * (v_wheel_raw - self._fwd_vel_filtered)
+        fwd_vel = self._fwd_vel_filtered
+        self.position += fwd_vel * dt
 
         state = RobotState(
             sim_time=sim_time,
@@ -468,7 +475,7 @@ class TribotBalanceBot:
         # --- Controller -> per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             s.pitch, s.pitch_rate,
-            s.position, s.yaw_rate, sim_time, dt, ref=ref
+            s.position, s.forward_velocity, s.yaw_rate, sim_time, dt, ref=ref
         )
 
         # Triplet hub commands

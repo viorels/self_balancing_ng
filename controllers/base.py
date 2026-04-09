@@ -68,7 +68,7 @@ class BalanceControllerBase(ABC):
 
     @abstractmethod
     def update(self, measured_pitch: float, measured_pitch_rate: float,
-               position: float, yaw_rate: float,
+               position: float, forward_velocity: float, yaw_rate: float,
                sim_time: float, dt: float,
                ref: StateReference | None = None) -> tuple[float, float]:
         """
@@ -78,13 +78,12 @@ class BalanceControllerBase(ABC):
             measured_pitch:      fused pitch angle (rad)
             measured_pitch_rate: gyro pitch rate (rad/s)
             position:            forward position estimate (m)
+            forward_velocity:    forward velocity from odometry (m/s)
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
-            ref:                 reference state (position, velocity, pitch,
-                                 pitch_rate).  Built by the robot loop.
-                                 Controllers that manage their own references
-                                 may ignore this (default None).
+            ref:                 lean reference (pitch, pitch_rate).
+                                 Built by the robot loop.
 
         Returns:
             (left_torque, right_torque) — commanded motor torques (Nm)
