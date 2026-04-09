@@ -220,7 +220,7 @@ def run_simulation():
     marker_h = CONFIG.gamepad.target_marker_height
 
     # Persistent bridge overrides
-    _bridge_target_abs = None
+    _bridge_vel_cmd = None
     _bridge_yaw = None
     _bridge_lean = None
     _bridge_ticks_left = 0
@@ -238,23 +238,21 @@ def run_simulation():
         for cmd in bridge.pop_commands():
             ctype = cmd.get("type")
             if ctype == "drive":
-                _bridge_target_abs = robot.position + cmd["fwd"]
+                _bridge_vel_cmd = cmd.get("vel", 0.0)
                 _bridge_yaw = cmd["yaw"]
                 _bridge_ticks_left = cmd.get("ticks", 500)
             elif ctype == "lean":
                 _bridge_lean = cmd["lean_rad"]
                 _bridge_ticks_left = 5000
             elif ctype == "target_position":
-                _bridge_target_abs = cmd["position"]
-                _bridge_ticks_left = 5000
+                robot.controller.set_target_position(cmd["position"])
             elif ctype == "set_drive_mode":
                 target = DriveMode.TWO_WD if cmd["mode"] == "2wd" else DriveMode.FOUR_WD
                 robot.set_drive_mode(target)
             elif ctype == "reset":
                 robot.reset()
-                _bridge_target_abs = _bridge_yaw = _bridge_lean = None
+                _bridge_vel_cmd = _bridge_yaw = _bridge_lean = None
                 _bridge_ticks_left = 0
-                inp.target_position = 0.0
                 sim_time = 0.0
                 last_log_time = 0.0
                 wall_start = time.monotonic()
@@ -264,9 +262,8 @@ def run_simulation():
             _reset_requested = False
             print("[key] R pressed — resetting robot")
             robot.reset()
-            _bridge_target_abs = _bridge_yaw = _bridge_lean = None
+            _bridge_vel_cmd = _bridge_yaw = _bridge_lean = None
             _bridge_ticks_left = 0
-            inp.target_position = 0.0
             sim_time = 0.0
             last_log_time = 0.0
             wall_start = time.monotonic()
@@ -275,7 +272,7 @@ def run_simulation():
         goals, mode_toggle, marker = inp.update(
             robot.position, robot.get_world_pose_2d()
         )
-        robot.controller.set_target_position(goals.target_position)
+        robot.controller.set_velocity_command(goals.velocity_command)
         robot.controller.set_yaw_rate(goals.yaw_rate)
         robot.controller.set_lean(goals.pitch_bias)
         if mode_toggle:
@@ -283,17 +280,21 @@ def run_simulation():
 
         # --- Apply bridge overrides (take priority over gamepad) ---
         if _bridge_ticks_left > 0:
-            if _bridge_target_abs is not None:
-                robot.controller.set_target_position(_bridge_target_abs)
+            if _bridge_vel_cmd is not None:
+                robot.controller.set_velocity_command(_bridge_vel_cmd)
             if _bridge_yaw is not None:
                 robot.controller.set_yaw_rate(_bridge_yaw)
             if _bridge_lean is not None:
                 robot.controller.set_lean(_bridge_lean)
             _bridge_ticks_left -= 1
 
-        # --- Update visual marker ---
+        # --- Update visual marker at controller's target position ---
         viewer.user_scn.ngeom = 0  # clear previous frame's markers
         if inp.connected:
+            rx, ry, _, fwd_x, fwd_y = robot.get_world_pose_2d()
+            dist = robot.controller.target_position - robot.position
+            marker.x = rx + dist * fwd_x
+            marker.y = ry + dist * fwd_y
             _draw_marker(viewer, marker.x, marker.y, marker_h, marker_color)
 
         # --- Sensors -> controller -> actuators ---

@@ -32,14 +32,12 @@ from dataclasses import dataclass
 
 @dataclass
 class StateReference:
-    """Reference state passed to the controller each tick.
+    """Lean reference passed to the controller each tick.
 
     Built by the robot loop (which knows the drive mode and owns the
-    trajectory planner).  The controller is a pure function of
-    (measured_state, ref, gains) → torques.
+    lean trajectory planner).  Position/velocity references are owned
+    by the controller internally.
     """
-    position: float = 0.0
-    velocity: float = 0.0
     pitch: float = 0.0
     pitch_rate: float = 0.0
 
@@ -106,6 +104,11 @@ class BalanceControllerBase(ABC):
     # ------------------------------------------------------------------
     # Setters — shared interface, called by the sim loop
     # ------------------------------------------------------------------
+
+    @abstractmethod
+    def set_velocity_command(self, velocity: float) -> None:
+        """Set desired forward velocity (m/s). 0 = stop and hold position."""
+        ...
 
     @abstractmethod
     def set_target_position(self, position: float) -> None:

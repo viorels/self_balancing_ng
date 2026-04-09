@@ -190,8 +190,10 @@ class LQRBalanceController(BalanceControllerBase):
         self._blend = 0.0
         self.aggressive_active = False
 
-        # --- Reference state ---
-        self.target_position = 0.0
+        # --- Velocity-mode reference integration ---
+        self._velocity_command = 0.0   # operator's desired velocity (m/s)
+        self.target_position = 0.0     # integrated position reference
+        self._was_driving = False      # to detect stop → freeze position
 
         # --- Velocity estimation (finite difference at control rate) ---
         self.prev_position = 0.0
@@ -235,7 +237,9 @@ class LQRBalanceController(BalanceControllerBase):
         stale torques, velocity estimates, or gain-scheduling state from
         a previous run.
         """
+        self._velocity_command = 0.0
         self.target_position = 0.0
+        self._was_driving = False
         self.yaw_rate_setpoint = 0.0
         self._requested_lean = 0.0
         self.target_lean = 0.0
@@ -264,8 +268,12 @@ class LQRBalanceController(BalanceControllerBase):
     # BalanceControllerBase interface
     # ----------------------------------------------------------------
 
+    def set_velocity_command(self, velocity):
+        """Set desired forward velocity (m/s). 0 = stop and hold position."""
+        self._velocity_command = velocity
+
     def set_target_position(self, position):
-        """Set the desired forward position (m)."""
+        """Set the desired forward position (m). Overrides integrated ref."""
         self.target_position = position
 
     def set_yaw_rate(self, yaw_rate):
@@ -307,6 +315,7 @@ class LQRBalanceController(BalanceControllerBase):
             "desired_lean":     float(self._desired_lean),
             "requested_lean":   float(self._requested_lean),
             "target_pos":       float(self.target_position),
+            "velocity_cmd":     float(self._velocity_command),
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
@@ -336,10 +345,7 @@ class LQRBalanceController(BalanceControllerBase):
         """
         # Fallback when no ref provided (e.g. standalone use)
         if ref is None:
-            ref = StateReference(
-                position=self.target_position,
-                pitch=self._requested_lean,
-            )
+            ref = StateReference(pitch=self._requested_lean)
 
         # Keep telemetry-visible attributes in sync with the ref
         self.target_lean = ref.pitch
@@ -364,13 +370,23 @@ class LQRBalanceController(BalanceControllerBase):
             self.prev_position = position
             self.prev_vel_time = sim_time
 
-            # State error: measured − reference.
-            # The robot loop provides ref.velocity and ref.pitch_rate
-            # during trajectory transitions so the LQR doesn't fight
-            # the planned motion.
+            # --- Velocity-command reference integration ---
+            # Controller owns position/velocity reference. The external
+            # ref is only used for pitch/pitch_rate (lean trajectories).
+            driving = abs(self._velocity_command) > 1e-4
+            if driving:
+                self.target_position += self._velocity_command * self.control_period
+                self._was_driving = True
+            elif self._was_driving:
+                # Joystick released → freeze ref at current position
+                self.target_position = position
+                self._was_driving = False
+
+            # State error: position/velocity from internal ref,
+            # pitch/pitch_rate from external ref (lean trajectory).
             x = np.array([
-                position - ref.position,
-                self.velocity - ref.velocity,
+                position - self.target_position,
+                self.velocity - self._velocity_command,
                 measured_pitch - ref.pitch,
                 measured_pitch_rate - ref.pitch_rate,
             ])

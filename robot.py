@@ -425,20 +425,16 @@ class TribotBalanceBot:
             )
         self._prev_requested_lean = requested
 
-        # Active trajectory -> use its smooth reference
+        # Active trajectory -> use its smooth lean reference
         if self._lean_traj.active:
-            ref_pos, ref_vel, ref_pitch, ref_prate = \
-                self._lean_traj.update(sim_time)
+            _, _, ref_pitch, ref_prate = self._lean_traj.update(sim_time)
             return StateReference(
-                position=ref_pos,
-                velocity=ref_vel,
                 pitch=ref_pitch,
                 pitch_rate=ref_prate,
             )
 
-        # Steady state: track operator commands directly
+        # Steady state: track operator lean directly
         return StateReference(
-            position=self.controller.target_position,
             pitch=requested,
         )
 

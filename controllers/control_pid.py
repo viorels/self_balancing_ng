@@ -61,6 +61,10 @@ class BalanceController(BalanceControllerBase):
     # BalanceControllerBase interface
     # ----------------------------------------------------------------
 
+    def set_velocity_command(self, velocity):
+        """PID doesn't support velocity mode; ignore."""
+        pass
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position

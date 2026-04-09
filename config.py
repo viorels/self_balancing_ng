@@ -181,7 +181,7 @@ class GamepadConfig:
     speed_axis: int = 4                # Right stick Y
     yaw_axis: int = 3                  # Right stick X
     lean_axis: int = 1                 # Left stick Y
-    max_distance: float = 1.0          # m
+    max_speed: float = 1.0             # m/s
     max_yaw_rate: float = 2.0          # rad/s
     max_lean: float = math.radians(30)
     mode_button: int = 4               # LB on F710 (XInput)

@@ -105,7 +105,7 @@ class ControlGoals:
     Written by the input layer (gamepad / autonomy);
     read by controllers.
     """
-    target_position: float = 0.0
+    velocity_command: float = 0.0     # m/s, primary drive input
     yaw_rate: float = 0.0
 
     # Operator-commanded pitch bias (rad): tilts the robot intentionally,
