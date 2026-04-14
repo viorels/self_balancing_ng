@@ -33,7 +33,7 @@ _FLOOR_TEXTURE = (
 )
 _FLOOR_MATERIAL = (
     '<material name="floor_mat" texture="floor_checker" '
-    'texrepeat="5 5" texuniform="true"/>'
+    'texrepeat="2 2" texuniform="true"/>'
 )
 
 
