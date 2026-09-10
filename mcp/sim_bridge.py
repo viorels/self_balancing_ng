@@ -180,11 +180,11 @@ class SimBridge:
             return {"ok": True, "result": self._config_to_dict()}
 
         elif method == "drive_command":
-            fwd = float(params.get("fwd", 0.0))
+            vel = float(params.get("vel", 0.0))
             yaw = float(params.get("yaw", 0.0))
             ticks = int(params.get("ticks", 500))   # ~1 s at 500 Hz
             with self._lock:
-                self._cmds.append({"type": "drive", "fwd": fwd, "yaw": yaw,
+                self._cmds.append({"type": "drive", "vel": vel, "yaw": yaw,
                                    "ticks": ticks})
             return {"ok": True, "result": {"queued": "drive_command"}}
 
@@ -316,11 +316,11 @@ class SimBridge:
             self._recording = True
 
         # 4. Queue drive command
-        fwd = float(command.get("fwd", 0.0))
+        vel = float(command.get("vel", 0.0))
         yaw = float(command.get("yaw", 0.0))
         ticks = int(command.get("ticks", 500))
         with self._lock:
-            self._cmds.append({"type": "drive", "fwd": fwd, "yaw": yaw,
+            self._cmds.append({"type": "drive", "vel": vel, "yaw": yaw,
                                 "ticks": ticks})
 
         # 5. Wait for command duration + extra settling time

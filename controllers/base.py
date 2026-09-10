@@ -32,14 +32,12 @@ from dataclasses import dataclass
 
 @dataclass
 class StateReference:
-    """Reference state passed to the controller each tick.
+    """Lean reference passed to the controller each tick.
 
     Built by the robot loop (which knows the drive mode and owns the
-    trajectory planner).  The controller is a pure function of
-    (measured_state, ref, gains) → torques.
+    lean trajectory planner).  Position/velocity references are owned
+    by the controller internally.
     """
-    position: float = 0.0
-    velocity: float = 0.0
     pitch: float = 0.0
     pitch_rate: float = 0.0
 
@@ -70,7 +68,7 @@ class BalanceControllerBase(ABC):
 
     @abstractmethod
     def update(self, measured_pitch: float, measured_pitch_rate: float,
-               position: float, yaw_rate: float,
+               position: float, forward_velocity: float, yaw_rate: float,
                sim_time: float, dt: float,
                ref: StateReference | None = None) -> tuple[float, float]:
         """
@@ -80,13 +78,12 @@ class BalanceControllerBase(ABC):
             measured_pitch:      fused pitch angle (rad)
             measured_pitch_rate: gyro pitch rate (rad/s)
             position:            forward position estimate (m)
+            forward_velocity:    forward velocity from odometry (m/s)
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
-            ref:                 reference state (position, velocity, pitch,
-                                 pitch_rate).  Built by the robot loop.
-                                 Controllers that manage their own references
-                                 may ignore this (default None).
+            ref:                 lean reference (pitch, pitch_rate).
+                                 Built by the robot loop.
 
         Returns:
             (left_torque, right_torque) — commanded motor torques (Nm)
@@ -106,6 +103,11 @@ class BalanceControllerBase(ABC):
     # ------------------------------------------------------------------
     # Setters — shared interface, called by the sim loop
     # ------------------------------------------------------------------
+
+    @abstractmethod
+    def set_velocity_command(self, velocity: float) -> None:
+        """Set desired forward velocity (m/s). 0 = stop and hold position."""
+        ...
 
     @abstractmethod
     def set_target_position(self, position: float) -> None:

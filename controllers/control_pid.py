@@ -61,6 +61,10 @@ class BalanceController(BalanceControllerBase):
     # BalanceControllerBase interface
     # ----------------------------------------------------------------
 
+    def set_velocity_command(self, velocity):
+        """PID doesn't support velocity mode; ignore."""
+        pass
+
     def set_target_position(self, position):
         """Set the desired forward position (m)."""
         self.target_position = position
@@ -78,7 +82,7 @@ class BalanceController(BalanceControllerBase):
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt, ref=None):
+               position, forward_velocity, yaw_rate, sim_time, dt, ref=None):
         """
         Run one controller tick.
 

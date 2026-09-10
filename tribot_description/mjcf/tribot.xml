@@ -1,0 +1,196 @@
+<mujoco model="tribot">
+  <compiler meshdir="../meshes/" angle="radian"/>
+
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler">
+    <flag warmstart="enable"/>
+  </option>
+
+  <!-- ================================================================
+       Lighting: boost ambient so low camera angles stay bright
+       ================================================================ -->
+  <visual>
+    <headlight ambient="0.3 0.3 0.3" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1"/>
+  </visual>
+
+  <!-- ================================================================
+       Default classes
+       ================================================================ -->
+  <default>
+    <joint damping="0" armature="0"/>
+    <geom condim="3" margin="0.001"/>
+
+    <default class="wheel_collision">
+      <geom type="sphere" friction="0.7 0.005 0.001" condim="4"
+            rgba="0 0 0 0" group="2"/>
+    </default>
+
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="1"/>
+    </default>
+
+    <default class="body_collision">
+      <geom friction="0.4 0.005 0.001" condim="3"/>
+    </default>
+
+    <default class="triplet_collision">
+      <geom friction="0.3 0.005 0.001" condim="3"/>
+    </default>
+  </default>
+
+  <!-- ================================================================
+       Mesh assets
+       ================================================================ -->
+  <asset>
+    <mesh name="c_body" file="c_body.stl"/>
+    <mesh name="l_triplet" file="l_triplet.stl"/>
+    <mesh name="l_wheel" file="l_wheel.stl"/>
+    <mesh name="r_triplet" file="r_triplet.stl"/>
+    <mesh name="r_wheel" file="r_wheel.stl"/>
+  </asset>
+
+  <!-- ================================================================
+       World: robot body tree
+       (no floor geom here — terrain.py injects it before loading)
+       ================================================================ -->
+  <worldbody>
+
+    <body name="c_body" pos="0 0 0.118">
+      <freejoint name="root"/>
+      <inertial pos="0 0 0.247" mass="2.716678"
+                fullinertia="0.057035 0.056436 0.014235 0 0 0"/>
+      <geom class="visual" type="mesh" mesh="c_body"
+            rgba="0.518 0.518 0.518 1"/>
+      <geom class="body_collision" type="mesh" mesh="c_body"/>
+
+      <!-- ============================================================
+           Left triplet hub
+           ============================================================ -->
+      <body name="l_triplet" pos="0 -0.0825 0">
+        <joint name="c_body_to_l_triplet" type="hinge" axis="0 1 0"
+               damping="0.05"/>
+        <inertial pos="0 0 0" mass="0.253511"
+                  fullinertia="0.001079 0.002097 0.001341 0 0 0"/>
+        <geom class="visual" type="mesh" mesh="l_triplet"
+              rgba="0.898 0.898 0.898 1"/>
+        <geom class="triplet_collision" type="mesh" mesh="l_triplet"/>
+
+        <!-- L wheel 1 (top, pos=0 -0.07 0.12) -->
+        <body name="l_wheel_1" pos="0 -0.07 0.12">
+          <joint name="l_triplet_to_l_wheel_1" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="l_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+
+        <!-- L wheel 2 (bottom-left, pos=-0.10414 -0.07 -0.060125) -->
+        <body name="l_wheel_2" pos="-0.10414 -0.07 -0.060125">
+          <joint name="l_triplet_to_l_wheel_2" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="l_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+
+        <!-- L wheel 3 (bottom-right, pos=0.10414 -0.07 -0.060125) -->
+        <body name="l_wheel_3" pos="0.10414 -0.07 -0.060125">
+          <joint name="l_triplet_to_l_wheel_3" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="l_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+      </body>
+
+      <!-- ============================================================
+           Right triplet hub
+           ============================================================ -->
+      <body name="r_triplet" pos="0 0.0825 0">
+        <joint name="c_body_to_r_triplet" type="hinge" axis="0 1 0"
+               damping="0.05"/>
+        <inertial pos="0 0 0" mass="0.253511"
+                  fullinertia="0.001079 0.002097 0.001341 0 0 0"/>
+        <geom class="visual" type="mesh" mesh="r_triplet"
+              rgba="0.898 0.898 0.898 1"/>
+        <geom class="triplet_collision" type="mesh" mesh="r_triplet"/>
+
+        <!-- R wheel 1 (top, pos=0 0.07 0.12) -->
+        <body name="r_wheel_1" pos="0 0.07 0.12">
+          <joint name="r_triplet_to_r_wheel_1" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="r_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+
+        <!-- R wheel 2 (bottom-left, pos=-0.10414 0.07 -0.060125) -->
+        <body name="r_wheel_2" pos="-0.10414 0.07 -0.060125">
+          <joint name="r_triplet_to_r_wheel_2" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="r_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+
+        <!-- R wheel 3 (bottom-right, pos=0.10414 0.07 -0.060125) -->
+        <body name="r_wheel_3" pos="0.10414 0.07 -0.060125">
+          <joint name="r_triplet_to_r_wheel_3" type="hinge" axis="0 1 0"/>
+          <inertial pos="0 0 0" mass="0.027132"
+                    fullinertia="0.00004 0.000068 0.00004 0 0 0"/>
+          <geom class="visual" type="mesh" mesh="r_wheel"
+                rgba="0.314 0.314 0.314 1"/>
+          <geom class="wheel_collision" size="0.058"/>
+        </body>
+      </body>
+
+    </body>
+  </worldbody>
+
+  <!-- ================================================================
+       Belt constraints: 1:1 gear coupling, 3 wheels per side
+       polycoef="0 1 0 0 0" means joint2 = joint1 (same direction)
+       ================================================================ -->
+  <equality>
+    <!-- Left side: wheel_1 is master -->
+    <joint joint1="l_triplet_to_l_wheel_1" joint2="l_triplet_to_l_wheel_2"
+           polycoef="0 1 0 0 0"/>
+    <joint joint1="l_triplet_to_l_wheel_1" joint2="l_triplet_to_l_wheel_3"
+           polycoef="0 1 0 0 0"/>
+    <!-- Right side: wheel_1 is master -->
+    <joint joint1="r_triplet_to_r_wheel_1" joint2="r_triplet_to_r_wheel_2"
+           polycoef="0 1 0 0 0"/>
+    <joint joint1="r_triplet_to_r_wheel_1" joint2="r_triplet_to_r_wheel_3"
+           polycoef="0 1 0 0 0"/>
+  </equality>
+
+  <!-- ================================================================
+       Actuators: direct torque control (motor type)
+       ================================================================ -->
+  <actuator>
+    <!-- Triplet hub motors -->
+    <motor name="motor_l_triplet" joint="c_body_to_l_triplet"
+           ctrllimited="true" ctrlrange="-10 10"/>
+    <motor name="motor_r_triplet" joint="c_body_to_r_triplet"
+           ctrllimited="true" ctrlrange="-10 10"/>
+    <!-- Left wheel motors -->
+    <motor name="motor_l_wheel_1" joint="l_triplet_to_l_wheel_1"
+           ctrllimited="true" ctrlrange="-2 2"/>
+    <motor name="motor_l_wheel_2" joint="l_triplet_to_l_wheel_2"
+           ctrllimited="true" ctrlrange="-2 2"/>
+    <motor name="motor_l_wheel_3" joint="l_triplet_to_l_wheel_3"
+           ctrllimited="true" ctrlrange="-2 2"/>
+    <!-- Right wheel motors -->
+    <motor name="motor_r_wheel_1" joint="r_triplet_to_r_wheel_1"
+           ctrllimited="true" ctrlrange="-2 2"/>
+    <motor name="motor_r_wheel_2" joint="r_triplet_to_r_wheel_2"
+           ctrllimited="true" ctrlrange="-2 2"/>
+    <motor name="motor_r_wheel_3" joint="r_triplet_to_r_wheel_3"
+           ctrllimited="true" ctrlrange="-2 2"/>
+  </actuator>
+
+</mujoco>

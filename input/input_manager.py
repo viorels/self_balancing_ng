@@ -50,15 +50,12 @@ class InputManager:
         self._mode_button = config.gamepad.mode_button
 
         # Scaling
-        self._max_distance = config.gamepad.max_distance
+        self._max_speed = config.gamepad.max_speed
         self._max_yaw_rate = config.gamepad.max_yaw_rate
         self._max_lean = config.gamepad.max_lean
 
         # Rising-edge state for mode toggle
         self._mode_was_pressed = False
-
-        # Latched target position (1-D, robot forward axis)
-        self.target_position: float = 0.0
 
         # Latched world-frame marker position
         self.marker = MarkerState()
@@ -94,11 +91,11 @@ class InputManager:
         self.gp.poll()
 
         if not self.gp.connected:
-            return ControlGoals(target_position=self.target_position), False, self.marker
+            return ControlGoals(), False, self.marker
 
         # --- Map axes ---
-        # Right stick Y → forward distance offset (push up = negative axis)
-        forward_offset = -self.gp.axis(self._speed_axis) * self._max_distance
+        # Right stick Y → velocity command (push up = negative axis = forward)
+        vel_cmd = -self.gp.axis(self._speed_axis) * self._max_speed
         # Right stick X → yaw rate
         yaw_cmd = self.gp.axis(self._yaw_axis) * self._max_yaw_rate
         # Left stick Y → lean (push up = lean forward = positive pitch bias)
@@ -109,23 +106,14 @@ class InputManager:
         mode_toggle = mode_pressed and not self._mode_was_pressed
         self._mode_was_pressed = mode_pressed
 
-        # --- Target-position latching ---
+        # --- Visual marker (project velocity as a distance hint) ---
         rx, ry, _, fwd_x, fwd_y = world_pose_2d
-
-        if abs(forward_offset) > 1e-4:
-            # Stick deflected → update target relative to current position
-            self.target_position = robot_position + forward_offset
-            self.marker.x = rx + forward_offset * fwd_x
-            self.marker.y = ry + forward_offset * fwd_y
-        elif abs(yaw_cmd) > 1e-4:
-            # Turning with no forward → reset target to current (no chase)
-            self.target_position = robot_position
-            self.marker.x = rx
-            self.marker.y = ry
-        # else: stick idle → keep latched target_position and marker
+        marker_dist = vel_cmd  # 1 m/s → 1 m ahead
+        self.marker.x = rx + marker_dist * fwd_x
+        self.marker.y = ry + marker_dist * fwd_y
 
         goals = ControlGoals(
-            target_position=self.target_position,
+            velocity_command=vel_cmd,
             yaw_rate=yaw_cmd,
             pitch_bias=lean_cmd,
             request_drive_mode=None,  # mode toggle handled separately

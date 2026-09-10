@@ -30,7 +30,7 @@ class SimConfig:
     timestep: float = 1.0 / 500.0       # 500 Hz physics
     sim_duration: float = 600.0
     controller: str = 'lqr'             # 'lqr', 'pid', or 'mpc'
-    urdf_path: str = 'tribot_description/urdf/tribot.urdf'
+    mjcf_path: str = 'tribot_description/mjcf/tribot.xml'
     initial_pitch: float = -0.03        # rad (~1.7°)
     initial_height: float = 0.118       # m
     initial_triplet_angle: float = 0.0  # rad (0° = 4WD)
@@ -41,7 +41,7 @@ class RobotConfig:
     """Robot geometry, contact properties, and mechanical parameters."""
     wheel_radius: float = 0.058         # m — small drive wheel
     triplet_radius: float = 0.12        # m — circumradius of wheel triangle
-    wheel_friction: float = 1.2
+    wheel_friction: float = 0.7
     triplet_friction: float = 0.3
     belt_max_force: float = 100.0       # N — gear constraint max force
     triplet_joint_damping: float = 0.05 # Nm·s/rad
@@ -110,11 +110,11 @@ class PIDConfig:
 class LQRConfig:
     """LQR gain tuning and gain-scheduling parameters."""
     q_diag: List[float] = field(
-        default_factory=lambda: [12.0, 4.0, 55.0, 4.0])
+        default_factory=lambda: [20.0, 12.0, 45.0, 6.0])
     r: float = 2.0
     aggressive_q_diag: List[float] = field(
-        default_factory=lambda: [40.0, 8.0, 35.0, 3.0])
-    aggressive_r: float = 1.0
+        default_factory=lambda: [40.0, 16.0, 35.0, 5.0])
+    aggressive_r: float = 1.5
     switch_threshold: float = 0.20     # m
     switch_hysteresis: float = 0.05    # m
 
@@ -181,7 +181,7 @@ class GamepadConfig:
     speed_axis: int = 4                # Right stick Y
     yaw_axis: int = 3                  # Right stick X
     lean_axis: int = 1                 # Left stick Y
-    max_distance: float = 1.0          # m
+    max_speed: float = 1.0             # m/s
     max_yaw_rate: float = 2.0          # rad/s
     max_lean: float = math.radians(30)
     mode_button: int = 4               # LB on F710 (XInput)
@@ -192,7 +192,7 @@ class GamepadConfig:
 class TerrainConfig:
     """Terrain type and stair geometry."""
     terrain_type: str = 'flat'         # 'flat', 'heightfield', or 'box_stairs'
-    ground_friction: float = 1.0
+    ground_friction: float = 0.7
     stair_num_steps: int = 2
     stair_step_depth: float = 0.20     # m
     stair_step_height: List[float] = field(

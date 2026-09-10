@@ -49,16 +49,16 @@ triplet joint:   -motor_torque + triplet_cmd
 τ_triplet: Q = [ 0,   −1, +1]   (body reaction + hub drive)
 ```
 
-## L/R Mirror Geometry — Critical Gotcha
+## L/R Triplet Geometry — Symmetric Convention
 
-Both triplet joints use the **same +Y axis**, but L sits at y = −0.0825 and R at y = +0.0825. Physically mirrored. To produce the **same** flip direction on both sides:
+Both triplet joints share the **same +Y axis**, and the two triplets are **identical in the sagittal (X–Z) plane**: the wheels sit at the same `(x, z)` offsets on each side and differ only in the `y` (hub) offset — L hub at y = −0.0825, R at y = +0.0825. Because the geometry is identical (**not** mirrored) in the plane of rotation, a **same-sign** command produces the **same** physical rotation on both sides.
 
-- **L gets +τ**, **R gets −τ** (anti-symmetric torque split)
-- Combined angle: **φ = (angle_L − angle_R) / 2**
+- **Same torque sign on both sides** → synchronized rotation. No R sign flip.
+- Combined angle: **φ = (angle_L + angle_R) / 2**
 - 4WD target: L = 0°, R = 0° → φ = 0°
-- 2WD target: L = +60°, R = −60° → φ = +60°
+- 2WD target: L = R = +60° (or both −60°) → φ = ±60°
 
-Forgetting the sign flip produces opposite rotations instead of synchronized ones.
+The only genuinely anti-symmetric term is **yaw steering**: the drive command is split `left = cmd − yaw_corr`, `right = cmd + yaw_corr` for differential turning. That is layered on top of the symmetric balance/drive command and is unrelated to triplet synchronization.
 
 ## Balancing Modes
 
@@ -242,7 +242,7 @@ Note on 2WD geometry: at φ = 60°, the grounded wheel (originally at 210°) rot
 
 1. **Torque budget is tiny** — 1.0 Nm drive motors on a 0.247 m pendulum. High gains saturate instantly; any K_pitch > ~12 or K_rate > ~2 will bang-bang.
 2. **Triplet is NOT a reaction wheel** — it pushes on the ground. The mass matrix must include rolling inertia (β·R² terms) or the model underestimates how hard the triplet is to rotate.
-3. **L/R anti-symmetry** — same URDF axis but mirrored geometry. Every torque split and angle combination must flip the R sign.
+3. **L/R triplets are symmetric, not mirrored** — same +Y axis and identical sagittal (X–Z) geometry, so the same torque sign rotates both the same way. Do **not** flip the R sign for triplet angle or drive torque; the combined triplet angle is `(L + R) / 2`. The only differential term is yaw steering (`left = cmd − yaw_corr`, `right = cmd + yaw_corr`).
 4. **Drive motor cancellation on hub** — the sim explicitly zeroes the wheel motor reaction on the triplet hub (`-motor_torque + triplet_cmd`). The B_gf matrix must match this convention, not textbook "motor-on-joint" physics.
 5. **4WD ↔ 2WD transitions are low-friction** — the grounded wheels roll freely in the direction of triplet rotation (X axis), so there is no Coulomb friction to overcome. The transition torque is dominated by inertia and gravity (weight shifting between wheels), not sliding friction.
 6. **Gravity coupling on triplet** — zero in 4WD (bilateral support), nonzero in 2WD (≈0.39 Nm/rad). The plant model should switch or schedule this.

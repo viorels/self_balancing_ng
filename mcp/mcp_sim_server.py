@@ -115,7 +115,7 @@ async def list_tools() -> list[types.Tool]:
             name="sim_drive_command",
             description=(
                 "Inject a drive command into the simulation. "
-                "`fwd` is target position offset (metres, + = forward). "
+                "`vel` is forward velocity (m/s, + = forward). "
                 "`yaw` is yaw-rate (rad/s, + = left). "
                 "`ticks` is how many simulation steps to hold the command "
                 "(default 500 ≈ 1 s at 500 Hz)."
@@ -123,7 +123,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "fwd":   {"type": "number", "description": "Forward position offset (m)"},
+                    "vel":   {"type": "number", "description": "Forward velocity (m/s)"},
                     "yaw":   {"type": "number", "description": "Yaw rate (rad/s)"},
                     "ticks": {"type": "integer", "description": "Hold duration in sim steps (default 500)"},
                 },
@@ -242,7 +242,7 @@ async def list_tools() -> list[types.Tool]:
                 "return downsampled samples + per-variable statistics (min, max, "
                 "mean, final). Ideal for testing parameter changes or comparing "
                 "controller tunings. "
-                "Typical usage: sim_run_experiment(command={fwd:0.5, ticks:1000}, "
+                "Typical usage: sim_run_experiment(command={vel:0.5, ticks:1000}, "
                 "record_vars=['pitch','position'], decimation=10)."
             ),
             inputSchema={
@@ -252,12 +252,12 @@ async def list_tools() -> list[types.Tool]:
                         "type": "object",
                         "description": (
                             "Drive command to execute during the experiment. "
-                            "fwd: position offset in metres (+ = forward), "
+                            "vel: forward velocity in m/s (+ = forward), "
                             "yaw: yaw rate in rad/s (+ = left), "
                             "ticks: hold duration in sim steps (default 500 ≈ 1 s)."
                         ),
                         "properties": {
-                            "fwd":   {"type": "number"},
+                            "vel":   {"type": "number"},
                             "yaw":   {"type": "number"},
                             "ticks": {"type": "integer"},
                         },
@@ -340,7 +340,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     elif name == "sim_drive_command":
         method = "drive_command"
         params = {
-            "fwd":   arguments.get("fwd", 0.0),
+            "vel":   arguments.get("vel", 0.0),
             "yaw":   arguments.get("yaw", 0.0),
             "ticks": arguments.get("ticks", 500),
         }

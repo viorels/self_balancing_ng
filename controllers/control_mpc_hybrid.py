@@ -1087,6 +1087,10 @@ class MPCHybridController(BalanceControllerBase):
     # Public setters (same API as PID / LQR controllers)
     # ----------------------------------------------------------------
 
+    def set_velocity_command(self, velocity):
+        """MPC doesn't support velocity mode; ignore."""
+        pass
+
     def set_target_position(self, position):
         self.target_position = position
 
@@ -1389,7 +1393,7 @@ class MPCHybridController(BalanceControllerBase):
     # ----------------------------------------------------------------
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt, ref=None):
+               position, forward_velocity, yaw_rate, sim_time, dt, ref=None):
         """
         Run one tick of the hybrid MPC+PD controller.
 

@@ -186,18 +186,17 @@ class LQRBalanceController(BalanceControllerBase):
         print(f"  Switch: |err|>{self.switch_threshold}m → aggressive, "
               f"<{self.switch_threshold - self.switch_hysteresis}m → normal")
 
-        # Active gain (start in normal mode)
-        self.K = self.K_normal
+        # Smooth gain blending (0 = normal, 1 = aggressive)
+        self._blend = 0.0
         self.aggressive_active = False
 
-        # --- Reference state ---
-        self.target_position = 0.0
+        # --- Velocity-mode reference integration ---
+        self._velocity_command = 0.0   # operator's desired velocity (m/s)
+        self.target_position = 0.0     # integrated position reference
+        self._was_driving = False      # to detect stop → freeze position
 
-        # --- Velocity estimation (finite difference at control rate) ---
-        self.prev_position = 0.0
-        self.prev_vel_time = 0.0
+        # --- Forward velocity (passed in from odometry each tick) ---
         self.velocity = 0.0
-        self.vel_filter_alpha = 0.1   # low-pass on velocity estimate
 
         # --- Control loop timing ---
         self.control_period = 1.0 / config.control.control_rate_hz
@@ -235,24 +234,22 @@ class LQRBalanceController(BalanceControllerBase):
         stale torques, velocity estimates, or gain-scheduling state from
         a previous run.
         """
+        self._velocity_command = 0.0
         self.target_position = 0.0
+        self._was_driving = False
         self.yaw_rate_setpoint = 0.0
         self._requested_lean = 0.0
         self.target_lean = 0.0
         self.target_pitch = 0.0
         self._desired_lean = 0.0
 
-        # Velocity estimator — stale prev_position causes a wild velocity
-        # spike on the first control tick after reset.
-        self.prev_position = 0.0
-        self.prev_vel_time = 0.0
         self.velocity = 0.0
 
         # Control-loop timing — let it fire on the very next tick.
         self.next_control_time = 0.0
 
         # Gain scheduling — return to normal mode.
-        self.K = self.K_normal
+        self._blend = 0.0
         self.aggressive_active = False
 
         # Zero telemetry accumulators.
@@ -264,8 +261,12 @@ class LQRBalanceController(BalanceControllerBase):
     # BalanceControllerBase interface
     # ----------------------------------------------------------------
 
+    def set_velocity_command(self, velocity):
+        """Set desired forward velocity (m/s). 0 = stop and hold position."""
+        self._velocity_command = velocity
+
     def set_target_position(self, position):
-        """Set the desired forward position (m)."""
+        """Set the desired forward position (m). Overrides integrated ref."""
         self.target_position = position
 
     def set_yaw_rate(self, yaw_rate):
@@ -307,13 +308,15 @@ class LQRBalanceController(BalanceControllerBase):
             "desired_lean":     float(self._desired_lean),
             "requested_lean":   float(self._requested_lean),
             "target_pos":       float(self.target_position),
+            "velocity_cmd":     float(self._velocity_command),
             "target_lean":      float(self.target_lean),
             "target_pitch":     float(self.target_pitch),
             "aggressive":       float(self.aggressive_active),
+            "gain_blend":       float(self._blend),
         }
 
     def update(self, measured_pitch, measured_pitch_rate,
-               position, yaw_rate, sim_time, dt,
+               position, forward_velocity, yaw_rate, sim_time, dt,
                ref=None):
         """
         Run one controller tick.
@@ -322,31 +325,24 @@ class LQRBalanceController(BalanceControllerBase):
             measured_pitch:      fused pitch angle (rad)
             measured_pitch_rate: gyro pitch rate (rad/s)
             position:            forward position estimate (m)
+            forward_velocity:    forward velocity from odometry (m/s)
             yaw_rate:            body-frame yaw rate (rad/s)
             sim_time:            current simulation time (s)
             dt:                  physics timestep (s)
-            ref:                 StateReference with target [pos, vel, pitch,
-                                 pitch_rate].  Built by the robot loop which
-                                 owns the trajectory planner and drive-mode
-                                 knowledge.
+            ref:                 lean reference (pitch, pitch_rate).
 
         Returns:
             (left_torque, right_torque): commanded motor torques (Nm)
         """
         # Fallback when no ref provided (e.g. standalone use)
         if ref is None:
-            ref = StateReference(
-                position=self.target_position,
-                pitch=self._requested_lean,
-            )
+            ref = StateReference(pitch=self._requested_lean)
 
         # Keep telemetry-visible attributes in sync with the ref
         self.target_lean = ref.pitch
         self.target_pitch = ref.pitch
 
-        # --- Velocity estimation (only at control rate to avoid noise) ---
-        # Estimating at 500Hz physics rate amplifies tiny position jitter.
-        # Instead, update velocity only when the control loop fires.
+        self.velocity = forward_velocity
 
         # --- LQR update at CONTROL_RATE_HZ ---
         jitter = (np.random.normal(0, self.cfg.control.control_jitter_std)
@@ -355,53 +351,51 @@ class LQRBalanceController(BalanceControllerBase):
         if sim_time >= self.next_control_time:
             self.next_control_time = sim_time + self.control_period + jitter
 
-            # Velocity estimated over the control period (not physics dt)
-            vel_dt = sim_time - self.prev_vel_time if self.prev_vel_time > 0 else self.control_period
-            if vel_dt > 0:
-                raw_vel = (position - self.prev_position) / vel_dt
-                self.velocity += self.vel_filter_alpha * (raw_vel - self.velocity)
-            self.prev_position = position
-            self.prev_vel_time = sim_time
+            # --- Velocity-command reference integration ---
+            # Controller owns position/velocity reference. The external
+            # ref is only used for pitch/pitch_rate (lean trajectories).
+            driving = abs(self._velocity_command) > 1e-4
+            if driving:
+                self.target_position += self._velocity_command * self.control_period
+                self._was_driving = True
+            elif self._was_driving:
+                # Joystick released → freeze ref at current position
+                self.target_position = position
+                self._was_driving = False
 
-            # State error: measured − reference.
-            # The robot loop provides ref.velocity and ref.pitch_rate
-            # during trajectory transitions so the LQR doesn't fight
-            # the planned motion.
+            # State error: position/velocity from internal ref,
+            # pitch/pitch_rate from external ref (lean trajectory).
             x = np.array([
-                position - ref.position,
-                self.velocity - ref.velocity,
+                position - self.target_position,
+                self.velocity - self._velocity_command,
                 measured_pitch - ref.pitch,
                 measured_pitch_rate - ref.pitch_rate,
             ])
             self.state_error = x.copy()
 
-            # --- Gain scheduling: switch K based on position error ---
+            # --- Gain scheduling: smooth sigmoid blend ---
             pos_err = abs(x[0])
             if self.K_aggressive is not None:
-                if not self.aggressive_active and pos_err > self.switch_threshold:
-                    self.aggressive_active = True
-                    self.K = self.K_aggressive
-                elif self.aggressive_active and pos_err < (self.switch_threshold - self.switch_hysteresis):
-                    self.aggressive_active = False
-                    self.K = self.K_normal
+                # Sigmoid centred on switch_threshold, steepness from hysteresis
+                scale = max(self.switch_hysteresis, 1e-6)
+                target_blend = 1.0 / (1.0 + math.exp(-(pos_err - self.switch_threshold) / (scale * 0.5)))
+                # Smooth toward target (EMA, ~50ms time constant at control rate)
+                alpha = min(1.0, dt * 10.0)
+                self._blend += alpha * (target_blend - self._blend)
+                self.aggressive_active = self._blend > 0.5
 
-            self.K_contributions = self.K[0] * x  # element-wise: K_i * x_i
+            K_blended = (1.0 - self._blend) * self.K_normal + self._blend * self.K_aggressive
+            self.K_contributions = K_blended[0] * x  # element-wise: K_i * x_i
 
             # --- LQR-implied desired lean angle ---
-            # The position+velocity terms of K·x represent a "lean demand":
-            # the pitch the LQR needs to achieve to drive position error
-            # toward zero.  At steady state (pitch_rate=0, u=0):
-            #   K_pos·e_pos + K_vel·v + K_pitch·θ_desired = 0
-            #   θ_desired = -(K_pos·e_pos + K_vel·v) / K_pitch
-            # Expose this so the triplet PD can cooperate instead of fight.
-            K = self.K[0]
+            K = K_blended[0]
             if abs(K[2]) > 1e-9:
                 self._desired_lean = -(K[0] * x[0] + K[1] * x[1]) / K[2]
             else:
                 self._desired_lean = 0.0
 
             # u = -K x  (total torque for both sides)
-            u_raw = float(-self.K @ x)
+            u_raw = float(-K_blended @ x)
             u = np.clip(u_raw, -self.cfg.motor.max_torque, self.cfg.motor.max_torque)
             commanded_torque = float(u)
             self.control_torque = commanded_torque

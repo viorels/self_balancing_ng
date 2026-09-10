@@ -1,19 +1,17 @@
 """
-TribotBalanceBot — URDF loading, sensors, actuators, belt constraints.
+TribotBalanceBot — MuJoCo robot interface: sensors, actuators, state.
 
-This module owns the physical robot representation: loading the URDF,
-discovering and configuring joints, reading sensors into a RobotState,
-and applying ControlOutput torques to the physics engine.
+This module owns the physical robot representation: discovering joints
+and actuators in the compiled MuJoCo model, reading sensors into a
+RobotState, and applying ControlOutput torques via data.ctrl.
 
-No control logic lives here — only the robot's interface to PyBullet.
+No control logic lives here — only the robot's interface to MuJoCo.
 """
 
 import math
-import os
-import tempfile
-import xml.etree.ElementTree as ET
 
-import pybullet as p
+import mujoco
+import numpy as np
 
 from robot_state import DriveMode, RobotState
 from models.motor_model import BrushlessMotorModel
@@ -30,43 +28,38 @@ from controllers.lean_trajectory import LeanTrajectory
 
 
 # ============================================================================
-# URDF HELPERS
+# QUATERNION HELPERS
 # ============================================================================
 
-def preprocess_urdf(urdf_path):
-    """
-    Preprocess the tribot URDF for PyBullet:
-    - Replace package:// paths with absolute filesystem paths
-    - Remove the zero-mass base_link and its joint so that c_body
-      becomes the root link (floating base with proper mass/inertia)
-    Returns the path to a temporary URDF file.
-    """
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
+def _euler_to_mj_quat(roll, pitch, yaw):
+    """Convert Euler angles (XYZ extrinsic) to MuJoCo quaternion [w, x, y, z]."""
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return [
+        cr * cp * cy + sr * sp * sy,   # w
+        sr * cp * cy - cr * sp * sy,   # x
+        cr * sp * cy + sr * cp * sy,   # y
+        cr * cp * sy - sr * sp * cy,   # z
+    ]
 
-    # Resolve package://tribot_description/ → absolute path
-    pkg_dir = os.path.abspath(os.path.join(os.path.dirname(urdf_path), '..'))
-    for mesh_elem in root.iter('mesh'):
-        fn = mesh_elem.get('filename', '')
-        if fn.startswith('package://tribot_description/'):
-            mesh_elem.set('filename', fn.replace(
-                'package://tribot_description/', pkg_dir + '/'))
 
-    # Remove the zero-mass base_link and its connecting joint entirely.
-    # This makes c_body the root link so PyBullet gives it proper mass.
-    for link in root.findall('link'):
-        if link.get('name') == 'base_link':
-            root.remove(link)
-    for joint in root.findall('joint'):
-        if joint.get('name') == 'base_link_to_c_body':
-            root.remove(joint)
-
-    # Write the preprocessed URDF to a temp file
-    fd, temp_path = tempfile.mkstemp(suffix='.urdf', prefix='tribot_')
-    with os.fdopen(fd, 'w') as f:
-        tree.write(f, xml_declaration=True, encoding='unicode')
-
-    return temp_path
+def _mj_quat_to_euler(quat_wxyz):
+    """Convert MuJoCo quaternion [w, x, y, z] to Euler angles [roll, pitch, yaw]."""
+    w, x, y, z = quat_wxyz
+    # Roll (X-axis)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr, cosr)
+    # Pitch (Y-axis)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = math.asin(sinp)
+    # Yaw (Z-axis)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny, cosy)
+    return roll, pitch, yaw
 
 
 # ============================================================================
@@ -75,33 +68,49 @@ def preprocess_urdf(urdf_path):
 
 class TribotBalanceBot:
     """
-    A self-balancing robot with triplet wheel clusters, loaded from URDF.
+    A self-balancing robot with triplet wheel clusters.
 
     Each side has a triplet assembly (3 small wheels in a triangle) connected
     to the body by a freely-rotating hub. All 3 wheels on each side are
-    coupled by a virtual belt (same angular velocity) driven by a single motor.
+    coupled by equality constraints (same angular velocity) driven by a
+    single motor.
+
+    Receives pre-loaded MuJoCo model and data from tribot_sim.py.
     """
 
-    def __init__(self, physics_client_id, config):
-        self.pc = physics_client_id
+    def __init__(self, model, data, config):
+        self.model = model
+        self.data = data
         self.cfg = config
 
-        self.body_id = None
+        # Joint and actuator index maps (populated by _discover)
+        self.joint_map = {}
+        self.actuator_map = {}
 
-        # Joint indices (populated after loading)
-        self.joint_map = {}               # name → index
-        self.l_triplet_joint = -1
-        self.r_triplet_joint = -1
-        self.l_wheel_joints = []          # [idx, idx, idx]
-        self.r_wheel_joints = []
-        self.belt_constraints = []        # gear constraint IDs
+        # Joint indices
+        self.l_triplet_jnt = -1
+        self.r_triplet_jnt = -1
+        self.l_wheel_jnts = []
+        self.r_wheel_jnts = []
 
-        # Load and configure the robot
-        self._load_robot()
-        self._discover_joints()
-        self._set_initial_pose()
-        self._configure_dynamics()
-        self._setup_belt_constraints()
+        # qpos / qvel address caches
+        self._qpos_addr = {}   # joint_id → qpos index
+        self._qvel_addr = {}   # joint_id → qvel (dof) index
+
+        # Actuator indices
+        self.act_l_triplet = -1
+        self.act_r_triplet = -1
+        self.act_l_wheels = []
+        self.act_r_wheels = []
+
+        # Body id for c_body
+        self.body_id = -1
+
+        # Discover joints/actuators and cache addresses
+        self._discover()
+
+        # Store initial pose for reset()
+        self._initial_qpos = self.data.qpos.copy()
 
         # Balance controller
         ctrl_type = config.sim.controller.lower()
@@ -124,8 +133,6 @@ class TribotBalanceBot:
         self.triplet_base_angle = config.sim.initial_triplet_angle
 
         # Lean transition trajectory planner (2WD only).
-        # Generates smooth state references so the LQR tracks a feasible
-        # path instead of a step when the operator commands a lean change.
         self._lean_traj = LeanTrajectory(
             h_cog=config.triplet.cog_dist_2wd,
             min_duration=0.2,
@@ -137,13 +144,11 @@ class TribotBalanceBot:
         # IMU sensor model
         self.imu = IMUSensorModel(config)
 
-        # Estimated wheel radius (may be overridden from AABB after loading)
+        # Wheel radius and velocity filter for odometry
         self.wheel_radius = config.robot.wheel_radius
+        self._fwd_vel_filtered = 0.0
 
         # Current state for logging
-        # NOTE: position is accumulated by integrating forward velocity
-        # projected onto the robot's current heading, so it stays valid
-        # after yaw rotations (unlike a raw world-X projection).
         self.position = 0.0
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
@@ -153,18 +158,89 @@ class TribotBalanceBot:
         self.state = RobotState(drive_mode=self.drive_mode,
                                 triplet_base_angle=self.triplet_base_angle)
 
+        # Set initial triplet angles and print summary
+        self._set_initial_pose()
+
     # ----------------------------------------------------------------
     # Robot setup
     # ----------------------------------------------------------------
 
+    def _discover(self):
+        """Build name→id maps for joints, actuators, and body; cache addresses."""
+        # Joints
+        for i in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            if name:
+                self.joint_map[name] = i
+                self._qpos_addr[i] = self.model.jnt_qposadr[i]
+                self._qvel_addr[i] = self.model.jnt_dofadr[i]
+
+        self.l_triplet_jnt = self.joint_map['c_body_to_l_triplet']
+        self.r_triplet_jnt = self.joint_map['c_body_to_r_triplet']
+
+        self.l_wheel_jnts = [
+            self.joint_map['l_triplet_to_l_wheel_1'],
+            self.joint_map['l_triplet_to_l_wheel_2'],
+            self.joint_map['l_triplet_to_l_wheel_3'],
+        ]
+        self.r_wheel_jnts = [
+            self.joint_map['r_triplet_to_r_wheel_1'],
+            self.joint_map['r_triplet_to_r_wheel_2'],
+            self.joint_map['r_triplet_to_r_wheel_3'],
+        ]
+
+        # Actuators
+        for i in range(self.model.nu):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            if name:
+                self.actuator_map[name] = i
+
+        self.act_l_triplet = self.actuator_map['motor_l_triplet']
+        self.act_r_triplet = self.actuator_map['motor_r_triplet']
+        self.act_l_wheels = [
+            self.actuator_map['motor_l_wheel_1'],
+            self.actuator_map['motor_l_wheel_2'],
+            self.actuator_map['motor_l_wheel_3'],
+        ]
+        self.act_r_wheels = [
+            self.actuator_map['motor_r_wheel_1'],
+            self.actuator_map['motor_r_wheel_2'],
+            self.actuator_map['motor_r_wheel_3'],
+        ]
+
+        # Body id
+        self.body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, 'c_body')
+
+        num_joints = self.model.njnt
+        print(f"  Joints discovered: {num_joints} total")
+        print(f"    L triplet: joint {self.l_triplet_jnt}")
+        print(f"    R triplet: joint {self.r_triplet_jnt}")
+        print(f"    L wheels:  joints {self.l_wheel_jnts}")
+        print(f"    R wheels:  joints {self.r_wheel_jnts}")
+
+        # Print body masses for debugging
+        for i in range(self.model.nbody):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i)
+            mass = self.model.body_mass[i]
+            if mass > 0:
+                print(f"    {name}: mass={mass:.4f}")
+
+        print(f"  Belt constraints: {self.model.neq} equality constraints")
+
     def _set_initial_pose(self):
-        """Set initial triplet angles (0° = 4WD, 60° = 2WD)."""
+        """Set initial triplet angles (0 = 4WD, 60 = 2WD)."""
         trip_angle = self.cfg.sim.initial_triplet_angle
         if abs(trip_angle) > 1e-6:
-            p.resetJointState(self.body_id, self.l_triplet_joint, trip_angle, 0.0)
-            p.resetJointState(self.body_id, self.r_triplet_joint, trip_angle, 0.0)
-        mode = '2WD' if abs(trip_angle - math.pi / 3) < 0.05 else ('4WD' if abs(trip_angle) < 0.05 else 'Lean')
-        print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f}° ({mode} mode)")
+            self.data.qpos[self._qpos_addr[self.l_triplet_jnt]] = trip_angle
+            self.data.qpos[self._qpos_addr[self.r_triplet_jnt]] = trip_angle
+            mujoco.mj_forward(self.model, self.data)
+            # Update stored initial qpos
+            self._initial_qpos = self.data.qpos.copy()
+
+        mode = ('2WD' if abs(trip_angle - math.pi / 3) < 0.05
+                else ('4WD' if abs(trip_angle) < 0.05 else 'Lean'))
+        print(f"  Initial triplet angle: {math.degrees(trip_angle):.1f} ({mode} mode)")
 
     def reset(self):
         """Reset the robot to its initial upright pose with zero velocities.
@@ -172,64 +248,26 @@ class TribotBalanceBot:
         Intended for AI-driven experiments: call between trials to start fresh
         without restarting the simulation process.
         """
-        # --- Restore base pose (CoM frame, not link frame!) ---
-        # See _load_robot() for why we use _initial_com_pos instead of
-        # config.initial_height.
-        p.resetBasePositionAndOrientation(
-            self.body_id,
-            list(self._initial_com_pos),
-            list(self._initial_com_orn))
-        p.resetBaseVelocity(self.body_id,
-                            linearVelocity=[0, 0, 0],
-                            angularVelocity=[0, 0, 0])
+        # Restore initial qpos (includes base pose + triplet angles)
+        self.data.qpos[:] = self._initial_qpos
+        self.data.qvel[:] = 0.0
+        self.data.ctrl[:] = 0.0
 
-        # --- Restore all joint states ---
-        num_joints = p.getNumJoints(self.body_id)
-        trip_angle = self.cfg.sim.initial_triplet_angle
-        for i in range(num_joints):
-            if i in (self.l_triplet_joint, self.r_triplet_joint):
-                p.resetJointState(self.body_id, i, trip_angle, 0.0)
-            else:
-                p.resetJointState(self.body_id, i, 0.0, 0.0)
+        # Forward kinematics to update derived quantities
+        mujoco.mj_forward(self.model, self.data)
 
-        # --- Nuke gear constraints and recreate them fresh.
-        #
-        # PyBullet's JOINT_GEAR constraints keep internal solver warmstart
-        # across ticks.  The only way to get a clean state is to destroy
-        # and recreate them.
-        for cid in self.belt_constraints:
-            p.removeConstraint(cid)
-        self.belt_constraints.clear()
-
-        # Disable all joint motors so no stale TORQUE_CONTROL forces leak.
-        all_actuated = (self.l_wheel_joints + self.r_wheel_joints
-                        + [self.l_triplet_joint, self.r_triplet_joint])
-        for ji in all_actuated:
-            p.setJointMotorControl2(
-                self.body_id, ji,
-                p.VELOCITY_CONTROL,
-                targetVelocity=0, force=0)
-
-        # Flush broadphase so the collision engine knows the body has
-        # teleported.  Without this, PyBullet may retain stale contact
-        # manifolds from the fallen pose and apply ghost impulses on the
-        # first post-reset step.
-        p.performCollisionDetection()
-
-        # Recreate belt constraints with fresh solver state.
-        self._setup_belt_constraints()
-
-        # --- Reset motor first-order lag models ---
+        # Reset motor first-order lag models
         self.motors = [
             type(self.motors[0])(self.cfg),
             type(self.motors[1])(self.cfg),
         ]
 
-        # --- Reset IMU ---
+        # Reset IMU
         self.imu = type(self.imu)(self.cfg)
 
-        # --- Reset software state ---
+        # Reset software state
         self.position = 0.0
+        self._fwd_vel_filtered = 0.0
         self.pitch_angle = 0.0
         self.pitch_rate = 0.0
         self.actual_torques = [0.0, 0.0]
@@ -240,16 +278,14 @@ class TribotBalanceBot:
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
 
-        # --- Reset controller ---
+        # Reset controller
         ctrl = self.controller
         if hasattr(ctrl, 'reset'):
             ctrl.reset()
         else:
-            # Fallback for controllers without a reset() method.
             for attr in ('_integral', '_pos_integral', 'x_hat',
                          '_prev_error', '_prev_pos_error'):
                 if hasattr(ctrl, attr):
-                    import numpy as np
                     val = getattr(ctrl, attr)
                     if hasattr(val, 'shape'):
                         setattr(ctrl, attr, np.zeros_like(val))
@@ -259,156 +295,45 @@ class TribotBalanceBot:
             ctrl.set_yaw_rate(0.0)
             ctrl.set_lean(0.0)
 
-        # --- Reset lean trajectory planner ---
+        # Reset lean trajectory planner
         self._lean_traj.cancel()
         self._prev_requested_lean = 0.0
 
         print("[reset] Robot pose and state restored to initial conditions.")
 
-    def _load_robot(self):
-        """Load the URDF with preprocessed paths."""
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        urdf_path = os.path.join(script_dir, self.cfg.sim.urdf_path)
-
-        temp_urdf = preprocess_urdf(urdf_path)
-        try:
-            self.body_id = p.loadURDF(
-                temp_urdf,
-                basePosition=[0, 0, self.cfg.sim.initial_height],
-                baseOrientation=p.getQuaternionFromEuler(
-                    [0, self.cfg.sim.initial_pitch, 0]
-                ),
-                useFixedBase=False,
-            )
-        finally:
-            os.unlink(temp_urdf)
-
-        # Capture initial CoM pose for use by reset().
-        # loadURDF places the *link frame origin* at basePosition, then
-        # PyBullet internally shifts to the CoM using the <inertial>
-        # <origin> offset.  getBasePositionAndOrientation returns the CoM,
-        # and resetBasePositionAndOrientation expects the CoM — so we must
-        # store the CoM pose (NOT the config value) for a correct reset.
-        self._initial_com_pos, self._initial_com_orn = \
-            p.getBasePositionAndOrientation(self.body_id)
-
-    def _discover_joints(self):
-        """Build a name→index map and identify joint groups."""
-        num_joints = p.getNumJoints(self.body_id)
-        for i in range(num_joints):
-            info = p.getJointInfo(self.body_id, i)
-            name = info[1].decode('utf-8')
-            self.joint_map[name] = i
-
-        # Triplet hub joints (free-spinning)
-        self.l_triplet_joint = self.joint_map['c_body_to_l_triplet']
-        self.r_triplet_joint = self.joint_map['c_body_to_r_triplet']
-
-        # Drive wheel joints (3 per side, belt-coupled)
-        self.l_wheel_joints = [
-            self.joint_map['l_triplet_to_l_wheel_1'],
-            self.joint_map['l_triplet_to_l_wheel_2'],
-            self.joint_map['l_triplet_to_l_wheel_3'],
-        ]
-        self.r_wheel_joints = [
-            self.joint_map['r_triplet_to_r_wheel_1'],
-            self.joint_map['r_triplet_to_r_wheel_2'],
-            self.joint_map['r_triplet_to_r_wheel_3'],
-        ]
-
-        print(f"  Joints discovered: {num_joints} total")
-        print(f"    L triplet: joint {self.l_triplet_joint}")
-        print(f"    R triplet: joint {self.r_triplet_joint}")
-        print(f"    L wheels:  joints {self.l_wheel_joints}")
-        print(f"    R wheels:  joints {self.r_wheel_joints}")
-
-    def _configure_dynamics(self):
-        """Set friction, damping for all links."""
-        num_joints = p.getNumJoints(self.body_id)
-
-        # Disable all default joint motors (we'll apply torques explicitly)
-        for i in range(num_joints):
-            p.setJointMotorControl2(
-                self.body_id, i, p.VELOCITY_CONTROL,
-                targetVelocity=0.0, force=0.0
-            )
-
-        # Print computed inertias for debugging
-        for i in range(-1, num_joints):
-            dyn = p.getDynamicsInfo(self.body_id, i)
-            if i == -1:
-                name = 'c_body(base)'
-            else:
-                name = p.getJointInfo(self.body_id, i)[12].decode()
-            print(f"    {name}: mass={dyn[0]:.4f} inertia={tuple(round(v,6) for v in dyn[2])}")
-
-        # Body base link: moderate friction, slight angular damping
-        p.changeDynamics(self.body_id, -1,
-                         lateralFriction=0.4,
-                         linearDamping=0.0,
-                         angularDamping=0.05)
-
-        # Triplet hubs: low friction + joint damping (simulates motor back-EMF)
-        trip_damping = self.cfg.robot.triplet_joint_damping
-        for tj in [self.l_triplet_joint, self.r_triplet_joint]:
-            p.changeDynamics(self.body_id, tj,
-                             lateralFriction=self.cfg.robot.triplet_friction,
-                             linearDamping=0.0,
-                             angularDamping=0.0,
-                             jointDamping=trip_damping)
-
-        # Drive wheels: high friction for traction
-        for wj in self.l_wheel_joints + self.r_wheel_joints:
-            p.changeDynamics(self.body_id, wj,
-                             lateralFriction=self.cfg.robot.wheel_friction,
-                             spinningFriction=0.01,
-                             rollingFriction=0.001,
-                             linearDamping=0.0,
-                             angularDamping=0.0)
-
-    def _setup_belt_constraints(self):
-        """
-        Create gear constraints to simulate virtual belts.
-        All 3 wheels on each side rotate at the same angular velocity
-        (relative to their triplet) — enforced via 1:1 gear constraints.
-        """
-        for side_wheels in [self.l_wheel_joints, self.r_wheel_joints]:
-            master = side_wheels[0]
-            for slave in side_wheels[1:]:
-                c = p.createConstraint(
-                    self.body_id, master,
-                    self.body_id, slave,
-                    jointType=p.JOINT_GEAR,
-                    jointAxis=[0, 1, 0],
-                    parentFramePosition=[0, 0, 0],
-                    childFramePosition=[0, 0, 0]
-                )
-                p.changeConstraint(c, gearRatio=-1,
-                                   maxForce=self.cfg.robot.belt_max_force)
-                self.belt_constraints.append(c)
-
-        print(f"  Belt constraints: {len(self.belt_constraints)} "
-              f"gear joints created")
-
     # ----------------------------------------------------------------
     # State estimation
     # ----------------------------------------------------------------
+
+    def _get_rot_and_vel(self):
+        """Return (rot_3x3, lin_vel_world, ang_vel_body) for c_body."""
+        rot = self.data.xmat[self.body_id].reshape(3, 3)
+        # Use CoM velocity for odometry (matches PyBullet's getBaseVelocity).
+        # qvel[0:3] is the body-frame origin velocity, but the LQR's position
+        # estimate was tuned with CoM velocity.  The difference matters during
+        # pitching: v_CoM = v_origin + ω×r_CoG, which shifts ~0.25 m/s at
+        # pitch_rate≈1 rad/s (h_CoG=0.247 m) and causes position drift.
+        lin_vel = self.data.cvel[self.body_id][3:6]  # CoM velocity, world frame
+        ang_vel = self.data.qvel[3:6]   # body frame (MuJoCo convention)
+        return rot, lin_vel, ang_vel
 
     def _get_true_state(self):
         """
         Read true pitch from physics (body-frame, yaw-invariant).
         Pitch = rotation around body Y axis (the wheel axle direction).
-        """
-        pos, orn = p.getBasePositionAndOrientation(self.body_id)
-        lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
 
-        rot = p.getMatrixFromQuaternion(orn)
-        body_up_z = rot[8]
-        body_fwd_z = rot[6]
+        MuJoCo xmat is row-major 3x3:
+          rot[2,2] = world-Z component of body-Z (body_up_z)
+          rot[2,0] = world-Z component of body-X (body_fwd_z)
+        """
+        rot, _, ang_vel = self._get_rot_and_vel()
+
+        body_up_z = rot[2, 2]
+        body_fwd_z = rot[2, 0]
         pitch = math.atan2(-body_fwd_z, body_up_z)
 
-        # Pitch rate = angular velocity projected onto body Y axis
-        pitch_rate = rot[1] * ang_vel[0] + rot[4] * ang_vel[1] + rot[7] * ang_vel[2]
+        # Pitch rate = body-frame Y angular velocity (MuJoCo qvel is body frame)
+        pitch_rate = float(ang_vel[1])
 
         return pitch, pitch_rate
 
@@ -422,7 +347,7 @@ class TribotBalanceBot:
 
         This method is the single source of truth for measured / estimated
         quantities. Controllers and the telemetry loop consume the returned
-        RobotState rather than reaching into PyBullet directly.
+        RobotState rather than reaching into MuJoCo directly.
         """
         # --- Ground truth from physics ---
         true_pitch, true_pitch_rate = self._get_true_state()
@@ -431,29 +356,33 @@ class TribotBalanceBot:
         measured_pitch, measured_pitch_rate = self.imu.read(
             true_pitch, true_pitch_rate, sim_time, dt
         )
-        # Keep legacy attributes in sync (used by triplet PD, logging)
         self.pitch_angle = measured_pitch
         self.pitch_rate = measured_pitch_rate
 
-        # --- Yaw rate (body-frame) for yaw damping ---
-        lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
-        _, orn = p.getBasePositionAndOrientation(self.body_id)
-        rot = p.getMatrixFromQuaternion(orn)
-        yaw_rate = -(rot[2] * ang_vel[0] + rot[5] * ang_vel[1] + rot[8] * ang_vel[2])
-
-        # --- Forward odometry: integrate velocity projected onto heading ---
-        body_fwd_x = -rot[0]
-        body_fwd_y = -rot[3]
-        fwd_vel = lin_vel[0] * body_fwd_x + lin_vel[1] * body_fwd_y
-        self.position += fwd_vel * dt
+        # --- Yaw rate (body-frame Z angular velocity) ---
+        _, _, ang_vel = self._get_rot_and_vel()
+        yaw_rate = -float(ang_vel[2])
 
         # --- Triplet encoders ---
-        lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
-        rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
+        lt_angle = self.data.qpos[self._qpos_addr[self.l_triplet_jnt]]
+        lt_rate = self.data.qvel[self._qvel_addr[self.l_triplet_jnt]]
+        rt_angle = self.data.qpos[self._qpos_addr[self.r_triplet_jnt]]
+        rt_rate = self.data.qvel[self._qvel_addr[self.r_triplet_jnt]]
 
         # --- Wheel velocities (one representative per side, belt-coupled) ---
-        wheel_vel_L = p.getJointState(self.body_id, self.l_wheel_joints[0])[1]
-        wheel_vel_R = p.getJointState(self.body_id, self.r_wheel_joints[0])[1]
+        wheel_vel_L = self.data.qvel[self._qvel_addr[self.l_wheel_jnts[0]]]
+        wheel_vel_R = self.data.qvel[self._qvel_addr[self.r_wheel_jnts[0]]]
+
+        # --- Forward odometry from wheel encoders ---
+        # Raw wheel velocity includes pitch-correction oscillation that
+        # doesn't represent true ground travel.  A low-pass filter strips
+        # the high-frequency balance component (~5-10 Hz) while preserving
+        # the actual translation (< 1 Hz bandwidth for a 3 kg robot).
+        v_wheel_raw = -self.wheel_radius * (wheel_vel_L + wheel_vel_R) * 0.5
+        alpha = min(1.0, dt * 20.0)  # ~50ms time constant
+        self._fwd_vel_filtered += alpha * (v_wheel_raw - self._fwd_vel_filtered)
+        fwd_vel = self._fwd_vel_filtered
+        self.position += fwd_vel * dt
 
         state = RobotState(
             sim_time=sim_time,
@@ -465,12 +394,12 @@ class TribotBalanceBot:
             true_pitch_rate=true_pitch_rate,
             position=self.position,
             forward_velocity=fwd_vel,
-            triplet_angle_L=lt_state[0],
-            triplet_angle_R=rt_state[0],
-            triplet_rate_L=lt_state[1],
-            triplet_rate_R=rt_state[1],
-            wheel_velocity_L=wheel_vel_L,
-            wheel_velocity_R=wheel_vel_R,
+            triplet_angle_L=float(lt_angle),
+            triplet_angle_R=float(rt_angle),
+            triplet_rate_L=float(lt_rate),
+            triplet_rate_R=float(rt_rate),
+            wheel_velocity_L=float(wheel_vel_L),
+            wheel_velocity_R=float(wheel_vel_R),
             drive_mode=self.drive_mode,
             triplet_base_angle=self.triplet_base_angle,
         )
@@ -492,7 +421,7 @@ class TribotBalanceBot:
         """
         requested = self.controller.requested_lean
 
-        # Detect lean change → start trajectory (2WD only)
+        # Detect lean change -> start trajectory (2WD only)
         if (self.drive_mode == DriveMode.TWO_WD
                 and abs(requested - self._prev_requested_lean) > math.radians(1.0)):
             self._lean_traj.start(
@@ -503,20 +432,16 @@ class TribotBalanceBot:
             )
         self._prev_requested_lean = requested
 
-        # Active trajectory → use its smooth reference
+        # Active trajectory -> use its smooth lean reference
         if self._lean_traj.active:
-            ref_pos, ref_vel, ref_pitch, ref_prate = \
-                self._lean_traj.update(sim_time)
+            _, _, ref_pitch, ref_prate = self._lean_traj.update(sim_time)
             return StateReference(
-                position=ref_pos,
-                velocity=ref_vel,
                 pitch=ref_pitch,
                 pitch_rate=ref_prate,
             )
 
-        # Steady state: track operator commands directly
+        # Steady state: track operator lean directly
         return StateReference(
-            position=self.controller.target_position,
             pitch=requested,
         )
 
@@ -529,7 +454,7 @@ class TribotBalanceBot:
         Run one control + actuation cycle.
 
         Reads sensors via read_sensors(), feeds the controller, computes
-        triplet commands, and applies motor torques.
+        triplet commands, and applies motor torques via data.ctrl.
         Called every physics timestep; controller only runs at CONTROL_RATE_HZ.
         """
         s = self.read_sensors(sim_time, dt)
@@ -545,15 +470,12 @@ class TribotBalanceBot:
             self.triplet_ctrl_R.set_base_angle(self.triplet_base_angle)
 
         # --- Build state reference ---
-        # The robot loop owns the trajectory planner and knows the drive
-        # mode, so it builds the StateReference that the controller
-        # tracks.  The controller is a pure function of (state, ref, K).
         ref = self._build_state_reference(sim_time)
 
-        # --- Controller → per-side commanded torques ---
+        # --- Controller -> per-side commanded torques ---
         left_cmd, right_cmd = self.controller.update(
             s.pitch, s.pitch_rate,
-            s.position, s.yaw_rate, sim_time, dt, ref=ref
+            s.position, s.forward_velocity, s.yaw_rate, sim_time, dt, ref=ref
         )
 
         # Triplet hub commands
@@ -561,9 +483,6 @@ class TribotBalanceBot:
             triplet_cmd_L = self.controller.triplet_torque_L
             triplet_cmd_R = self.controller.triplet_torque_R
         else:
-            # Triplet target = ref.pitch (trajectory pitch during
-            # transitions, requested lean otherwise).  Works for
-            # both 2WD and 4WD — the ref already encodes the mode.
             triplet_cmd_L = self.triplet_ctrl_L.compute_lean_and_update(
                 ref.pitch, self.controller.desired_lean,
                 self.triplet_base_angle,
@@ -577,35 +496,31 @@ class TribotBalanceBot:
 
         # --- Apply motor torque through motor models ---
         side_configs = [
-            (0, self.l_wheel_joints, self.l_triplet_joint, left_cmd, triplet_cmd_L, s.wheel_velocity_L),
-            (1, self.r_wheel_joints, self.r_triplet_joint, right_cmd, triplet_cmd_R, s.wheel_velocity_R),
+            (0, self.l_wheel_jnts, self.act_l_wheels, self.act_l_triplet,
+             left_cmd, triplet_cmd_L, s.wheel_velocity_L),
+            (1, self.r_wheel_jnts, self.act_r_wheels, self.act_r_triplet,
+             right_cmd, triplet_cmd_R, s.wheel_velocity_R),
         ]
 
-        for motor_idx, wheel_joints, triplet_joint, cmd_torque, triplet_cmd, wheel_vel in side_configs:
+        for (motor_idx, wheel_jnts, wheel_acts, triplet_act,
+             cmd_torque, triplet_cmd, wheel_vel) in side_configs:
 
             motor_torque = self.motors[motor_idx].update(
                 cmd_torque, wheel_vel, dt
             )
             self.actual_torques[motor_idx] = motor_torque
 
+            # Triplet hub: reaction-cancelled torque
             triplet_total = -motor_torque + triplet_cmd
-            p.setJointMotorControl2(
-                self.body_id, triplet_joint,
-                controlMode=p.TORQUE_CONTROL,
-                force=triplet_total
-            )
+            self.data.ctrl[triplet_act] = triplet_total
 
+            # Drive wheels: distribute motor torque + per-wheel imbalance
             torque_per_wheel = -motor_torque / 3.0
-
-            for wj in wheel_joints:
-                wheel_pos = p.getJointState(self.body_id, wj)[0]
-                imbalance = self.cfg.robot.wheel_imbalance_torque * math.sin(wheel_pos)
-
-                p.setJointMotorControl2(
-                    self.body_id, wj,
-                    controlMode=p.TORQUE_CONTROL,
-                    force=torque_per_wheel + imbalance
-                )
+            for wj, wa in zip(wheel_jnts, wheel_acts):
+                wheel_pos = self.data.qpos[self._qpos_addr[wj]]
+                imbalance = (self.cfg.robot.wheel_imbalance_torque
+                             * math.sin(wheel_pos))
+                self.data.ctrl[wa] = torque_per_wheel + imbalance
 
     # ----------------------------------------------------------------
     # Telemetry helpers
@@ -641,23 +556,27 @@ class TribotBalanceBot:
 
     def get_debug_state(self):
         """Return comprehensive debug info."""
-        pos, orn = p.getBasePositionAndOrientation(self.body_id)
-        lin_vel, ang_vel = p.getBaseVelocity(self.body_id)
-        euler = p.getEulerFromQuaternion(orn)
+        pos = self.data.qpos[0:3]
+        quat_wxyz = self.data.qpos[3:7]
+        euler = _mj_quat_to_euler(quat_wxyz)
 
-        lt_state = p.getJointState(self.body_id, self.l_triplet_joint)
-        rt_state = p.getJointState(self.body_id, self.r_triplet_joint)
+        ang_vel = self.data.qvel[3:6]
 
-        lw_vel = p.getJointState(self.body_id, self.l_wheel_joints[0])[1]
-        rw_vel = p.getJointState(self.body_id, self.r_wheel_joints[0])[1]
+        lt_angle = self.data.qpos[self._qpos_addr[self.l_triplet_jnt]]
+        rt_angle = self.data.qpos[self._qpos_addr[self.r_triplet_jnt]]
+        lt_rate = self.data.qvel[self._qvel_addr[self.l_triplet_jnt]]
+        rt_rate = self.data.qvel[self._qvel_addr[self.r_triplet_jnt]]
+
+        lw_vel = self.data.qvel[self._qvel_addr[self.l_wheel_jnts[0]]]
+        rw_vel = self.data.qvel[self._qvel_addr[self.r_wheel_jnts[0]]]
 
         return {
-            'pos': pos,
+            'pos': tuple(pos),
             'euler_deg': tuple(math.degrees(e) for e in euler),
             'ang_vel_deg': tuple(math.degrees(v) for v in ang_vel),
-            'triplet_ang': (lt_state[0], rt_state[0]),
-            'triplet_vel': (lt_state[1], rt_state[1]),
-            'wheel_vel': (lw_vel, rw_vel),
+            'triplet_ang': (float(lt_angle), float(rt_angle)),
+            'triplet_vel': (float(lt_rate), float(rt_rate)),
+            'wheel_vel': (float(lw_vel), float(rw_vel)),
         }
 
     def get_world_pose_2d(self):
@@ -665,12 +584,12 @@ class TribotBalanceBot:
         Return (x, y, yaw, fwd_x, fwd_y) in world frame.
         Robot forward is body -X (URDF convention).
         """
-        pos, orn = p.getBasePositionAndOrientation(self.body_id)
-        rot = p.getMatrixFromQuaternion(orn)
-        fwd_x = -rot[0]
-        fwd_y = -rot[3]
+        pos = self.data.qpos[0:3]
+        rot = self.data.xmat[self.body_id].reshape(3, 3)
+        fwd_x = -rot[0, 0]
+        fwd_y = -rot[1, 0]
         yaw = math.atan2(fwd_y, fwd_x)
-        return pos[0], pos[1], yaw, fwd_x, fwd_y
+        return float(pos[0]), float(pos[1]), yaw, fwd_x, fwd_y
 
     def set_drive_mode(self, mode: DriveMode):
         """Set a specific drive mode; no-op if already in that mode."""
@@ -682,23 +601,23 @@ class TribotBalanceBot:
         angle_2wd = self.cfg.robot.triplet_2wd_angle
         if self.drive_mode == DriveMode.FOUR_WD:
             self.drive_mode = DriveMode.TWO_WD
-            cur_angle = p.getJointState(self.body_id, self.l_triplet_joint)[0]
+            cur_angle = self.data.qpos[self._qpos_addr[self.l_triplet_jnt]]
             if cur_angle >= 0:
                 self.triplet_base_angle = -angle_2wd
             else:
                 self.triplet_base_angle = angle_2wd
-            print(f"  [MODE] 4WD → 2WD  (triplet target "
-                  f"{math.degrees(self.triplet_base_angle):+.0f}°)")
+            print(f"  [MODE] 4WD -> 2WD  (triplet target "
+                  f"{math.degrees(self.triplet_base_angle):+.0f})")
         else:
             self.drive_mode = DriveMode.FOUR_WD
             self.triplet_base_angle = 0.0
-            print(f"  [MODE] 2WD → 4WD  (triplet target 0°)")
+            print(f"  [MODE] 2WD -> 4WD  (triplet target 0)")
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
         if self.drive_mode == DriveMode.FOUR_WD:
             self._lean_traj.cancel()
 
     def check_fallen(self):
-        """Check if robot has fallen over (|pitch| > 80°)."""
+        """Check if robot has fallen over (|pitch| > 80)."""
         true_pitch, _ = self._get_true_state()
         return abs(true_pitch) > math.radians(80)
