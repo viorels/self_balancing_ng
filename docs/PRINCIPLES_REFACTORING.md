@@ -86,7 +86,10 @@ self_balancing_ng/
 │   ├── base.py                # BalanceControllerBase (ABC)
 │   ├── control_pid.py         # PIDBalanceController
 │   ├── control_lqr.py         # LQRBalanceController
-│   └── control_mpc_hybrid.py  # MPCHybridController
+│   ├── control_mpc.py         # MPCBalanceController (default)
+│   ├── mpc_plant.py           # planar model, linearisation
+│   ├── mpc_qp.py              # OSQP problem
+│   └── triplet_planner.py     # mode transitions, flip trigger
 ├── input/
 │   ├── __init__.py
 │   ├── gamepad.py             # Gamepad (low-level)

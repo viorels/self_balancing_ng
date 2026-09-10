@@ -134,12 +134,14 @@ def _print_config_summary(model, robot, config):
               f"Ki={config.pid.pos_ki}, Kd={config.pid.pos_kd}, "
               f"max_pitch={math.degrees(config.pid.pos_max_pitch):.1f}")
     elif ctrl_type == 'MPC':
-        print(f"  MPC rate: {config.mpc.rate_hz}Hz, N={config.mpc.horizon}, "
-              f"sim_solve={config.mpc.simulated_solve_ms}ms")
+        print(f"  MPC: N={config.mpc.horizon} x {config.mpc.dt_pred * 1e3:.0f} ms, "
+              f"solved at {config.control.control_rate_hz} Hz (OSQP)")
         print(f"  MPC Q_diag={config.mpc.q_diag}")
-        print(f"  MPC R_diag={config.mpc.r_diag}")
+        print(f"  MPC R_diag={config.mpc.r_diag}  Rd_diag={config.mpc.rd_diag}")
+        print(f"  Flip trigger: {'on' if config.mpc.flip_enabled else 'off'}, "
+              f"T_flip={config.mpc.flip_time * 1e3:.0f} ms, "
+              f"transition={config.mpc.transition_time:.2f} s")
         print(f"  Plant: m_body={config.plant.body_mass}kg, "
-              f"m_wheel={config.plant.wheel_mass}kg, "
               f"l_cog={config.plant.cog_height}m, "
               f"I_body={config.plant.body_inertia}kg*m^2")
     else:

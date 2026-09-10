@@ -12,5 +12,5 @@ When answering questions or generating code, always assume familiarity with this
 
 ## Key conventions
 - The robot is simulated using MuJoCo
-- Main control strategy is LQR (`control_lqr.py`)
+- Main control strategy is mode-scheduled MPC (`controllers/control_mpc.py`, see `docs/MPC_CONTROLLER.md`); LQR (`control_lqr.py`) and PID remain selectable via `config.sim.controller`
 - The main simulation entry point is `tribot_sim.py`

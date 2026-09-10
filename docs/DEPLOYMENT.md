@@ -33,13 +33,21 @@ uv pip install --python .venv/bin/python -r requirements.txt
 The environment lives in `.venv/` (gitignored). It must be at that exact path:
 `.mcp.json` points to `.venv/bin/python` for the MCP simulation server.
 
-Dependencies (`requirements.txt`): numpy, numpy-stl, scipy, mujoco, mcp.
-scipy is required by the hybrid MPC controller that `robot.py` loads.
+Dependencies (`requirements.txt`): numpy, numpy-stl, scipy, mujoco, osqp, mcp.
+scipy and osqp are required by the MPC controller that `robot.py` loads by
+default (see `docs/MPC_CONTROLLER.md`).
 
 Verify the install:
 
 ```bash
-.venv/bin/python -c "import mujoco, scipy, robot, controllers; print('ok')"
+.venv/bin/python -c "import mujoco, scipy, osqp, robot, controllers; print('ok')"
+```
+
+Headless checks (no viewer needed):
+
+```bash
+.venv/bin/python tools/validate_mpc_plant.py   # model vs MuJoCo accelerations
+.venv/bin/python tools/run_headless.py all     # balance, drive, transition, push scenarios
 ```
 
 ## Running

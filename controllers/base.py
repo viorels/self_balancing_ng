@@ -53,7 +53,8 @@ class BalanceControllerBase(ABC):
     Subclasses MAY override:
         set_lean()           — accept operator lean bias (default: no-op)
         set_triplet_state()  — accept triplet encoder readings (default: no-op)
-        get_flip_diagnostics() — ZMP/DCM flip telemetry (default: empty dict)
+        set_drive_mode()     — accept a drive-mode request (default: no-op)
+        get_flip_diagnostics() — DCM flip telemetry (default: empty dict)
 
     Properties with safe defaults (override in subclass if meaningful):
         triplet_torque_L/R   — planned triplet torques (0.0)
@@ -126,6 +127,15 @@ class BalanceControllerBase(ABC):
     def set_triplet_state(self, angle_L: float, angle_R: float,
                           rate_L: float, rate_R: float) -> None:
         """Update triplet encoder readings.  Default: no-op."""
+        pass
+
+    def set_drive_mode(self, mode) -> None:
+        """Notify the controller of a requested drive mode.  Default: no-op.
+
+        Controllers that plan their own triplet torques (MPC) use this to
+        start a 4WD<->2WD transition; the external TripletController path
+        reads the base angle from the robot loop instead.
+        """
         pass
 
     # ------------------------------------------------------------------

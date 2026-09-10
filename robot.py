@@ -23,7 +23,7 @@ from controllers.triplet_controller import (
 from controllers.base import StateReference
 from controllers.control_pid import BalanceController
 from controllers.control_lqr import LQRBalanceController
-from controllers.control_mpc_hybrid import MPCHybridController
+from controllers.control_mpc import MPCBalanceController
 from controllers.lean_trajectory import LeanTrajectory
 
 
@@ -115,7 +115,7 @@ class TribotBalanceBot:
         # Balance controller
         ctrl_type = config.sim.controller.lower()
         if ctrl_type == 'mpc':
-            self.controller = MPCHybridController(config)
+            self.controller = MPCBalanceController(config)
         elif ctrl_type == 'lqr':
             self.controller = LQRBalanceController(config)
         else:
@@ -374,11 +374,18 @@ class TribotBalanceBot:
         wheel_vel_R = self.data.qvel[self._qvel_addr[self.r_wheel_jnts[0]]]
 
         # --- Forward odometry from wheel encoders ---
-        # Raw wheel velocity includes pitch-correction oscillation that
-        # doesn't represent true ground travel.  A low-pass filter strips
-        # the high-frequency balance component (~5-10 Hz) while preserving
-        # the actual translation (< 1 Hz bandwidth for a 3 kg robot).
-        v_wheel_raw = -self.wheel_radius * (wheel_vel_L + wheel_vel_R) * 0.5
+        # The wheel encoder measures spin relative to the hub.  Ground
+        # travel follows the wheel's ABSOLUTE spin, which also includes
+        # the hub rotation and the body pitch rate (all about +Y):
+        #     omega_abs = wheel_joint_rate + hub_joint_rate + pitch_rate
+        # In steady 4WD the hub is ground-locked (hub rate = -pitch rate)
+        # so this reduces to the raw encoder; it matters during mode
+        # transitions and flips, where the hub rotates by up to 120 deg.
+        # A low-pass filter then strips the high-frequency balance
+        # component (~5-10 Hz) while preserving the actual translation.
+        omega_abs = 0.5 * (wheel_vel_L + wheel_vel_R + lt_rate + rt_rate) \
+            + measured_pitch_rate
+        v_wheel_raw = -self.wheel_radius * omega_abs
         alpha = min(1.0, dt * 20.0)  # ~50ms time constant
         self._fwd_vel_filtered += alpha * (v_wheel_raw - self._fwd_vel_filtered)
         fwd_vel = self._fwd_vel_filtered
@@ -459,7 +466,7 @@ class TribotBalanceBot:
         """
         s = self.read_sensors(sim_time, dt)
 
-        # --- Feed triplet state to controller (for MPC) ---
+        # --- Feed triplet state to controller (used by the MPC) ---
         self.controller.set_triplet_state(
             s.triplet_angle_L, s.triplet_angle_R,
             s.triplet_rate_L, s.triplet_rate_R,
@@ -614,6 +621,7 @@ class TribotBalanceBot:
             print(f"  [MODE] 2WD -> 4WD  (triplet target 0)")
         self.triplet_ctrl_L.drive_mode = self.drive_mode
         self.triplet_ctrl_R.drive_mode = self.drive_mode
+        self.controller.set_drive_mode(self.drive_mode)
         if self.drive_mode == DriveMode.FOUR_WD:
             self._lean_traj.cancel()
 
