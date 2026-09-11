@@ -171,6 +171,33 @@ class MPCConfig:
     flip_min_fall_rate_deg_s: float = 15.0
     flip_kp: float = 25.0              # Nm/rad
     flip_kd: float = 0.8               # Nm·s/rad
+    # --- Stair step manoeuvre (4WD): lean over the blocked front wheel, then
+    #     roll the cluster so the upper wheel lands on the tread ---
+    step_enabled: bool = True
+    step_min_height: float = 0.03      # m — smaller bumps are just driven over
+    step_max_height: float = 0.09      # m — taller obstacles: stop instead
+    step_trigger_gap: float = 0.04     # m — front wheel edge to riser distance
+    step_approach_speed: float = 0.2   # m/s — velocity cap when a riser is near
+    step_approach_distance: float = 0.45  # m — from the hub, where the cap applies
+    step_lean_margin: float = -0.05    # kg·m — CoG first-moment margin vs the pivot (negative: just behind)
+    step_roll_margin: float = 0.02     # kg·m — CoG margin ahead of the pivot while rolling
+    step_roll_lead: float = 0.5        # rad — leg reference lead past the top of the roll
+    step_theta_rate: float = 1.2       # rad/s — max rate of the pitch reference while rolling
+    step_theta_floor: float = 0.05     # rad — pitch reference floor while rolling
+    step_lean_time: float = 0.7        # s
+    drop_hold: bool = True             # stop at a drop-off instead of driving over it
+    step_down_enabled: bool = True     # roll down a drop with the same manoeuvre
+    step_max_drop: float = 0.12        # m — largest drop the step-down attempts
+    step_roll_time: float = 0.7        # s for a full 120° roll (scaled by the actual sweep)
+    step_roll_timeout: float = 1.5     # s — give up on a roll after this
+    step_impact_rate: float = 1.5      # rad/s — leg-rate drop in one tick that marks the landing
+    step_land_margin: float = 0.09     # rad (~5°) past the geometric landing angle
+    step_settle_time: float = 0.4      # s
+    step_pitch_limit: float = 0.8      # rad — soft pitch limit while stepping
+    step_drive_limit: float = 0.6      # Nm — drive torque cap while stepping
+    step_press_torque: float = 0.0     # Nm — drive bias while leaning (0: pivot wheel rolls freely)
+    step_hub_limit: float = 5.0        # Nm — total hub torque cap while rolling
+    step_lin_clip: float = 1.35        # rad — linearisation clip while rolling
 
 
 @dataclass
@@ -207,14 +234,17 @@ class GamepadConfig:
 @dataclass
 class TerrainConfig:
     """Terrain type and stair geometry."""
-    terrain_type: str = 'flat'         # 'flat', 'heightfield', or 'box_stairs'
+    terrain_type: str = 'box_stairs'         # 'flat', 'heightfield', or 'box_stairs'
     ground_friction: float = 0.7
     stair_num_steps: int = 2
     stair_step_depth: float = 0.20     # m
     stair_step_height: List[float] = field(
-        default_factory=lambda: [0.1, 0.15])
+        default_factory=lambda: [0.05, 0.05])
     stair_width: float = 0.6           # m
     stair_start_x: float = 0.5         # m
+    # Forward-looking terrain probe (ToF model, see TribotBalanceBot._probe_terrain)
+    probe_rate_hz: int = 50
+    probe_step_threshold: float = 0.02  # m — ground height change that counts
 
 
 # ============================================================================

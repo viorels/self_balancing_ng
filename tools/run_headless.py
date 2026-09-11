@@ -11,7 +11,7 @@ Usage:
     .venv/bin/python tools/run_headless.py [scenario ...] [--controller mpc|lqr]
                                            [--duration S] [--noise 0|1]
 Scenarios: balance4, balance2, drive4, drive2, transition, push4, push2,
-           flip, all
+           flip, stairs, all   (stairs: --mode 4wd|2wd, --speed; box stairs)
 """
 
 from __future__ import annotations
@@ -68,11 +68,15 @@ def push(robot, impulse_ns, duration=0.05):
     return {'t_end': None, 'force': force, 'duration': duration}
 
 
-def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
+def run(cfg, scenario, duration, verbose=False, push_ns=3.0, speed=0.4,
+        mode='2wd', log_dt=0.1):
     events = []          # (time, callable)
     triplet0 = 0.0
-    if scenario in ('balance2', 'drive2', 'push2', 'flip'):
+    if scenario in ('balance2', 'drive2', 'push2', 'flip') or \
+            (scenario == 'stairs' and mode == '2wd'):
         triplet0 = math.pi / 3
+    # Flat-ground scenarios must not depend on the configured terrain.
+    cfg.terrain.terrain_type = 'box_stairs' if scenario == 'stairs' else 'flat'
     model, data, robot = make_robot(cfg, triplet=triplet0)
     ctrl = robot.controller
     if triplet0 != 0.0:
@@ -107,6 +111,8 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
         events += [(1.0, do_push(0.8)), (3.0, do_push(-0.8)), (5.0, do_push(1.5))]
     elif scenario == 'flip':
         events += [(1.5, do_push(push_ns, 0.05))]
+    elif scenario == 'stairs':
+        events += [(1.0, lambda t: ctrl.set_velocity_command(speed))]
 
     dt = cfg.sim.timestep
     n_steps = int(duration / dt)
@@ -118,6 +124,8 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
     ticks = 0
     fell = False
     log = []
+    min_x = 0.0
+    max_z = 0.0
     pos_err_after = []
     t_wall0 = time.perf_counter()
     yaw_rates = []
@@ -134,6 +142,8 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
 
         s = robot.state
         peak_pitch = max(peak_pitch, abs(s.true_pitch))
+        min_x = min(min_x, float(data.qpos[0]))
+        max_z = max(max_z, float(data.qpos[2]))
         if max(abs(v) for v in robot.actual_torques) > 0.98 * cfg.motor.max_torque:
             sat_ticks += 1
         if t > 1.5:
@@ -143,13 +153,17 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
         if robot.check_fallen():
             fell = True
             break
-        if verbose and i % int(0.1 / dt) == 0:
+        if verbose and i % max(1, int(round(log_dt / dt))) == 0:
             tel = ctrl.get_telemetry()
             log.append((t, math.degrees(s.true_pitch), s.position,
                         tel.get('u_drive', 0.0), tel.get('u_triplet', 0.0),
-                        tel.get('mode_4wd', -1), tel.get('flip_phase', -1),
+                        tel.get('mode_4wd', -1), tel.get('step_phase', -1),
                         math.degrees(s.triplet_angle_L),
-                        math.degrees(s.triplet_angle_R)))
+                        math.degrees(s.triplet_angle_R),
+                        float(data.qpos[0]), float(data.qpos[2]),
+                        s.forward_velocity, tel.get('planner_2wd', -1),
+                        math.degrees(tel.get('z_lam', 0.0)),
+                        math.degrees(tel.get('ref_lam', 0.0))))
     wall = time.perf_counter() - t_wall0
     tel = ctrl.get_telemetry()
     result = {
@@ -167,13 +181,18 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0):
         'flip_phase_end': tel.get('flip_phase', -1),
         'trip_L_deg': math.degrees(robot.state.triplet_angle_L),
         'trip_R_deg': math.degrees(robot.state.triplet_angle_R),
+        'min_x': min_x,
+        'max_z': max_z,
     }
     if verbose:
         print(f"    {'t':>5s} {'pitch':>7s} {'pos':>7s} {'u_d':>6s} {'u_t':>6s} "
-              f"{'4wd':>4s} {'flip':>4s} {'phiL':>7s} {'phiR':>7s}")
+              f"{'4wd':>4s} {'step':>4s} {'phiL':>7s} {'phiR':>7s} "
+              f"{'x':>7s} {'z':>6s} {'v':>6s} {'p2':>3s} {'lam':>6s} {'lamr':>6s}")
         for row in log:
             print(f"    {row[0]:5.2f} {row[1]:7.2f} {row[2]:7.3f} {row[3]:6.2f} "
-                  f"{row[4]:6.2f} {row[5]:4.0f} {row[6]:4.0f} {row[7]:7.1f} {row[8]:7.1f}")
+                  f"{row[4]:6.2f} {row[5]:4.0f} {row[6]:4.0f} {row[7]:7.1f} {row[8]:7.1f} "
+                  f"{row[9]:7.3f} {row[10]:6.3f} {row[11]:6.2f} {row[12]:3.0f} "
+                  f"{row[13]:6.1f} {row[14]:6.1f}")
     return result
 
 
@@ -187,23 +206,43 @@ def main():
     ap.add_argument('--push', type=float, default=3.0,
                     help='impulse (N*s) for the flip scenario')
     ap.add_argument('--flip', type=int, default=1, help='enable the flip trigger')
+    ap.add_argument('--speed', type=float, default=0.4,
+                    help='velocity command (m/s) for the stairs scenario')
+    ap.add_argument('--mode', default='2wd', help='start mode for stairs: 2wd|4wd')
+    ap.add_argument('--log-dt', type=float, default=0.1, help='verbose log period (s)')
+    ap.add_argument('--set', action='append', default=[],
+                    help='override config, e.g. --set mpc.step_lean_margin=-0.05')
     args = ap.parse_args()
 
     names = args.scenarios
     if names == ['all']:
         names = ['balance4', 'balance2', 'drive4', 'drive2', 'transition',
-                 'push4', 'push2', 'flip']
+                 'push4', 'push2', 'flip', 'stairs']
     ok_all = True
     for name in names:
         cfg = load_config()
         cfg.sim.controller = args.controller
         cfg.imu.add_sensor_noise = bool(args.noise)
         cfg.mpc.flip_enabled = bool(args.flip)
-        res = run(cfg, name, args.duration, verbose=args.verbose,
-                  push_ns=args.push)
+        for item in args.set:
+            path, val = item.split('=', 1)
+            obj = cfg
+            *parents, leaf = path.split('.')
+            for part in parents:
+                obj = getattr(obj, part)
+            cur = getattr(obj, leaf)
+            setattr(obj, leaf, type(cur)(val) if not isinstance(cur, bool)
+                    else val.lower() in ('1', 'true', 'yes'))
+        duration = max(args.duration, 14.0) if name == 'stairs' else args.duration
+        res = run(cfg, name, duration, verbose=args.verbose,
+                  push_ns=args.push, speed=args.speed, mode=args.mode,
+                  log_dt=args.log_dt)
         ok = not res['fell']
         ok_all &= ok
-        print(f"[{'OK ' if ok else 'FELL'}] {name:10s} t={res['t_end']:.2f}s "
+        extra = ''
+        if name == 'stairs':
+            extra = f"min_x={res['min_x']:+.2f}m max_z={res['max_z']:.3f}m "
+        print(f"[{'OK ' if ok else 'FELL'}] {name:10s} t={res['t_end']:.2f}s {extra}"
               f"peak_pitch={res['peak_pitch_deg']:.1f}deg sat={res['sat_frac']*100:.0f}% "
               f"pos_err_rms={res['pos_err_rms']:.3f}m final={res['final_pos_err']:+.3f}m "
               f"yaw={res['yaw_rate_mean']:+.2f} solve_max={res['solve_max_ms']:.2f}ms "

@@ -47,7 +47,7 @@ Headless checks (no viewer needed):
 
 ```bash
 .venv/bin/python tools/validate_mpc_plant.py   # model vs MuJoCo accelerations
-.venv/bin/python tools/run_headless.py all     # balance, drive, transition, push scenarios
+.venv/bin/python tools/run_headless.py all     # balance, drive, transition, push, stairs scenarios
 ```
 
 ## Running

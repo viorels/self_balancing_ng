@@ -88,3 +88,8 @@ against MuJoCo, and scenario results. Modules: `controllers/control_mpc.py`,
 `controllers/triplet_planner.py`; tools: `tools/validate_mpc_plant.py`,
 `tools/run_headless.py`. The EKF, slope handling, and embedded code
 generation from this plan are not yet done.
+
+Stair negotiation was added afterwards as a planned step manoeuvre in the
+event layer (terrain probe, lean, roll over the front wheel, landing
+detection from the hub encoders); see the Stairs section of
+`docs/MPC_CONTROLLER.md`.

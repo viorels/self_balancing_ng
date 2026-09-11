@@ -148,6 +148,16 @@ class TribotBalanceBot:
         self.wheel_radius = config.robot.wheel_radius
         self._fwd_vel_filtered = 0.0
 
+        # Terrain probe: downward rays at these forward offsets from the hub
+        # (metres), terrain geoms only (geom group 3, see terrain.py).
+        self._probe_offsets = np.arange(0.0, 0.42, 0.01)
+        self._probe_group = np.zeros(6, dtype=np.uint8)
+        self._probe_group[3] = 1
+        self._probe_geomid = np.zeros(1, dtype=np.int32)
+        self._probe_period = 1.0 / config.terrain.probe_rate_hz
+        self._probe_next_time = 0.0
+        self._probe_last = (float('inf'), 0.0, config.sim.initial_height)
+
         # Current state for logging
         self.position = 0.0
         self.pitch_angle = 0.0
@@ -338,6 +348,41 @@ class TribotBalanceBot:
         return pitch, pitch_rate
 
     # ----------------------------------------------------------------
+    # Terrain probe
+    # ----------------------------------------------------------------
+
+    def _probe_terrain(self, sim_time):
+        """
+        Model of a forward-looking time-of-flight sensor: cast vertical rays
+        at a few points ahead of the hub and report the nearest ground-height
+        change.  Returns (distance, height, clearance); see RobotState.
+        """
+        if sim_time < self._probe_next_time:
+            return self._probe_last
+        self._probe_next_time = sim_time + self._probe_period
+
+        hub = self.data.xpos[self.body_id]
+        _, _, _, fwd_x, fwd_y = self.get_world_pose_2d()
+        z_start = hub[2] + 0.5
+        vec = np.array([0.0, 0.0, -1.0])
+        heights = []
+        for d in self._probe_offsets:
+            pnt = np.array([hub[0] + d * fwd_x, hub[1] + d * fwd_y, z_start])
+            dist = mujoco.mj_ray(self.model, self.data, pnt, vec,
+                                 self._probe_group, 1, -1, self._probe_geomid)
+            heights.append(z_start - dist if dist >= 0 else -1.0)
+        z0 = heights[0]
+        clearance = float(hub[2] - z0)
+        thr = self.cfg.terrain.probe_step_threshold
+        distance, height = float('inf'), 0.0
+        for d, z in zip(self._probe_offsets[1:], heights[1:]):
+            if abs(z - z0) > thr:
+                distance, height = float(d), float(z - z0)
+                break
+        self._probe_last = (distance, height, clearance)
+        return self._probe_last
+
+    # ----------------------------------------------------------------
     # Sensor pipeline
     # ----------------------------------------------------------------
 
@@ -391,6 +436,9 @@ class TribotBalanceBot:
         fwd_vel = self._fwd_vel_filtered
         self.position += fwd_vel * dt
 
+        # --- Terrain probe ---
+        step_dist, step_height, clearance = self._probe_terrain(sim_time)
+
         state = RobotState(
             sim_time=sim_time,
             dt=dt,
@@ -409,6 +457,9 @@ class TribotBalanceBot:
             wheel_velocity_R=float(wheel_vel_R),
             drive_mode=self.drive_mode,
             triplet_base_angle=self.triplet_base_angle,
+            terrain_step_distance=step_dist,
+            terrain_step_height=step_height,
+            ground_clearance=clearance,
         )
         self.state = state
         return state
@@ -471,6 +522,8 @@ class TribotBalanceBot:
             s.triplet_angle_L, s.triplet_angle_R,
             s.triplet_rate_L, s.triplet_rate_R,
         )
+        self.controller.set_terrain_ahead(
+            s.terrain_step_distance, s.terrain_step_height, s.ground_clearance)
 
         if not self.controller.plans_triplet_torque:
             self.triplet_ctrl_L.set_base_angle(self.triplet_base_angle)
@@ -555,6 +608,9 @@ class TribotBalanceBot:
             "triplet_angle_R": s.triplet_angle_R,
             "wheel_velocity_L": s.wheel_velocity_L,
             "wheel_velocity_R": s.wheel_velocity_R,
+            "terrain_step_dist": min(s.terrain_step_distance, 9.9),
+            "terrain_step_height": s.terrain_step_height,
+            "ground_clearance": s.ground_clearance,
         }
 
     # ----------------------------------------------------------------

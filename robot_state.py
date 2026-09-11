@@ -68,6 +68,14 @@ class RobotState:
     drive_mode: DriveMode = DriveMode.FOUR_WD
     triplet_base_angle: float = 0.0
 
+    # Terrain probe (forward-looking ToF model): nearest change of ground
+    # height ahead of the hub axis.  distance is measured from the hub
+    # along the driving direction; height is relative to the ground under
+    # the hub (positive = step up, negative = drop).  inf / 0 when flat.
+    terrain_step_distance: float = float('inf')
+    terrain_step_height: float = 0.0
+    ground_clearance: float = 0.0     # hub axis height above local ground
+
 
 # ---------------------------------------------------------------------------
 # Control output — actuator commands returned by any balance controller

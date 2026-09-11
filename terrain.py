@@ -80,7 +80,7 @@ def _flat_xml(config):
     return {
         'asset': f'{_FLOOR_TEXTURE}\n{_FLOOR_MATERIAL}',
         'worldbody': (
-            f'<geom name="floor" type="plane" size="10 10 0.1" '
+            f'<geom name="floor" type="plane" size="10 10 0.1" group="3" '
             f'material="floor_mat" '
             f'friction="{friction} 0.005 0.001"/>'
         ),
@@ -109,7 +109,7 @@ def _heightfield_xml(config):
             f'{_FLOOR_TEXTURE}\n{_FLOOR_MATERIAL}'
         ),
         'worldbody': (
-            f'<geom name="floor" type="hfield" hfield="terrain" '
+            f'<geom name="floor" type="hfield" hfield="terrain" group="3" '
             f'material="floor_mat" '
             f'friction="{friction} 0.005 0.001"/>'
         ),
@@ -170,7 +170,7 @@ def _box_stairs_xml(config):
     step_color_b = "0.65 0.65 0.70 1"
 
     parts = [
-        f'<geom name="floor" type="plane" size="10 10 0.1" '
+        f'<geom name="floor" type="plane" size="10 10 0.1" group="3" '
         f'material="floor_mat" '
         f'friction="{friction} 0.005 0.001"/>'
     ]
@@ -185,7 +185,7 @@ def _box_stairs_xml(config):
             cz = h / 2
             color = step_color_a if i % 2 == 0 else step_color_b
             parts.append(
-                f'<geom name="stair_{prefix}_{i}" type="box" '
+                f'<geom name="stair_{prefix}_{i}" type="box" group="3" '
                 f'size="{half_x} {half_y} {half_z}" '
                 f'pos="{cx} 0 {cz}" '
                 f'friction="{friction} 0.005 0.001" '

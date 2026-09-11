@@ -15,7 +15,8 @@ controller (`config.sim.controller = 'mpc'`).
 | `controllers/mpc_qp.py` | Sparse QP with a fixed sparsity pattern, solved by OSQP with warm start |
 | `controllers/triplet_planner.py` | Event layer: per-side hub references, asymmetric mode transitions, flip state machine |
 | `tools/validate_mpc_plant.py` | Compares model accelerations and sign conventions against MuJoCo |
-| `tools/run_headless.py` | Scripted scenarios without the viewer; exit code 1 if the robot falls |
+| `tools/run_headless.py` | Scripted scenarios without the viewer (flat ground and stairs); exit code 1 if the robot falls |
+| `robot.py` (`_probe_terrain`) | Forward-looking terrain probe (ToF model): ground height change ahead of the hub, from ray casts against terrain geoms (group 3) |
 
 ## Plant model
 
@@ -83,6 +84,54 @@ typically, with rare spikes to a few milliseconds under extreme pushes.
   (it does this under hard pushes), the planner re-snaps its references and
   mode once the hubs rest near a new 60° multiple.
 
+## Stairs
+
+A 5 cm riser is 86% of the wheel radius, so no drive torque rolls a wheel
+up it; the cluster has to step. The planner runs a step manoeuvre in 4WD
+whenever the terrain probe reports a climbable riser just in front of the
+front wheel while driving forward:
+
+1. **Approach**: the velocity command is capped (`step_approach_speed`)
+   within `step_approach_distance` of a riser so the wheel meets it gently.
+2. **Lean**: the pitch reference ramps to the lean that puts the composite
+   CoG just behind the front axle (`lean_for_pivot`, margin
+   `step_lean_margin`). The lean is computed from the measured leg angle to
+   the front wheel, which is 60° behind vertical on level ground and about
+   74° in the oblique stance on a step. The drive is pinned to zero so the
+   pivot wheel rolls freely up to the riser; the 4WD tipping constraint
+   and the pitch soft limit are relaxed.
+3. **Roll**: the MPC switches to the single-contact model with the front
+   wheel as pivot and a leg reference that sweeps forward. Past the top the
+   reference is kept a fixed lead ahead of the measurement, and the pitch
+   reference follows the leg geometry with a rate limit, so the MPC never
+   brakes the leg or arrests the body with hub torque before the wheel is
+   down (either torque rolls the cluster back off the tread). Odometry is
+   pinned while the pivot wheel is blocked.
+4. **Landing**: detected from the hub encoders, whose rate collapses within
+   about 20 ms when the upper wheel hits the tread, with the geometric
+   landing angle and a stall detector as fallbacks. The MPC returns to the
+   locked-leg model and settles the body upright in the new, oblique,
+   two-contact stance.
+
+Descending uses the same manoeuvre with a negative step height
+(`step_down_enabled`); the position is then held during the lean, because
+there is no riser to keep the pivot wheel at the edge. Drops deeper than
+`step_max_drop`, and any obstacle in 2WD or mid-transition, make the
+planner hold position in front of it instead.
+
+Headless results on the configured two-step staircase (5 cm risers, 20 cm
+treads, 10 cm drop at the far end), sensor noise on, 14 s runs:
+
+| Case | Outcome |
+|------|---------|
+| 4WD, 0.15 to 0.5 m/s, step-down on | climbs both steps, rolls down the far edge, drives on; 12 of 12 runs, peak pitch 32° (the deliberate lean) |
+| 4WD, step-down off (`step_down_enabled=False`) | climbs both steps and holds at the top edge; 3 of 3 |
+| 2WD into the riser | stops in front of it |
+
+Each step is one 120° cluster roll, so the hub encoders read exactly three
+rolls after a full traverse. On the real robot the terrain probe
+corresponds to the forward-looking ToF sensor in the hardware list.
+
 ## Sign conventions for outputs
 
 Positive drive torque drives forward; positive hub torque increases the
@@ -102,8 +151,8 @@ convention: `left = u_d/2 − corr`, `right = u_d/2 + corr`.
 
 The explicit flip is therefore a last-resort reflex; on flat ground the
 MPC's use of the leg covers every push tested before the flip becomes
-relevant. Stair negotiation (the original motivation for the flip) is not
-tuned in this pass.
+relevant. Stairs are handled by the planned step manoeuvre described
+below, not by the flip.
 
 ## Not implemented from the plan
 
@@ -111,7 +160,9 @@ tuned in this pass.
   wheel odometry are used directly. Wheel odometry was corrected to use the
   absolute wheel spin (encoder + hub rate + pitch rate), which matters
   during transitions and flips.
-- Slope handling and stair-aware references in the planner.
+- Slope handling. Stairs with risers up to `step_max_height` (9 cm) and
+  drops up to `step_max_drop` (12 cm) are handled; taller obstacles stop
+  the robot.
 - Code generation for an embedded target; the OSQP problem is the
   reference formulation to port.
 
@@ -122,3 +173,8 @@ leg weight makes the hub hold the leg stiffer, raising `r_diag[1]` pushes
 pitch correction onto the wheels. `theta_soft_limit` bounds the lean the
 MPC will plan. `tipping_safety` limits hub torque in 4WD.
 `transition_time`, `flip_time`, `flip_theta_trigger` shape the event layer.
+
+Note on solver failures: a stair traversal logs roughly 15 to 35 QP
+failures (out of ~2800 solves) during the rolls, where the linearisation
+point moves quickly. Each one is covered by the previous plan shifted one
+step, and none coincided with a fall in the runs above.

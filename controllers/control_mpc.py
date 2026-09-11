@@ -38,10 +38,10 @@ from robot_state import DriveMode
 from .base import BalanceControllerBase, StateReference
 from .mpc_plant import (
     NX, NU, PITCH_SIGN, ContactMode, PlanarPlant, PlantParams,
-    discretize, grounded_wheel_offset,
+    discretize, grounded_wheel_offset, wrap120,
 )
 from .mpc_qp import MPCQP
-from .triplet_planner import TripletPlanner, FlipPhase
+from .triplet_planner import TripletPlanner, FlipPhase, StepPhase
 
 _PI_3 = math.pi / 3.0
 
@@ -114,6 +114,15 @@ class MPCBalanceController(BalanceControllerBase):
         self._phi_L = self._phi_R = 0.0
         self._phid_L = self._phid_R = 0.0
         self._sim_time = 0.0
+        self._terrain = (float('inf'), 0.0, 0.0)
+
+        # --- Stair step manoeuvre limits ---
+        self.step_pitch_limit = m.step_pitch_limit
+        self.step_drive_limit = m.step_drive_limit
+        self.step_hub_limit = m.step_hub_limit
+        self.step_press_torque = m.step_press_torque
+        self.step_lin_clip = m.step_lin_clip
+        self.theta_soft_limit = m.theta_soft_limit
 
         # --- Model cache ---
         self._mode = ContactMode.FOUR_WD
@@ -135,6 +144,7 @@ class MPCBalanceController(BalanceControllerBase):
         self.max_solve_ms = 0.0
         self._plan_index = 0
         self._last_out = None
+        self._holding = False
 
         print("  MPC balance controller initialised")
         print(f"    horizon N={self.N}, dt_pred={self.dt * 1e3:.0f} ms "
@@ -166,6 +176,8 @@ class MPCBalanceController(BalanceControllerBase):
         self.u_traj = self.z_traj = None
         self._plan_index = 0
         self._lin_point = (None, None)
+        self._holding = False
+        self._terrain = (float('inf'), 0.0, 0.0)
         self.planner.reset()
 
     def set_velocity_command(self, velocity):
@@ -190,6 +202,9 @@ class MPCBalanceController(BalanceControllerBase):
 
     def set_drive_mode(self, mode: DriveMode):
         self.planner.request_mode(mode, self._sim_time)
+
+    def set_terrain_ahead(self, distance, height, clearance):
+        self._terrain = (distance, height, clearance)
 
     @property
     def plans_triplet_torque(self) -> bool:
@@ -243,6 +258,9 @@ class MPCBalanceController(BalanceControllerBase):
                 "dcm_margin":  float(out.dcm_margin),
                 "t_capture":   float(min(out.t_capture, 9.9)),
                 "transition":  float(out.transitioning),
+                "step_phase":  float(out.step_phase),
+                "hold_drop":   float(out.hold_for_drop),
+                "planner_2wd": float(self.planner.mode == DriveMode.TWO_WD),
             })
         return d
 
@@ -257,22 +275,23 @@ class MPCBalanceController(BalanceControllerBase):
     # Model scheduling
     # ------------------------------------------------------------------
 
-    def _select_mode(self, theta, out):
+    def _select_mode(self, a_L, a_R, out):
         """Pick the contact model for this tick."""
-        a_L = grounded_wheel_offset(theta, self._phi_L)
-        a_R = grounded_wheel_offset(theta, self._phi_R)
+        if out.force_single_contact:
+            return ContactMode.SINGLE_CONTACT
         both_tied = (abs(a_L) > _PI_3 - self.four_wd_tol
                      and abs(a_R) > _PI_3 - self.four_wd_tol)
         steady_4wd = (self.planner.mode == DriveMode.FOUR_WD
                       and not out.transitioning)
         if out.flipping or steady_4wd or both_tied:
-            return ContactMode.FOUR_WD, a_L, a_R
-        return ContactMode.SINGLE_CONTACT, a_L, a_R
+            return ContactMode.FOUR_WD
+        return ContactMode.SINGLE_CONTACT
 
-    def _update_model(self, mode, lam0, theta0):
+    def _update_model(self, mode, lam0, theta0, clip=None):
         """Re-linearise and refresh the terminal cost when needed."""
-        lam0 = float(np.clip(lam0, -self.lin_clip, self.lin_clip))
-        theta0 = float(np.clip(theta0, -self.lin_clip, self.lin_clip))
+        clip = self.lin_clip if clip is None else clip
+        lam0 = float(np.clip(lam0, -clip, clip))
+        theta0 = float(np.clip(theta0, -clip, clip))
         if mode == ContactMode.FOUR_WD:
             lam0 = 0.0
         prev_mode, prev_pt = self._lin_point
@@ -345,22 +364,47 @@ class MPCBalanceController(BalanceControllerBase):
         self.next_control_time = sim_time + self.control_period
         T = self.control_period
 
+        # --- Leg geometry from the hub encoders ---
+        a_L = grounded_wheel_offset(theta, self._phi_L)
+        a_R = grounded_wheel_offset(theta, self._phi_R)
+        # Plain average: the contact midpoint, which is the physical leg
+        # for the MPC both at the 4WD tie and during an asymmetric
+        # transition (where the two sides are legitimately far apart).
+        lam_raw = -0.5 * (a_L + a_R)
+        # Leg angle to the FRONT lower wheel, the pivot of a stair step.
+        # Computed per side before averaging: at the tie the two sides
+        # straddle the +-60 deg wrap boundary and averaging the wrapped
+        # values first would read ~0 (a 2WD pose).
+        af_L = a_L if a_L >= 0.0 else a_L + 2.0 * _PI_3
+        af_R = a_R if a_R >= 0.0 else a_R + 2.0 * _PI_3
+        lam_pivot = -0.5 * (af_L + af_R)
+        lam_dot_raw = theta_dot - 0.5 * (self._phid_L + self._phid_R)
+
         # --- Event layer ---
         peak_theta = 0.0
         if self.z_traj is not None:
             k = int(np.argmax(np.abs(self.z_traj[:, 2])))
             peak_theta = float(self.z_traj[k, 2])
+        t_dist, t_height, _ = self._terrain
         out = self.planner.update(sim_time, theta, theta_dot,
                                   self._phi_L, self._phi_R,
-                                  predicted_peak_theta=peak_theta)
+                                  predicted_peak_theta=peak_theta,
+                                  lam=lam_raw, lam_dot=lam_dot_raw,
+                                  lam_pivot=lam_pivot,
+                                  v_cmd=self._velocity_command,
+                                  terrain_dist=t_dist, terrain_height=t_height)
         self._last_out = out
-        mode, a_L, a_R = self._select_mode(theta, out)
+        mode = self._select_mode(a_L, a_R, out)
 
         # --- State estimate in planar coordinates ---
-        lam = -0.5 * (a_L + a_R) if mode == ContactMode.SINGLE_CONTACT else 0.0
-        lam_dot = theta_dot - 0.5 * (self._phid_L + self._phid_R)
-        if mode == ContactMode.FOUR_WD:
-            lam_dot = 0.0
+        if mode == ContactMode.SINGLE_CONTACT:
+            lam, lam_dot = lam_raw, lam_dot_raw
+            if out.lam_ref is not None:
+                # Unwrap the 120-deg periodic leg angle onto the branch of
+                # the reference so a full roll over the pivot is continuous.
+                lam = out.lam_ref + wrap120(lam_raw - out.lam_ref)
+        else:
+            lam, lam_dot = 0.0, 0.0
         z0 = np.array([position, forward_velocity, theta, theta_dot, lam, lam_dot])
         self.z0 = z0
 
@@ -368,32 +412,56 @@ class MPCBalanceController(BalanceControllerBase):
         driving = abs(self._velocity_command) > 1e-4
         if out.reset_position:
             self.target_position = position
-        if out.freeze_position:
+        if out.freeze_position or out.hold_for_drop:
+            # Hold the position where the hold began (latched once).
             v_cmd = 0.0
-            self.target_position = position
+            if not self._holding:
+                self.target_position = position
+                self._holding = True
         else:
+            if self._holding:
+                # Release: restart the reference from wherever we are, the
+                # odometry may have drifted while a wheel was blocked.
+                self.target_position = position
+            self._holding = False
             v_cmd = self._velocity_command
+            if v_cmd > 0.0:
+                v_cmd = min(v_cmd, out.v_cap)
             if driving:
                 self.target_position += v_cmd * T
                 self._was_driving = True
             elif self._was_driving:
                 self.target_position = position
                 self._was_driving = False
+        if out.step_phase == StepPhase.ROLL:
+            # The pivot wheel is blocked by the riser and spins freely, so
+            # the wheel odometry is meaningless: pin the position states.
+            z0[0] = self.target_position
+            z0[1] = 0.0
 
         theta_ref = PITCH_SIGN * ref.pitch
         theta_rate_ref = PITCH_SIGN * ref.pitch_rate
-        if mode == ContactMode.SINGLE_CONTACT:
+        if out.theta_ref is not None:
+            theta_ref, theta_rate_ref = out.theta_ref, 0.0
+        lam_rate_ref = 0.0
+        if out.lam_ref is not None:
+            lam_ref, lam_rate_ref = out.lam_ref, out.lam_rate
+        elif mode == ContactMode.SINGLE_CONTACT:
             lam_ref = self.plant.equilibrium_leg_angle(theta_ref)
         else:
             lam_ref = 0.0
 
         # --- Model for this tick ---
-        self._update_model(mode, lam, theta)
+        clip = self.step_lin_clip if out.force_single_contact else None
+        self._update_model(mode, lam, theta, clip=clip)
+        self.qp.theta_max = (self.step_pitch_limit if out.relax_limits
+                             else self.theta_soft_limit)
 
         z_ref = np.zeros((self.N + 1, NX))
         for k in range(self.N + 1):
             z_ref[k] = [self.target_position + v_cmd * k * self.dt, v_cmd,
-                        theta_ref, theta_rate_ref, lam_ref, 0.0]
+                        theta_ref, theta_rate_ref,
+                        lam_ref + lam_rate_ref * k * self.dt, lam_rate_ref]
         self.z_ref0 = z_ref[0]
         u_ref = self._equilibrium_input(z_ref[0])
         if out.flipping:
@@ -405,7 +473,18 @@ class MPCBalanceController(BalanceControllerBase):
         u_max = np.array([self.u_d_max, self.u_t_max])
         if out.flipping:
             u_min[1] = u_max[1] = 0.0      # hub torque owned by the flip PD
-        if mode == ContactMode.FOUR_WD and not out.flipping:
+        if out.limit_drive:
+            # Forward only, with a bias that keeps the pivot wheel pressed
+            # against the riser; never back away from it to help the pitch.
+            u_min[0], u_max[0] = 0.0, self.step_drive_limit
+            u_ref[0] = self.step_press_torque
+            if out.pin_drive:
+                u_min[0] = u_max[0] = self.step_press_torque
+        if out.force_single_contact:
+            # Rolling over the pivot: moderate hub torque so a lagging leg
+            # reference cannot yank the body.
+            u_min[1], u_max[1] = -self.step_hub_limit, self.step_hub_limit
+        if mode == ContactMode.FOUR_WD and not out.flipping and not out.relax_limits:
             tip_max = self.tip_safety * self.params.tipping_torque
             kappa = self.kappa_tip
         else:

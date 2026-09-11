@@ -129,6 +129,11 @@ class BalanceControllerBase(ABC):
         """Update triplet encoder readings.  Default: no-op."""
         pass
 
+    def set_terrain_ahead(self, distance: float, height: float,
+                          clearance: float) -> None:
+        """Terrain probe reading (see RobotState).  Default: no-op."""
+        pass
+
     def set_drive_mode(self, mode) -> None:
         """Notify the controller of a requested drive mode.  Default: no-op.
 

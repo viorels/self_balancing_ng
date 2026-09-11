@@ -201,6 +201,7 @@ def run_simulation():
     viewer.cam.azimuth = 120
     viewer.cam.elevation = -20
     viewer.cam.lookat[:] = [0, 0, 0.15]
+    viewer.opt.geomgroup[3] = 1   # terrain geoms live in group 3 (ray probes)
 
     # --- Input ---
     gp = Gamepad(CONFIG.gamepad.device, deadzone=CONFIG.gamepad.deadzone)
