@@ -9,7 +9,7 @@ saturation, and MPC solve times.
 
 Usage:
     .venv/bin/python tools/run_headless.py [scenario ...] [--controller mpc|lqr]
-                                           [--duration S] [--noise 0|1]
+                                           [--duration S] [--noise 0|1] [--seed N]
 Scenarios: balance4, balance2, drive4, drive2, transition, push4, push2,
            flip, stairs, all   (stairs: --mode 4wd|2wd, --speed; box stairs)
 """
@@ -163,7 +163,8 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0, speed=0.4,
                         float(data.qpos[0]), float(data.qpos[2]),
                         s.forward_velocity, tel.get('planner_2wd', -1),
                         math.degrees(tel.get('z_lam', 0.0)),
-                        math.degrees(tel.get('ref_lam', 0.0))))
+                        math.degrees(tel.get('ref_lam', 0.0)),
+                        tel.get('solve_ok', -1)))
     wall = time.perf_counter() - t_wall0
     tel = ctrl.get_telemetry()
     result = {
@@ -187,12 +188,13 @@ def run(cfg, scenario, duration, verbose=False, push_ns=3.0, speed=0.4,
     if verbose:
         print(f"    {'t':>5s} {'pitch':>7s} {'pos':>7s} {'u_d':>6s} {'u_t':>6s} "
               f"{'4wd':>4s} {'step':>4s} {'phiL':>7s} {'phiR':>7s} "
-              f"{'x':>7s} {'z':>6s} {'v':>6s} {'p2':>3s} {'lam':>6s} {'lamr':>6s}")
+              f"{'x':>7s} {'z':>6s} {'v':>6s} {'p2':>3s} {'lam':>6s} {'lamr':>6s} "
+              f"{'ok':>2s}")
         for row in log:
             print(f"    {row[0]:5.2f} {row[1]:7.2f} {row[2]:7.3f} {row[3]:6.2f} "
                   f"{row[4]:6.2f} {row[5]:4.0f} {row[6]:4.0f} {row[7]:7.1f} {row[8]:7.1f} "
                   f"{row[9]:7.3f} {row[10]:6.3f} {row[11]:6.2f} {row[12]:3.0f} "
-                  f"{row[13]:6.1f} {row[14]:6.1f}")
+                  f"{row[13]:6.1f} {row[14]:6.1f} {row[15]:2.0f}")
     return result
 
 
@@ -212,6 +214,8 @@ def main():
     ap.add_argument('--log-dt', type=float, default=0.1, help='verbose log period (s)')
     ap.add_argument('--set', action='append', default=[],
                     help='override config, e.g. --set mpc.step_lean_margin=-0.05')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='seed the sensor-noise RNG (reproducible runs)')
     args = ap.parse_args()
 
     names = args.scenarios
@@ -220,6 +224,8 @@ def main():
                  'push4', 'push2', 'flip', 'stairs']
     ok_all = True
     for name in names:
+        if args.seed is not None:
+            np.random.seed(args.seed)
         cfg = load_config()
         cfg.sim.controller = args.controller
         cfg.imu.add_sensor_noise = bool(args.noise)

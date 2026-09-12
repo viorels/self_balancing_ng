@@ -185,6 +185,8 @@ class MPCConfig:
     step_theta_rate: float = 1.2       # rad/s — max rate of the pitch reference while rolling
     step_theta_floor: float = 0.05     # rad — pitch reference floor while rolling
     step_lean_time: float = 0.7        # s
+    step_lean_extra: float = 0.5       # s — extra wait for the body to reach the lean
+    step_rest_time: float = 0.25       # s — cluster and body at rest before a step starts
     drop_hold: bool = True             # stop at a drop-off instead of driving over it
     step_down_enabled: bool = True     # roll down a drop with the same manoeuvre
     step_max_drop: float = 0.12        # m — largest drop the step-down attempts
@@ -195,7 +197,11 @@ class MPCConfig:
     step_settle_time: float = 0.4      # s
     step_pitch_limit: float = 0.8      # rad — soft pitch limit while stepping
     step_drive_limit: float = 0.6      # Nm — drive torque cap while stepping
-    step_press_torque: float = 0.0     # Nm — drive bias while leaning (0: pivot wheel rolls freely)
+    step_press_torque: float = 0.0     # Nm — drive bias while rolling (0: pivot wheel rolls freely)
+    step_lean_press: float = 0.3       # Nm — max drive while leaning to climb, applied only
+                                       #      against backward drift of the base (the lean's
+                                       #      reaction pushes the pivot wheel off the riser)
+    step_lean_damping: float = 2.0     # Nm per m/s of backward base velocity
     step_hub_limit: float = 5.0        # Nm — total hub torque cap while rolling
     step_lin_clip: float = 1.35        # rad — linearisation clip while rolling
 

@@ -115,6 +115,7 @@ class PlannerOutput:
     lam_rate: float = 0.0
     force_single_contact: bool = False # use the leg model even at the tie
     relax_limits: bool = False         # raise pitch limit, drop tipping limit
+    keep_tipping: bool = False         # ...but keep the 4WD tipping limit
     limit_drive: bool = False          # cap drive torque (pivot wheel blocked)
     pin_drive: bool = False            # drive torque fixed to the press bias
     hold_for_drop: bool = False        # obstacle ahead we cannot step over: hold
@@ -145,6 +146,8 @@ class TripletPlanner:
         self.step_max_h = m.step_max_height
         self.step_gap = m.step_trigger_gap
         self.T_step_lean = m.step_lean_time
+        self.T_step_lean_extra = m.step_lean_extra
+        self.T_step_rest = m.step_rest_time
         self.T_step_settle = m.step_settle_time
         self.front_edge_4wd = plant.p.R * math.sin(_PI_3) + plant.p.r
         self.step_land_margin = m.step_land_margin
@@ -167,6 +170,8 @@ class TripletPlanner:
         self.drop_hold = m.drop_hold
         self._step_height = 0.0
         self._lam_pivot0 = -_PI_3
+        self._lean_target = 0.0
+        self._rest_since = 0.0
         self._stall_time = 0.0
         self._last_t = 0.0
         self._lam_land = _PI_3
@@ -209,6 +214,7 @@ class TripletPlanner:
         self._theta_ramp = _Ramp()
         self._lam_ramp = _Ramp()
         self.hold_for_drop = False
+        self._rest_since = 0.0
 
     def initialise(self, phi_L: float, phi_R: float):
         """Latch references from the first encoder reading (snapped to 60 deg)."""
@@ -264,7 +270,7 @@ class TripletPlanner:
     # Stair step manoeuvre
     # ------------------------------------------------------------------
 
-    def _step_update(self, t, theta, lam, lam_dot, lam_pivot, v_cmd,
+    def _step_update(self, t, theta, theta_dot, lam, lam_dot, lam_pivot, v_cmd,
                      terrain_dist, terrain_height):
         """
         Advance the stair-step state machine.  Returns a dict of overrides
@@ -305,7 +311,14 @@ class TripletPlanner:
         # the front wheel is 120 deg on.
 
         if self.step_phase == StepPhase.NONE:
-            can_step = self.step_enabled and steady_4wd
+            # Only start from rest: after a landing the cluster may still be
+            # rocking onto its stance (it can over-rotate past the tie and
+            # fall back), and a lean begun in that jolt lags its ramp.
+            at_rest = abs(lam_dot) < 0.5 and abs(theta_dot) < 0.6
+            if not at_rest:
+                self._rest_since = t
+            can_step = (self.step_enabled and steady_4wd
+                        and t - self._rest_since >= self.T_step_rest)
             obstacle_ahead = (abs(terrain_height) > self.step_min_h and in_front
                               and terrain_dist <= self.front_edge_4wd + 2.0 * self.step_gap)
             # Slow down on the approach so the wheel meets the riser gently.
@@ -326,21 +339,30 @@ class TripletPlanner:
                 self._lam_pivot0 = lam_pivot
                 self._lam_track = lam_pivot
                 lean = self.lean_for_pivot(lam_pivot)
+                self._lean_target = lean
                 self._theta_ramp.start(t, theta, lean, self.T_step_lean)
         elif self.step_phase == StepPhase.LEAN:
             th_ref, _ = self._theta_ramp.update(t)
-            # Climbing: the drive is pinned so the pivot wheel rolls freely
-            # up to the riser.  Stepping down: there is no riser to jam on,
-            # so let the MPC hold the position with forward drive to keep
-            # the pivot wheel at the edge.
+            # The drive is pinned to a damper on backward base motion so
+            # the pivot wheel stays at the riser (or the edge, stepping
+            # down) while the body leans.  Left to the MPC, even with a
+            # position hold, the base rolls back 10-15 cm to build the
+            # lean: climbing, the roll then starts short of the riser;
+            # descending, the rear wheel drops off the previous tread.
             out.update(theta_ref=th_ref, relax=True, limit_drive=True,
-                       pin_drive=self._step_height > 0.0)
+                       pin_drive=True)
             self._lam_track = self._lam_track + wrap120(lam_pivot - self._lam_track)
             # Early exit only on a real roll-over, not on a contact wobble
             # while the rear wheel unloads.
             cluster_moving = (lam_dot > 0.8
                               and self._lam_track > self._lam_pivot0 + math.radians(8.0))
-            if (not self._theta_ramp.active) or cluster_moving:
+            # Roll once the body has actually reached its lean (the ramp
+            # can end with the body 10-15 deg short after a jolt, and a
+            # roll from there stalls), with a timeout as the backstop.
+            lean_reached = ((not self._theta_ramp.active)
+                            and theta >= self._lean_target - math.radians(4.0))
+            timed_out = t - self._step_t0 > self.T_step_lean + self.T_step_lean_extra
+            if lean_reached or cluster_moving or timed_out:
                 self.step_phase = StepPhase.ROLL
                 self._step_t0 = t
                 self._lam_land = self.landing_leg_angle(self._step_height)
@@ -375,6 +397,10 @@ class TripletPlanner:
             dth = self.step_theta_rate * (t - self._last_t)
             th_ref = min(max(th_geom, self._th_prev - dth), self._th_prev + dth)
             self._th_prev = th_ref
+            # The drive stays available (forward only): against a riser it
+            # acts on the body through the blocked wheel; descending it
+            # moves the base under the body.  Pinning it here makes the
+            # MPC reverse the roll with hub torque instead.
             out.update(theta_ref=th_ref, lam_ref=lam_ref, lam_rate=lam_rate,
                        single=True, relax=True, limit_drive=True)
             # Landing detection, in order of speed:
@@ -401,7 +427,12 @@ class TripletPlanner:
                 self._step_t0 = t
                 self._lam_ramp.set(lam_unwrapped)
         elif self.step_phase == StepPhase.SETTLE:
+            # The body may land well forward of upright; allow the lean but
+            # keep the tipping limit: a large hub torque in the locked-leg
+            # model would roll the cluster over the front wheel again (and
+            # off the next edge) instead of pitching the body.
             out['relax'] = True
+            out['keep_tipping'] = True
             if t - self._step_t0 >= self.T_step_settle:
                 self.step_phase = StepPhase.NONE
         self._last_t = t
@@ -534,8 +565,8 @@ class TripletPlanner:
             and self.phase != FlipPhase.FLIPPING
         flipping = self.phase == FlipPhase.FLIPPING
 
-        step = self._step_update(t, theta, lam, lam_dot, lam_pivot, v_cmd,
-                                 terrain_dist, terrain_height)
+        step = self._step_update(t, theta, theta_dot, lam, lam_dot, lam_pivot,
+                                 v_cmd, terrain_dist, terrain_height)
         return PlannerOutput(
             phi_ref_L=pL, phi_ref_R=pR, phi_rate_L=vL, phi_rate_R=vR,
             transitioning=transitioning,
@@ -552,6 +583,7 @@ class TripletPlanner:
             lam_rate=step.get('lam_rate', 0.0),
             force_single_contact=step.get('single', False),
             relax_limits=step.get('relax', False),
+            keep_tipping=step.get('keep_tipping', False),
             limit_drive=step.get('limit_drive', False),
             pin_drive=step.get('pin_drive', False),
             hold_for_drop=self.hold_for_drop,

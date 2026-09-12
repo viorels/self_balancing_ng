@@ -121,6 +121,8 @@ class MPCBalanceController(BalanceControllerBase):
         self.step_drive_limit = m.step_drive_limit
         self.step_hub_limit = m.step_hub_limit
         self.step_press_torque = m.step_press_torque
+        self.step_lean_press = m.step_lean_press
+        self.step_lean_damping = m.step_lean_damping
         self.step_lin_clip = m.step_lin_clip
         self.theta_soft_limit = m.theta_soft_limit
 
@@ -368,16 +370,27 @@ class MPCBalanceController(BalanceControllerBase):
         a_L = grounded_wheel_offset(theta, self._phi_L)
         a_R = grounded_wheel_offset(theta, self._phi_R)
         # Plain average: the contact midpoint, which is the physical leg
-        # for the MPC both at the 4WD tie and during an asymmetric
-        # transition (where the two sides are legitimately far apart).
-        lam_raw = -0.5 * (a_L + a_R)
-        # Leg angle to the FRONT lower wheel, the pivot of a stair step.
-        # Computed per side before averaging: at the tie the two sides
-        # straddle the +-60 deg wrap boundary and averaging the wrapped
-        # values first would read ~0 (a 2WD pose).
+        # for the MPC during an asymmetric transition, where the two sides
+        # are legitimately up to 60 deg apart and start 120 deg apart at
+        # the tie (a circular mean reads the first half of a transition as
+        # a tie).  Outside a transition, sides more than 90 deg apart are
+        # straddling the +-60 deg wrap boundary a few degrees apart (the
+        # hubs drift apart mid-roll on a step), and the circular mean is
+        # the physical one: a_L = -52, a_R = +58 is a leg at 57, not 3.
+        in_transition = self._last_out is not None and self._last_out.transitioning
+        if not in_transition and abs(a_L - a_R) > 1.5 * _PI_3:
+            lam_raw = -(a_L + 0.5 * wrap120(a_R - a_L))
+        else:
+            lam_raw = -0.5 * (a_L + a_R)
+        # Leg angle to the FRONT lower wheel, the pivot of a stair step,
+        # in (-120, 0].  Its wrap boundary is at 0 (pivot wheel straight
+        # under the hub), which the cluster crosses mid-roll with the two
+        # encoders a hair apart, so the sides are combined with a circular
+        # mean: one side at 0.1 deg and the other at 119.9 deg is 0, not
+        # 60 (that jump put the planner's leg tracker on the wrong branch).
         af_L = a_L if a_L >= 0.0 else a_L + 2.0 * _PI_3
         af_R = a_R if a_R >= 0.0 else a_R + 2.0 * _PI_3
-        lam_pivot = -0.5 * (af_L + af_R)
+        lam_pivot = -(af_L + 0.5 * wrap120(af_R - af_L))
         lam_dot_raw = theta_dot - 0.5 * (self._phid_L + self._phid_R)
 
         # --- Event layer ---
@@ -479,12 +492,21 @@ class MPCBalanceController(BalanceControllerBase):
             u_min[0], u_max[0] = 0.0, self.step_drive_limit
             u_ref[0] = self.step_press_torque
             if out.pin_drive:
-                u_min[0] = u_max[0] = self.step_press_torque
+                # Leaning to climb: the drive only damps backward drift of
+                # the base, so the pivot wheel stays at the riser without
+                # ever being driven into it (a constant press shoves the
+                # base into the riser at the end of the lean and the jolt
+                # throws the body past its lean; a free wheel lets the
+                # base roll back 10 cm and the roll starts short).
+                pin = min(self.step_lean_press,
+                          max(0.0, -self.step_lean_damping * forward_velocity))
+                u_min[0] = u_max[0] = pin
         if out.force_single_contact:
             # Rolling over the pivot: moderate hub torque so a lagging leg
             # reference cannot yank the body.
             u_min[1], u_max[1] = -self.step_hub_limit, self.step_hub_limit
-        if mode == ContactMode.FOUR_WD and not out.flipping and not out.relax_limits:
+        if mode == ContactMode.FOUR_WD and not out.flipping and (
+                not out.relax_limits or out.keep_tipping):
             tip_max = self.tip_safety * self.params.tipping_torque
             kappa = self.kappa_tip
         else:

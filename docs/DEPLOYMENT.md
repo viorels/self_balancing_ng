@@ -48,6 +48,7 @@ Headless checks (no viewer needed):
 ```bash
 .venv/bin/python tools/validate_mpc_plant.py   # model vs MuJoCo accelerations
 .venv/bin/python tools/run_headless.py all     # balance, drive, transition, push, stairs scenarios
+.venv/bin/python tools/run_headless.py stairs --mode 4wd --speed 0.4 --seed 3   # one reproducible stair run
 ```
 
 ## Running
@@ -60,6 +61,16 @@ Run the simulation with the interactive MuJoCo viewer:
 
 Or activate the environment first with `source .venv/bin/activate` and run
 `python tribot_sim.py`. Simulation parameters live in `config.py`.
+
+To replay a scripted drive in the viewer (for example the stair traverse
+verified headless) without a gamepad, or overriding it:
+
+```bash
+.venv/bin/python tribot_sim.py --drive 0.4 --drive-for 12   # 0.4 m/s from t=1 s for 12 s
+```
+
+Press R to reset; the scripted drive replays from the reset. `--seed N`
+makes the sensor noise identical to the headless run with the same seed.
 
 ### Optional: MCP simulation server
 

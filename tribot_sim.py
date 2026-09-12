@@ -6,9 +6,15 @@ Wires together: config, robot, input, controller, physics, telemetry.
 No control logic, no sensor code, no motor physics lives here.
 
 USAGE:
-    python3 tribot_sim.py
+    python3 tribot_sim.py [--drive V] [--drive-at T] [--drive-for S] [--seed N]
+
+    --drive V     scripted forward velocity command (m/s), applied after
+                  --drive-at seconds (default 1.0) for --drive-for seconds
+                  (default: until the end); overrides the gamepad while active
+    --seed N      seed the sensor-noise RNG (reproduces a headless run)
 """
 
+import argparse
 import math
 import os
 import time
@@ -161,9 +167,27 @@ def _print_config_summary(model, robot, config):
     print("-" * 70)
 
 
-def run_simulation():
+def _parse_args():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--drive', type=float, default=None,
+                    help='scripted forward velocity command (m/s)')
+    ap.add_argument('--drive-at', type=float, default=1.0,
+                    help='sim time (s) at which the scripted drive starts')
+    ap.add_argument('--drive-for', type=float, default=None,
+                    help='duration (s) of the scripted drive (default: unlimited)')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='seed the sensor-noise RNG')
+    return ap.parse_args()
+
+
+def run_simulation(args=None):
     """Run the tribot self-balancing simulation."""
     global _reset_requested
+    if args is None:
+        args = _parse_args()
+    if args.seed is not None:
+        np.random.seed(args.seed)
 
     print("=" * 70)
     print("Tribot Self-Balancing Robot — MuJoCo Simulation")
@@ -290,6 +314,13 @@ def run_simulation():
             if _bridge_lean is not None:
                 robot.controller.set_lean(_bridge_lean)
             _bridge_ticks_left -= 1
+
+        # --- Scripted drive (--drive), same command as the headless runner ---
+        if args.drive is not None and sim_time >= args.drive_at and (
+                args.drive_for is None or sim_time < args.drive_at + args.drive_for):
+            robot.controller.set_velocity_command(args.drive)
+            robot.controller.set_yaw_rate(0.0)
+            robot.controller.set_lean(0.0)
 
         # --- Update visual marker at controller's target position ---
         viewer.user_scn.ngeom = 0  # clear previous frame's markers
